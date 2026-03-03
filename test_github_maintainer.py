@@ -20,6 +20,24 @@ sys.modules["github_maintainer"] = gm
 spec.loader.exec_module(gm)
 
 
+@pytest.fixture
+def default_config():
+    """Create a default Config for testing."""
+    return gm.Config(
+        agent_command="echo",
+        agent_flags="",
+        auto_merge_dependabot=True,
+        auto_update_dependencies=True,
+        dependency_min_age_days=30,
+        dry_run=True,
+        exclude=set(),
+        max_fix_attempts=4,
+        push_changes=False,
+        rollback_on_ci_failure=False,
+        run_tests=True,
+    )
+
+
 class TestSafeJsonParse:
     """Tests for safe_json_parse function."""
 
@@ -81,47 +99,13 @@ class TestProjectEnvironment:
 class TestAgentClientJsonExtraction:
     """Tests for AgentClient JSON extraction."""
 
-    def test_extract_plain_json(self):
-        client = gm.AgentClient(
-            Path("/tmp"),
-            "test-repo",
-            gm.Config(
-                agent_command="echo",
-                agent_flags="",
-                auto_merge_dependabot=True,
-                auto_update_dependencies=True,
-                dependency_min_age_days=30,
-                dry_run=True,
-                exclude=set(),
-                max_fix_attempts=4,
-                push_changes=False,
-                rollback_on_ci_failure=False,
-                run_tests=True,
-            ),
-            MagicMock(),
-        )
+    def test_extract_plain_json(self, default_config):
+        client = gm.AgentClient(Path("/tmp"), "test-repo", default_config, MagicMock())
         result = client._extract_json_from_response('{"key": "value"}')
         assert result == '{"key": "value"}'
 
-    def test_extract_json_from_markdown_block(self):
-        client = gm.AgentClient(
-            Path("/tmp"),
-            "test-repo",
-            gm.Config(
-                agent_command="echo",
-                agent_flags="",
-                auto_merge_dependabot=True,
-                auto_update_dependencies=True,
-                dependency_min_age_days=30,
-                dry_run=True,
-                exclude=set(),
-                max_fix_attempts=4,
-                push_changes=False,
-                rollback_on_ci_failure=False,
-                run_tests=True,
-            ),
-            MagicMock(),
-        )
+    def test_extract_json_from_markdown_block(self, default_config):
+        client = gm.AgentClient(Path("/tmp"), "test-repo", default_config, MagicMock())
         response = """Here's the result:
 ```json
 {"should_update": true, "commands": ["npm update"]}
@@ -130,25 +114,8 @@ class TestAgentClientJsonExtraction:
         result = client._extract_json_from_response(response)
         assert result == '{"should_update": true, "commands": ["npm update"]}'
 
-    def test_extract_json_from_code_block_without_lang(self):
-        client = gm.AgentClient(
-            Path("/tmp"),
-            "test-repo",
-            gm.Config(
-                agent_command="echo",
-                agent_flags="",
-                auto_merge_dependabot=True,
-                auto_update_dependencies=True,
-                dependency_min_age_days=30,
-                dry_run=True,
-                exclude=set(),
-                max_fix_attempts=4,
-                push_changes=False,
-                rollback_on_ci_failure=False,
-                run_tests=True,
-            ),
-            MagicMock(),
-        )
+    def test_extract_json_from_code_block_without_lang(self, default_config):
+        client = gm.AgentClient(Path("/tmp"), "test-repo", default_config, MagicMock())
         response = """```
 {"fixed": false}
 ```"""
@@ -229,27 +196,11 @@ class TestGitClient:
 class TestMaintainerValidation:
     """Tests for Maintainer validation methods."""
 
-    def test_is_valid_dependabot_pr_valid_branch(self):
+    def test_is_valid_dependabot_pr_valid_branch(self, default_config):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmppath = Path(tmpdir)
             (tmppath / ".git").mkdir()
-
-            config = gm.Config(
-                agent_command="echo",
-                agent_flags="",
-                auto_merge_dependabot=True,
-                auto_update_dependencies=True,
-                dependency_min_age_days=30,
-                dry_run=True,
-                exclude=set(),
-                max_fix_attempts=4,
-                push_changes=False,
-                rollback_on_ci_failure=False,
-                run_tests=True,
-            )
-            maintainer = gm.Maintainer(tmppath, config)
-
-            # Mock the GPG verification to return True
+            maintainer = gm.Maintainer(tmppath, default_config)
             maintainer.github.is_commit_verified = MagicMock(return_value=True)
 
             pr = {
@@ -259,54 +210,24 @@ class TestMaintainerValidation:
             }
             assert maintainer._is_valid_dependabot_pr(pr) is True
 
-    def test_is_valid_dependabot_pr_invalid_branch(self):
+    def test_is_valid_dependabot_pr_invalid_branch(self, default_config):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmppath = Path(tmpdir)
             (tmppath / ".git").mkdir()
-
-            config = gm.Config(
-                agent_command="echo",
-                agent_flags="",
-                auto_merge_dependabot=True,
-                auto_update_dependencies=True,
-                dependency_min_age_days=30,
-                dry_run=True,
-                exclude=set(),
-                max_fix_attempts=4,
-                push_changes=False,
-                rollback_on_ci_failure=False,
-                run_tests=True,
-            )
-            maintainer = gm.Maintainer(tmppath, config)
+            maintainer = gm.Maintainer(tmppath, default_config)
 
             pr = {
                 "number": 123,
-                "headRefName": "feature/some-feature",  # Not a dependabot branch
+                "headRefName": "feature/some-feature",
                 "headRefOid": "abc123",
             }
             assert maintainer._is_valid_dependabot_pr(pr) is False
 
-    def test_is_valid_dependabot_pr_unverified_commit(self):
+    def test_is_valid_dependabot_pr_unverified_commit(self, default_config):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmppath = Path(tmpdir)
             (tmppath / ".git").mkdir()
-
-            config = gm.Config(
-                agent_command="echo",
-                agent_flags="",
-                auto_merge_dependabot=True,
-                auto_update_dependencies=True,
-                dependency_min_age_days=30,
-                dry_run=True,
-                exclude=set(),
-                max_fix_attempts=4,
-                push_changes=False,
-                rollback_on_ci_failure=False,
-                run_tests=True,
-            )
-            maintainer = gm.Maintainer(tmppath, config)
-
-            # Mock the GPG verification to return False
+            maintainer = gm.Maintainer(tmppath, default_config)
             maintainer.github.is_commit_verified = MagicMock(return_value=False)
 
             pr = {
@@ -320,165 +241,65 @@ class TestMaintainerValidation:
 class TestDetectTestCommand:
     """Tests for test command detection."""
 
-    def test_detect_npm_test(self):
+    def test_detect_npm_test(self, default_config):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmppath = Path(tmpdir)
             (tmppath / ".git").mkdir()
             (tmppath / "package.json").write_text('{"scripts": {"test": "jest"}}')
-
-            config = gm.Config(
-                agent_command="echo",
-                agent_flags="",
-                auto_merge_dependabot=True,
-                auto_update_dependencies=True,
-                dependency_min_age_days=30,
-                dry_run=True,
-                exclude=set(),
-                max_fix_attempts=4,
-                push_changes=False,
-                rollback_on_ci_failure=False,
-                run_tests=True,
-            )
-            maintainer = gm.Maintainer(tmppath, config)
+            maintainer = gm.Maintainer(tmppath, default_config)
             assert maintainer.detect_test_command() == "npm test"
 
-    def test_detect_pytest(self):
+    def test_detect_pytest(self, default_config):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmppath = Path(tmpdir)
             (tmppath / ".git").mkdir()
             (tmppath / "pyproject.toml").write_text("[tool.pytest]")
             (tmppath / "tests").mkdir()
-
-            config = gm.Config(
-                agent_command="echo",
-                agent_flags="",
-                auto_merge_dependabot=True,
-                auto_update_dependencies=True,
-                dependency_min_age_days=30,
-                dry_run=True,
-                exclude=set(),
-                max_fix_attempts=4,
-                push_changes=False,
-                rollback_on_ci_failure=False,
-                run_tests=True,
-            )
-            maintainer = gm.Maintainer(tmppath, config)
+            maintainer = gm.Maintainer(tmppath, default_config)
             assert maintainer.detect_test_command() == "pytest"
 
-    def test_detect_cargo_test(self):
+    def test_detect_cargo_test(self, default_config):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmppath = Path(tmpdir)
             (tmppath / ".git").mkdir()
             (tmppath / "Cargo.toml").write_text("[package]")
-
-            config = gm.Config(
-                agent_command="echo",
-                agent_flags="",
-                auto_merge_dependabot=True,
-                auto_update_dependencies=True,
-                dependency_min_age_days=30,
-                dry_run=True,
-                exclude=set(),
-                max_fix_attempts=4,
-                push_changes=False,
-                rollback_on_ci_failure=False,
-                run_tests=True,
-            )
-            maintainer = gm.Maintainer(tmppath, config)
+            maintainer = gm.Maintainer(tmppath, default_config)
             assert maintainer.detect_test_command() == "cargo test"
 
-    def test_detect_no_test(self):
+    def test_detect_no_test(self, default_config):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmppath = Path(tmpdir)
             (tmppath / ".git").mkdir()
-
-            config = gm.Config(
-                agent_command="echo",
-                agent_flags="",
-                auto_merge_dependabot=True,
-                auto_update_dependencies=True,
-                dependency_min_age_days=30,
-                dry_run=True,
-                exclude=set(),
-                max_fix_attempts=4,
-                push_changes=False,
-                rollback_on_ci_failure=False,
-                run_tests=True,
-            )
-            maintainer = gm.Maintainer(tmppath, config)
+            maintainer = gm.Maintainer(tmppath, default_config)
             assert maintainer.detect_test_command() is None
 
 
 class TestBuildCommitMessage:
     """Tests for commit message building."""
 
-    def test_commit_message_deps_only(self):
+    def test_commit_message_deps_only(self, default_config):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmppath = Path(tmpdir)
             (tmppath / ".git").mkdir()
-
-            config = gm.Config(
-                agent_command="echo",
-                agent_flags="",
-                auto_merge_dependabot=True,
-                auto_update_dependencies=True,
-                dependency_min_age_days=30,
-                dry_run=True,
-                exclude=set(),
-                max_fix_attempts=4,
-                push_changes=False,
-                rollback_on_ci_failure=False,
-                run_tests=True,
-            )
-            maintainer = gm.Maintainer(tmppath, config)
+            maintainer = gm.Maintainer(tmppath, default_config)
             msg = maintainer.build_commit_message([], had_dep_updates=True)
             assert "chore(deps): update direct dependencies" in msg
 
-    def test_commit_message_prs_only(self):
+    def test_commit_message_prs_only(self, default_config):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmppath = Path(tmpdir)
             (tmppath / ".git").mkdir()
-
-            config = gm.Config(
-                agent_command="echo",
-                agent_flags="",
-                auto_merge_dependabot=True,
-                auto_update_dependencies=True,
-                dependency_min_age_days=30,
-                dry_run=True,
-                exclude=set(),
-                max_fix_attempts=4,
-                push_changes=False,
-                rollback_on_ci_failure=False,
-                run_tests=True,
-            )
-            maintainer = gm.Maintainer(tmppath, config)
+            maintainer = gm.Maintainer(tmppath, default_config)
             msg = maintainer.build_commit_message([123], had_dep_updates=False)
             assert "#123" in msg
             assert "dependabot" in msg.lower()
 
-    def test_commit_message_fix(self):
+    def test_commit_message_fix(self, default_config):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmppath = Path(tmpdir)
             (tmppath / ".git").mkdir()
-
-            config = gm.Config(
-                agent_command="echo",
-                agent_flags="",
-                auto_merge_dependabot=True,
-                auto_update_dependencies=True,
-                dependency_min_age_days=30,
-                dry_run=True,
-                exclude=set(),
-                max_fix_attempts=4,
-                push_changes=False,
-                rollback_on_ci_failure=False,
-                run_tests=True,
-            )
-            maintainer = gm.Maintainer(tmppath, config)
-            msg = maintainer.build_commit_message(
-                [], had_dep_updates=False, is_fix=True
-            )
+            maintainer = gm.Maintainer(tmppath, default_config)
+            msg = maintainer.build_commit_message([], had_dep_updates=False, is_fix=True)
             assert "fix: CI build failure" in msg
 
 

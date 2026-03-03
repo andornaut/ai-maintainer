@@ -83,7 +83,7 @@ AI agents receive untrusted data (CI logs, dependency files, test output) that c
 python -m pytest test_github_maintainer.py -v
 
 # Run a single test
-python -m pytest test_github_maintainer.py::TestValidateCommand -v
+python -m pytest test_github_maintainer.py::TestGitClient -v
 ```
 
 ## License
