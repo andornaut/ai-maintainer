@@ -42,16 +42,20 @@ github-maintainer -e repo1 -e repo2             # Exclude repos
 
 | Flag | Description |
 |------|-------------|
-| `--dry-run` | Preview without making changes |
+| `--dry-run`, `-n` | Preview without making changes |
 | `--limit N` | Process at most N repos with changes |
 | `--no-merge-dependabot` | Skip merging dependabot PRs |
 | `--no-update-dependencies` | Skip dependency updates |
 | `--no-run-tests` | Skip running tests |
 | `--no-push` | Don't push to remote |
 | `--wait-for-ci` | Wait for CI and fix failures |
-| `--dependency-age-threshold N` | Skip updates newer than N days (default: 30) |
+| `--dependency-min-age-days N` | Skip dependencies newer than N days (default: 30) |
+| `--max-fix-attempts N` | Max AI fix attempts per repo (default: 4) |
 | `--agent-command CMD` | AI agent executable (default: `claude`) |
+| `--agent-flags FLAGS` | Flags passed to agent (default: `-p --dangerously-skip-permissions`) |
 | `-e/--exclude REPO` | Exclude repository by name (repeatable) |
+| `-v/--verbose` | Verbose output (debug level) |
+| `-q/--quiet` | Quiet mode (errors only) |
 
 ## Automation
 
