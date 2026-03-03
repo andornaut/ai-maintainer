@@ -1921,11 +1921,24 @@ def main():
 
     logger.info("=" * 80)
     logger.info(f"GitHub Maintainer v{__version__} - {datetime.now().isoformat()}")
-    logger.info(f"Scanning directory: {args.base_dir}")
-    logger.info(f"Agent command: {config.agent_command} {config.agent_flags}")
-    logger.info(f"Dry run: {config.dry_run}")
+    logger.info(f"Base directory: {args.base_dir}")
+    logger.info(f"Agent: {config.agent_command} {config.agent_flags}")
+    logger.info(f"Dependency min age: {config.dependency_min_age_days} days")
+    logger.info(f"Max fix attempts: {config.max_fix_attempts}")
+    logger.info(
+        f"Features: dependabot={config.auto_merge_dependabot}, "
+        f"deps={config.auto_update_dependencies}, "
+        f"tests={config.run_tests}, "
+        f"push={config.push_changes}"
+    )
+    if config.rollback_on_ci_failure:
+        logger.info("Rollback on CI failure: enabled")
+    if config.dry_run:
+        logger.info("DRY RUN MODE - no changes will be made")
     if args.limit:
         logger.info(f"Limit: {args.limit} repositories with changes")
+    if config.exclude:
+        logger.info(f"Excluding: {', '.join(sorted(config.exclude))}")
     logger.info("=" * 80)
 
     # Find repositories
