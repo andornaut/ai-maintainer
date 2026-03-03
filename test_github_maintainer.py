@@ -211,6 +211,35 @@ class TestGitClient:
         assert client.repo_name == "my-repo"
 
 
+class TestFindRepos:
+    """Tests for find_repos function."""
+
+    def test_base_dir_is_git_repo(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            (tmppath / ".git").mkdir()
+            repos = gm.find_repos(tmppath, MagicMock())
+            assert repos == [tmppath]
+
+    def test_finds_subdirectory_repos(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            # Create two git repos as subdirectories
+            (tmppath / "repo-a" / ".git").mkdir(parents=True)
+            (tmppath / "repo-b" / ".git").mkdir(parents=True)
+            # Create a non-repo directory
+            (tmppath / "not-a-repo").mkdir()
+            repos = gm.find_repos(tmppath, MagicMock())
+            assert len(repos) == 2
+            assert (tmppath / "repo-a") in repos
+            assert (tmppath / "repo-b") in repos
+
+    def test_empty_directory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repos = gm.find_repos(Path(tmpdir), MagicMock())
+            assert repos == []
+
+
 class TestMaintainerValidation:
     """Tests for Maintainer validation methods."""
 

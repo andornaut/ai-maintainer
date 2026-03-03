@@ -1668,7 +1668,11 @@ class Maintainer:
 
 
 def find_repos(base_dir: Path, logger: logging.Logger) -> List[Path]:
-    """Find all git repositories in the specified directory."""
+    """Find git repositories to process.
+
+    If base_dir is itself a git repository, returns just that directory.
+    Otherwise, returns all git repository subdirectories (non-recursive).
+    """
     if not base_dir.exists():
         logger.error(f"Directory not found: {base_dir}")
         return []
@@ -1677,7 +1681,12 @@ def find_repos(base_dir: Path, logger: logging.Logger) -> List[Path]:
         logger.error(f"Not a directory: {base_dir}")
         return []
 
-    # Only include git repositories, excluding hidden directories and symlinks
+    # If base_dir itself is a git repo, process only it
+    if (base_dir / ".git").exists():
+        logger.debug(f"Base directory is a git repository: {base_dir}")
+        return [base_dir]
+
+    # Otherwise, find git repositories in subdirectories
     repos = []
     try:
         for item in base_dir.iterdir():
