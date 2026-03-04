@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for github-maintainer."""
+"""Unit tests for ai-maintainer."""
 
 import importlib.machinery
 
@@ -12,11 +12,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
-module_path = Path(__file__).parent / "github-maintainer"
-loader = importlib.machinery.SourceFileLoader("github_maintainer", str(module_path))
-spec = importlib.util.spec_from_loader("github_maintainer", loader)
+module_path = Path(__file__).parent / "ai-maintainer"
+loader = importlib.machinery.SourceFileLoader("ai_maintainer", str(module_path))
+spec = importlib.util.spec_from_loader("ai_maintainer", loader)
 gm = importlib.util.module_from_spec(spec)
-sys.modules["github_maintainer"] = gm
+sys.modules["ai_maintainer"] = gm
 spec.loader.exec_module(gm)
 
 

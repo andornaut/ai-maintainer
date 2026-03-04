@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GitHub Maintainer - Automated repository maintenance with AI-assisted decision making.
+AI Maintainer - Automated repository maintenance with AI-assisted decision making.
 
 Manages GitHub repositories by:
 - Pulling latest changes
@@ -44,7 +44,7 @@ DEFAULT_DEPENDENCY_MIN_AGE_DAYS = 30
 DEFAULT_MAX_FIX_ATTEMPTS = 4
 
 # Other constants
-TOOL_REPO_URL = "https://github.com/andornaut/github-maintainer"
+TOOL_REPO_URL = "https://github.com/andornaut/ai-maintainer"
 
 # Dependency files to check for in repositories
 DEPENDENCY_FILES = (
@@ -437,14 +437,14 @@ class GitClient:
         return (self.repo_path / ".git").exists()
 
     def is_latest_commit_from_maintainer(self) -> bool:
-        """Check if the latest commit was created by github-maintainer."""
+        """Check if the latest commit was created by ai-maintainer."""
         success, stdout, _ = run_command(
             ["git", "log", "-1", "--format=%B"], self.repo_path
         )
         if not success:
             return False
         # Check for our attribution in the commit message
-        return TOOL_REPO_URL in stdout or "github-maintainer" in stdout.lower()
+        return TOOL_REPO_URL in stdout or "ai-maintainer" in stdout.lower()
 
     def is_workdir_clean(self) -> bool:
         """Check if working directory is clean."""
@@ -809,7 +809,7 @@ class Maintainer:
             details = []
 
         return f"{title}\n\n" + "\n".join(
-            details + ["", "Created by github-maintainer", TOOL_REPO_URL]
+            details + ["", "Created by ai-maintainer", TOOL_REPO_URL]
         )
 
     def close_dependabot_prs(self, pr_numbers: List[int]) -> None:
@@ -820,7 +820,7 @@ class Maintainer:
                     f"[{self.repo_name}] DRY RUN: Would close PR #{pr_num}"
                 )
             elif self.github.close_pr(
-                pr_num, "Closed: merged locally by github-maintainer"
+                pr_num, "Closed: merged locally by ai-maintainer"
             ):
                 self.logger.debug(f"[{self.repo_name}] Closed PR #{pr_num}")
             else:
@@ -1101,7 +1101,7 @@ class Maintainer:
         # Stash the current changes (dependency updates) before first attempt
         # This allows us to restore them if AI's fix doesn't work
         stash_success, _, _ = run_command(
-            ["git", "stash", "push", "-m", "github-maintainer: dependency updates"],
+            ["git", "stash", "push", "-m", "ai-maintainer: dependency updates"],
             self.repo_path,
         )
         if not stash_success:
@@ -1150,7 +1150,7 @@ class Maintainer:
             True if repo is valid and ready, False otherwise.
         """
         # Skip self to prevent modifying this script while running
-        if self.repo_name == "github-maintainer":
+        if self.repo_name == "ai-maintainer":
             self.logger.debug(f"[{self.repo_name}] Skipping self")
             return False
 
@@ -1228,7 +1228,7 @@ class Maintainer:
         if initial_ci == "failure":
             if self.git.is_latest_commit_from_maintainer():
                 self.logger.warning(
-                    f"[{self.repo_name}] CI is failing from a previous github-maintainer run, will attempt to fix"
+                    f"[{self.repo_name}] CI is failing from a previous ai-maintainer run, will attempt to fix"
                 )
                 if self.fix_ci_with_retries():
                     self.logger.warning(f"[{self.repo_name}] Previous CI failure fixed")
@@ -1240,7 +1240,7 @@ class Maintainer:
                     return False, ci_was_passing
             else:
                 self.logger.warning(
-                    f"[{self.repo_name}] CI is already failing (not from github-maintainer), will not attempt fixes"
+                    f"[{self.repo_name}] CI is already failing (not from ai-maintainer), will not attempt fixes"
                 )
 
         return True, ci_was_passing
@@ -1613,7 +1613,7 @@ class Maintainer:
                         )
                 return False, merged_prs
 
-            commit_msg = f"Merge dependabot PR #{pr_num}\n\nCreated by github-maintainer\n{TOOL_REPO_URL}"
+            commit_msg = f"Merge dependabot PR #{pr_num}\n\nCreated by ai-maintainer\n{TOOL_REPO_URL}"
             success, _, stderr = run_command(
                 ["git", "commit", "-m", commit_msg], self.repo_path
             )
@@ -1900,7 +1900,7 @@ def main():
     )
 
     logger.info("=" * 80)
-    logger.info(f"GitHub Maintainer v{__version__} - {datetime.now().isoformat()}")
+    logger.info(f"AI Maintainer v{__version__} - {datetime.now().isoformat()}")
     logger.info(f"Base directory: {args.base_dir}")
     logger.info(f"Agent: {config.agent_command} {config.agent_flags}")
     logger.info(f"Dependency min age: {config.dependency_min_age_days} days")

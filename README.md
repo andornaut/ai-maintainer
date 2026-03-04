@@ -1,4 +1,4 @@
-# GitHub Maintainer
+# AI Maintainer
 
 Automated GitHub repository maintenance with AI-powered dependency updates, test fixing, and CI monitoring.
 
@@ -7,10 +7,10 @@ Merges dependabot PRs (GPG-verified), updates direct dependencies (with age cons
 ## Installation
 
 ```bash
-git clone https://github.com/andornaut/github-maintainer.git
-cd github-maintainer
-chmod +x github-maintainer
-ln -s "$(pwd)/github-maintainer" ~/.local/bin/
+git clone https://github.com/andornaut/ai-maintainer.git
+cd ai-maintainer
+chmod +x ai-maintainer
+ln -s "$(pwd)/ai-maintainer" ~/.local/bin/
 ```
 
 **Requirements**: Python 3.7+, Git, [GitHub CLI](https://cli.github.com/) (`gh auth login`), and [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) (or [Ollama](https://ollama.ai/))
@@ -19,19 +19,19 @@ ln -s "$(pwd)/github-maintainer" ~/.local/bin/
 
 ```bash
 # Preview changes (recommended first run)
-github-maintainer --dry-run --verbose
+ai-maintainer --dry-run --verbose
 
 # Process all repos in current directory
-github-maintainer
+ai-maintainer
 
 # Process specific directory, limit to 5 repos
-github-maintainer --base-dir ~/src/github.com --limit 5
+ai-maintainer --base-dir ~/src/github.com --limit 5
 
 # Exclude specific repos
-github-maintainer -e forked-repo -e broken-repo
+ai-maintainer -e forked-repo -e broken-repo
 
 # Use different AI agent
-github-maintainer --agent-command "ollama run llama3"
+ai-maintainer --agent-command "ollama run llama3"
 ```
 
 ## How it works
@@ -80,10 +80,10 @@ AI agents receive untrusted data (CI logs, dependency files, test output) that c
 
 ```bash
 # Run tests
-python -m pytest test_github_maintainer.py -v
+python -m pytest test_ai_maintainer.py -v
 
 # Run a single test
-python -m pytest test_github_maintainer.py::TestGitClient -v
+python -m pytest test_ai_maintainer.py::TestGitClient -v
 ```
 
 ## License

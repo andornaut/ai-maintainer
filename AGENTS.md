@@ -1,6 +1,6 @@
 # AI Agent Integration
 
-GitHub Maintainer uses AI agents for:
+AI Maintainer uses AI agents for:
 
 - **Dependency updates**: Analyze and update direct dependencies
 - **Test fixing**: Diagnose and fix test failures after updates
