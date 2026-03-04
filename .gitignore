@@ -20,3 +20,6 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
+
+# AI agent instructions (local only)
+AGENTS.md
