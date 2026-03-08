@@ -521,7 +521,7 @@ class GitClient:
                 return False
             # Other push errors (network, etc.) - log but don't treat as archived
             self.logger.warning(
-                f"[{self.repo_name}] Push test failed but may not be archived: {stderr.strip()}"
+                f"[{self.repo_name}] Push test failed: {stderr.strip()}"
             )
         return success
 
@@ -570,7 +570,7 @@ class GitClient:
             )
             return False
 
-        self.logger.warning(f"[{self.repo_name}] Successfully rolled back last commit")
+        self.logger.info(f"[{self.repo_name}] Successfully rolled back last commit")
         return True
 
 
@@ -729,14 +729,15 @@ class GitHubClient:
 
         return stdout.strip().lower() == "true"
 
-    def wait_for_ci(self, head_sha: str, timeout_minutes: int, logger) -> Optional[str]:
+    def wait_for_ci(self, head_sha: str, timeout_minutes: int, logger, repo_name: str = "") -> Optional[str]:
         """Wait for CI to complete on a specific commit.
 
         Returns 'success', 'failure', or None if unable to determine.
         """
+        prefix = f"[{repo_name}] " if repo_name else ""
         if not self.is_authenticated:
             logger.warning(
-                "GitHub CLI not authenticated, skipping CI check. "
+                f"{prefix}GitHub CLI not authenticated, skipping CI check. "
                 "Run 'gh auth login' to enable CI monitoring."
             )
             return None
@@ -770,17 +771,17 @@ class GitHubClient:
             # Find the run for our commit
             run = next((r for r in runs if r.get("headSha") == head_sha), None)
             if not run:
-                logger.debug(f"No CI run for {head_sha[:7]} yet, waiting...")
+                logger.debug(f"{prefix}No CI run for {head_sha[:7]} yet, waiting...")
                 time.sleep(poll_interval)
                 continue
 
             if run.get("status") == "completed":
                 return run.get("conclusion")
 
-            logger.debug(f"CI status: {run.get('status')}, waiting...")
+            logger.debug(f"{prefix}CI status: {run.get('status')}, waiting...")
             time.sleep(poll_interval)
 
-        logger.error(f"CI timed out after {timeout_minutes} minutes")
+        logger.error(f"{prefix}CI timed out after {timeout_minutes} minutes")
         return None
 
     def _get_runs(
@@ -937,11 +938,11 @@ class Maintainer:
         commit_sha = self.git.get_head_sha()
         if self.github.repo_url and commit_sha:
             commit_url = f"{self.github.repo_url}/commit/{commit_sha}"
-            self.logger.warning(
+            self.logger.info(
                 f"[{self.repo_name}] Committed and pushed ({commit_sha[:7]}): {commit_url}"
             )
         else:
-            self.logger.warning(f"[{self.repo_name}] Committed and pushed")
+            self.logger.info(f"[{self.repo_name}] Committed and pushed")
         return True, True
 
     def detect_test_command(self) -> Optional[str]:
@@ -1084,7 +1085,7 @@ class Maintainer:
         self.logger.info(f"[{self.repo_name}] AI fix: {changes}")
 
         if not self.run_tests()[0]:
-            self.logger.warning(f"[{self.repo_name}] Tests still failing after fix")
+            self.logger.error(f"[{self.repo_name}] Tests still failing after fix")
             self.git.reset_changes()
             return False
 
@@ -1177,13 +1178,13 @@ class Maintainer:
 
         current_branch = self.git.current_branch
         if not current_branch:
-            self.logger.warning(
+            self.logger.info(
                 f"[{self.repo_name}] Could not determine current branch, skipping"
             )
             return False
 
         if current_branch != default_branch:
-            self.logger.warning(
+            self.logger.info(
                 f"[{self.repo_name}] Not on default branch (current: {current_branch}, default: {default_branch}), skipping"
             )
             return False
@@ -1233,7 +1234,7 @@ class Maintainer:
                     f"[{self.repo_name}] CI is failing from a previous ai-maintainer run, will attempt to fix"
                 )
                 if self.fix_ci_with_retries():
-                    self.logger.warning(f"[{self.repo_name}] Previous CI failure fixed")
+                    self.logger.info(f"[{self.repo_name}] Previous CI failure fixed")
                     return True, True
                 else:
                     self.logger.error(
@@ -1283,7 +1284,7 @@ class Maintainer:
         if self.fix_ci_with_retries():
             ci_url = self.github.get_latest_ci_run_url()
             ci_url_suffix = f": {ci_url}" if ci_url else ""
-            self.logger.warning(f"[{self.repo_name}] CI failure fixed{ci_url_suffix}")
+            self.logger.info(f"[{self.repo_name}] CI failure fixed{ci_url_suffix}")
             return True
 
         # Failed to fix CI
@@ -1364,7 +1365,7 @@ class Maintainer:
                 return False, committed_changes
 
         if committed_changes:
-            self.logger.warning(
+            self.logger.info(
                 f"[{self.repo_name}] Maintenance completed successfully with changes"
             )
         else:
@@ -1499,7 +1500,7 @@ class Maintainer:
             # Check if AI actually made changes
             had_changes = not self.git.is_workdir_clean()
             if had_changes:
-                self.logger.warning(
+                self.logger.info(
                     f"[{self.repo_name}] Dependencies updated: {changes_made}"
                 )
             else:
@@ -1633,7 +1634,7 @@ class Maintainer:
                     )
                 return False, merged_prs
 
-            self.logger.warning(
+            self.logger.info(
                 f"[{self.repo_name}] PR #{pr_num} merged locally successfully"
             )
             merged_prs.append(pr_num)
@@ -1649,7 +1650,7 @@ class Maintainer:
         self.logger.debug(
             f"[{self.repo_name}] Waiting for CI on commit {head_sha[:7]}..."
         )
-        return self.github.wait_for_ci(head_sha, timeout_minutes, self.logger)
+        return self.github.wait_for_ci(head_sha, timeout_minutes, self.logger, self.repo_name)
 
 
 def find_repos(base_dir: Path, logger: logging.Logger) -> List[Path]:
