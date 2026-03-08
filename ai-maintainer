@@ -18,6 +18,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -100,6 +101,8 @@ def run_command(
             cmd, cwd=cwd, capture_output=True, text=True, shell=shell
         )
         return result.returncode == 0, result.stdout, result.stderr
+    except KeyboardInterrupt:
+        raise
     except (subprocess.SubprocessError, OSError, FileNotFoundError) as e:
         return False, "", str(e)
 
@@ -309,25 +312,45 @@ Respond with ONLY a JSON object. No explanations, no markdown outside the JSON.
         env.pop("CLAUDECODE", None)
 
         try:
-            result = subprocess.run(
+            # Use Popen with start_new_session and stdin=DEVNULL so the agent
+            # runs in its own process group without terminal access. This
+            # prevents it from setting the terminal to raw mode (which
+            # disables SIGINT generation from CTRL+C) and allows
+            # KeyboardInterrupt to be raised in our polling loop.
+            proc = subprocess.Popen(
                 agent_cmd,
-                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 env=env,
-                timeout=DEFAULT_AGENT_TIMEOUT_SECONDS,
+                start_new_session=True,
             )
-            stdout, stderr = result.stdout, result.stderr
-        except subprocess.TimeoutExpired:
-            self.logger.error(f"[{self.repo_name}] Agent timed out")
-            return json.dumps({"error": "Agent timed out"})
+            deadline = time.monotonic() + DEFAULT_AGENT_TIMEOUT_SECONDS
+            try:
+                while proc.poll() is None:
+                    if time.monotonic() >= deadline:
+                        proc.terminate()
+                        proc.wait(timeout=5)
+                        self.logger.error(f"[{self.repo_name}] Agent timed out")
+                        return json.dumps({"error": "Agent timed out"})
+                    time.sleep(0.5)
+                stdout, stderr = proc.communicate()
+            except KeyboardInterrupt:
+                self.logger.warning(f"[{self.repo_name}] Interrupted by user")
+                os.killpg(proc.pid, signal.SIGTERM)
+                proc.wait(timeout=5)
+                raise
+        except KeyboardInterrupt:
+            raise
         except (subprocess.SubprocessError, OSError) as e:
             self.logger.error(f"[{self.repo_name}] Agent error: {e}")
             return json.dumps({"error": str(e)})
 
-        if result.returncode == 0:
+        if proc.returncode == 0:
             return stdout
 
-        error_parts = [f"exit code {result.returncode}"]
+        error_parts = [f"exit code {proc.returncode}"]
         if stderr.strip():
             error_parts.append(f"stderr: {stderr.strip()}")
         if stdout.strip():
@@ -1631,7 +1654,7 @@ class Maintainer:
                     )
                 return False, merged_prs
 
-            self.logger.info(
+            self.logger.warning(
                 f"[{self.repo_name}] PR #{pr_num} merged locally successfully"
             )
             merged_prs.append(pr_num)
@@ -1697,7 +1720,7 @@ def find_repos(base_dir: Path, logger: logging.Logger) -> List[Path]:
 def setup_logging(verbose: bool, quiet: bool) -> logging.Logger:
     """Setup logging configuration."""
     if quiet:
-        level = logging.ERROR
+        level = logging.WARNING
     elif verbose:
         level = logging.DEBUG
     else:
