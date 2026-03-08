@@ -42,6 +42,7 @@ DEFAULT_AGENT_TIMEOUT_SECONDS = 300
 DEFAULT_CI_LOG_MAX_LENGTH = 10000
 DEFAULT_CI_TIMEOUT_MINUTES = 10
 DEFAULT_DEPENDENCY_MIN_AGE_DAYS = 30
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 120
 DEFAULT_MAX_FIX_ATTEMPTS = 4
 
 # Other constants
@@ -93,18 +94,32 @@ class Config:
 
 
 def run_command(
-    cmd: Union[List[str], str], cwd: Path, shell: bool = False
+    cmd: Union[List[str], str],
+    cwd: Path,
+    shell: bool = False,
+    timeout: int = DEFAULT_COMMAND_TIMEOUT_SECONDS,
 ) -> CommandResult:
     """Run a command and return (success, stdout, stderr)."""
     try:
         result = subprocess.run(
-            cmd, cwd=cwd, capture_output=True, text=True, shell=shell
+            cmd, cwd=cwd, capture_output=True, text=True, shell=shell, timeout=timeout
         )
         return result.returncode == 0, result.stdout, result.stderr
+    except subprocess.TimeoutExpired:
+        return False, "", f"Command timed out after {timeout}s"
     except KeyboardInterrupt:
         raise
     except (subprocess.SubprocessError, OSError, FileNotFoundError) as e:
         return False, "", str(e)
+
+
+def run_shell_command(
+    cmd: str,
+    cwd: Path,
+    timeout: int = DEFAULT_COMMAND_TIMEOUT_SECONDS,
+) -> CommandResult:
+    """Run a shell command string via bash and return (success, stdout, stderr)."""
+    return run_command(["bash", "-c", cmd], cwd, timeout=timeout)
 
 
 def safe_json_parse(text: str, default: Any = None) -> Any:
@@ -133,7 +148,6 @@ class ProjectEnvironment:
     def __init__(self, repo_path: Path):
         self.repo_path = repo_path
         self._env_runner: Optional[str] = None
-        self._needs_bash = False
         self._detect()
 
     def _detect(self):
@@ -141,23 +155,16 @@ class ProjectEnvironment:
         # Node.js projects (.nvmrc)
         if (self.repo_path / ".nvmrc").exists():
             self._env_runner = self._detect_node_runner()
-            self._needs_bash = self._env_runner is not None and (
-                "nvm" in self._env_runner or "fnm" in self._env_runner
-            )
         # Ruby projects (Gemfile or .ruby-version)
         elif (self.repo_path / "Gemfile").exists() or (
             self.repo_path / ".ruby-version"
         ).exists():
             self._env_runner = self._detect_ruby_runner()
-            self._needs_bash = self._env_runner is not None and (
-                "chruby" in self._env_runner or "rbenv init" in self._env_runner
-            )
         # Python projects (Pipfile or poetry.lock)
         elif (self.repo_path / "Pipfile").exists() or (
             self.repo_path / "poetry.lock"
         ).exists():
             self._env_runner = self._detect_python_runner()
-            self._needs_bash = False
 
     def _detect_node_runner(self) -> Optional[str]:
         """Detect Node.js version manager (nvm or fnm)."""
@@ -246,10 +253,6 @@ class ProjectEnvironment:
         """Get the environment runner prefix for this project."""
         return self._env_runner
 
-    @property
-    def needs_bash(self) -> bool:
-        """Check if commands need to be run with bash explicitly."""
-        return self._needs_bash
 
 
 class AgentClient:
@@ -262,6 +265,18 @@ class AgentClient:
         self.repo_name = repo_name
         self.config = config
         self.logger = logger
+
+    @staticmethod
+    def _kill_agent(proc: subprocess.Popen) -> None:
+        """Terminate the agent process group, escalating to SIGKILL if needed."""
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+        except OSError:
+            pass
 
     def ask(self, prompt: str, context: Optional[Dict[str, Any]] = None) -> str:
         """Ask the AI agent for a decision.
@@ -330,16 +345,14 @@ Respond with ONLY a JSON object. No explanations, no markdown outside the JSON.
             try:
                 while proc.poll() is None:
                     if time.monotonic() >= deadline:
-                        proc.terminate()
-                        proc.wait(timeout=5)
+                        self._kill_agent(proc)
                         self.logger.error(f"[{self.repo_name}] Agent timed out")
                         return json.dumps({"error": "Agent timed out"})
                     time.sleep(0.5)
                 stdout, stderr = proc.communicate()
             except KeyboardInterrupt:
                 self.logger.warning(f"[{self.repo_name}] Interrupted by user")
-                os.killpg(proc.pid, signal.SIGTERM)
-                proc.wait(timeout=5)
+                self._kill_agent(proc)
                 raise
         except KeyboardInterrupt:
             raise
@@ -385,10 +398,14 @@ Respond with ONLY a JSON object. No explanations, no markdown outside the JSON.
             if extracted:
                 return extracted
 
-        # Try to find a JSON object in the response (handles text before/after JSON)
-        match = re.search(r"\{[\s\S]*\}", response)
-        if match:
-            return match.group(0)
+        # Try to find a valid JSON object by attempting to parse from each '{'
+        for match in re.finditer(r"\{", response):
+            try:
+                obj = json.loads(response[match.start() :])
+                if isinstance(obj, dict):
+                    return json.dumps(obj)
+            except json.JSONDecodeError:
+                continue
 
         return '{"error": "No JSON found in agent response"}'
 
@@ -973,20 +990,6 @@ class Maintainer:
 
         return None
 
-    def _run_shell_command(self, cmd: str) -> CommandResult:
-        """Run a shell command with appropriate shell handling.
-
-        Automatically determines whether to use bash explicitly based on
-        the project environment (version managers like nvm/chruby require bash).
-
-        Returns:
-            Tuple of (success, stdout, stderr)
-        """
-        if self.project_env.needs_bash:
-            return run_command(["bash", "-c", cmd], self.repo_path, shell=False)
-        else:
-            return run_command(cmd, self.repo_path, shell=True)
-
     def fix_ci_failure(self, logs: str) -> bool:
         """Ask AI to fix a CI failure, verify, commit and push. Returns True if successful."""
         self.logger.info(f"[{self.repo_name}] Asking AI to fix CI failure...")
@@ -1060,14 +1063,10 @@ class Maintainer:
 
         return False
 
-    def fix_test_failure(self, test_output: str, preserve_stash: bool = False) -> bool:
-        """Ask AI to fix a local test failure. Returns True if tests now pass.
+    def _try_fix_tests(self, test_output: str) -> bool:
+        """Ask AI to fix a test failure and verify. Returns True if tests pass.
 
-        Args:
-            test_output: The test failure output to analyze
-            preserve_stash: If True, restore from git stash on failure instead of full reset
-
-        Note: Resets AI's changes on failure while preserving stashed dependency updates.
+        On failure, resets the working directory to undo AI's changes.
         """
         self.logger.info(f"[{self.repo_name}] Asking AI to fix test failure...")
 
@@ -1079,36 +1078,14 @@ class Maintainer:
             {"test_output": test_output},
         )
         if not changes:
-            if preserve_stash:
-                # Restore dependency updates from stash
-                success, _, stderr = run_command(
-                    ["git", "stash", "pop"], self.repo_path
-                )
-                if not success:
-                    self.logger.error(
-                        f"[{self.repo_name}] Failed to restore stashed changes: {stderr}"
-                    )
-                    self.git.reset_changes()
-            else:
-                self.git.reset_changes()
+            self.git.reset_changes()
             return False
 
         self.logger.info(f"[{self.repo_name}] AI fix: {changes}")
 
         if not self.run_tests()[0]:
             self.logger.warning(f"[{self.repo_name}] Tests still failing after fix")
-            if preserve_stash:
-                # Reset AI's changes and restore dependency updates from stash
-                self.git.reset_changes()
-                success, _, stderr = run_command(
-                    ["git", "stash", "pop"], self.repo_path
-                )
-                if not success:
-                    self.logger.error(
-                        f"[{self.repo_name}] Failed to restore stashed changes: {stderr}"
-                    )
-            else:
-                self.git.reset_changes()
+            self.git.reset_changes()
             return False
 
         self.logger.info(f"[{self.repo_name}] Tests passing after AI fix")
@@ -1118,48 +1095,50 @@ class Maintainer:
         """Attempt to fix test failures with retries. Returns True if tests pass.
 
         Uses git stash to preserve dependency updates across retry attempts.
+        On each failed attempt, resets to the original dependency-updated state.
         """
         max_attempts = self.config.max_fix_attempts
-
-        # Stash the current changes (dependency updates) before first attempt
-        # This allows us to restore them if AI's fix doesn't work
-        stash_success, _, _ = run_command(
-            ["git", "stash", "push", "-m", "ai-maintainer: dependency updates"],
-            self.repo_path,
-        )
-        if not stash_success:
-            self.logger.error(
-                f"[{self.repo_name}] Failed to stash changes before fix attempts"
-            )
-            return False
-
-        # Restore the stashed changes for the first attempt
-        success, _, stderr = run_command(["git", "stash", "pop"], self.repo_path)
-        if not success:
-            self.logger.error(
-                f"[{self.repo_name}] Failed to restore stashed changes for first attempt: {stderr}"
-            )
-            return False
 
         for attempt in range(1, max_attempts + 1):
             self.logger.info(
                 f"[{self.repo_name}] Test fix attempt {attempt}/{max_attempts}"
             )
-            # Use preserve_stash for all attempts except the last one
-            preserve_stash = attempt < max_attempts
-            if self.fix_test_failure(test_output, preserve_stash=preserve_stash):
+
+            # Stash dependency updates so we can restore them if the fix fails
+            stash_success, _, _ = run_command(
+                ["git", "stash", "push", "-m", "ai-maintainer: dependency updates"],
+                self.repo_path,
+            )
+            if not stash_success:
+                self.logger.error(
+                    f"[{self.repo_name}] Failed to stash changes before fix attempt"
+                )
+                return False
+
+            # Restore dependency updates as the starting point for this attempt
+            pop_success, _, stderr = run_command(
+                ["git", "stash", "pop"], self.repo_path
+            )
+            if not pop_success:
+                self.logger.error(
+                    f"[{self.repo_name}] Failed to restore stashed changes: {stderr}"
+                )
+                return False
+
+            if self._try_fix_tests(test_output):
                 self.logger.info(
                     f"[{self.repo_name}] Tests passed after {attempt} fix attempt(s)"
                 )
                 return True
+
+            # _try_fix_tests already reset AI's changes; dep updates are still
+            # in the working tree, so re-run tests to capture fresh output
             if attempt < max_attempts:
-                # Re-run tests with dependency updates restored (from stash pop in fix_test_failure)
                 _, test_output = self.run_tests()
 
         self.logger.error(
             f"[{self.repo_name}] Exhausted all {max_attempts} fix attempts"
         )
-        # Final cleanup - reset everything since all attempts failed
         self.git.reset_changes()
         return False
 
@@ -1442,7 +1421,7 @@ class Maintainer:
             # Use shell for commands with shell operators (&&, source, etc.)
             use_shell = "&&" in test_cmd or test_cmd.startswith("source ")
             if use_shell:
-                success, stdout, stderr = self._run_shell_command(test_cmd)
+                success, stdout, stderr = run_shell_command(test_cmd, self.repo_path)
             else:
                 success, stdout, stderr = run_command(
                     shlex.split(test_cmd), self.repo_path
@@ -1879,7 +1858,7 @@ Examples:
         "--verbose", "-v", action="store_true", help="Verbose output (debug level)"
     )
     parser.add_argument(
-        "--quiet", "-q", action="store_true", help="Quiet mode (errors only)"
+        "--quiet", "-q", action="store_true", help="Quiet mode (warnings and errors only)"
     )
 
     return parser.parse_args()
