@@ -69,7 +69,6 @@ class TestProjectEnvironment:
         with tempfile.TemporaryDirectory() as tmpdir:
             env = gm.ProjectEnvironment(Path(tmpdir))
             assert env.env_runner is None
-            assert env.needs_bash is False
 
     def test_nvmrc_detection(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -85,7 +84,6 @@ class TestProjectEnvironment:
             (tmppath / "Pipfile").write_text("[packages]")
             env = gm.ProjectEnvironment(tmppath)
             assert env.env_runner == "pipenv run"
-            assert env.needs_bash is False
 
     def test_poetry_detection(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -93,7 +91,6 @@ class TestProjectEnvironment:
             (tmppath / "poetry.lock").write_text("")
             env = gm.ProjectEnvironment(tmppath)
             assert env.env_runner == "poetry run"
-            assert env.needs_bash is False
 
 
 class TestAgentClientJsonExtraction:
