@@ -493,6 +493,13 @@ class GitClient:
         )
         return success and not stdout.strip()
 
+    def has_unpushed_commits(self) -> bool:
+        """Check if there are local commits not yet pushed to the remote."""
+        success, stdout, _ = run_command(
+            ["git", "rev-list", "@{u}..HEAD", "--count"], self.repo_path
+        )
+        return success and stdout.strip() not in ("", "0")
+
     def pull_changes(self) -> bool:
         """Pull latest changes from remote."""
         self.logger.debug(f"[{self.repo_name}] Pulling changes...")
@@ -528,6 +535,11 @@ class GitClient:
     def reset_changes(self) -> bool:
         """Reset working directory to HEAD, discarding all uncommitted changes."""
         self.logger.debug(f"[{self.repo_name}] Resetting working directory...")
+        # Abort any in-progress merge/rebase (ignore errors if none in progress)
+        run_command(["git", "merge", "--abort"], self.repo_path)
+        run_command(["git", "rebase", "--abort"], self.repo_path)
+        # Also handle squash merges which don't create MERGE_HEAD
+        run_command(["git", "reset", "--merge"], self.repo_path)
         # Reset index first to clear any unmerged entries
         run_command(["git", "reset", "HEAD"], self.repo_path)
         # Reset staged and unstaged changes
@@ -810,6 +822,8 @@ class GitHubClient:
                 "list",
                 "--branch",
                 branch,
+                "--event",
+                "push",
                 "--limit",
                 str(limit),
                 "--json",
@@ -887,66 +901,79 @@ class Maintainer:
         Returns:
             Tuple of (success, had_changes) where:
             - success: whether the operation completed successfully
-            - had_changes: whether there were changes that were committed
+            - had_changes: whether there were changes that were committed or pushed
         """
         if not self.config.push_changes:
             self.logger.debug(f"[{self.repo_name}] Push disabled in config")
             return True, False
 
-        # Check if there are changes
-        if self.git.is_workdir_clean():
-            self.logger.debug(f"[{self.repo_name}] No changes to commit")
+        workdir_dirty = not self.git.is_workdir_clean()
+        committed = False
+
+        # Commit if there are uncommitted changes
+        if workdir_dirty:
+            if self.config.dry_run:
+                self.logger.info(
+                    f"[{self.repo_name}] DRY RUN: Would commit and push changes"
+                )
+                return True, True  # Would have committed
+
+            self.logger.debug(f"[{self.repo_name}] Committing changes...")
+
+            # Stage all changes (including new files created by AI)
+            success, _, stderr = run_command(["git", "add", "-A"], self.repo_path)
+            if not success:
+                self.logger.error(
+                    f"[{self.repo_name}] Command failed: git add -A\n{stderr}"
+                )
+                return False, False
+
+            # Check if anything was actually staged
+            success, stdout, _ = run_command(
+                ["git", "diff", "--cached", "--name-only"], self.repo_path
+            )
+            if not success or not stdout.strip():
+                self.logger.debug(f"[{self.repo_name}] No changes staged for commit")
+                workdir_dirty = False
+            else:
+                success, _, stderr = run_command(
+                    ["git", "commit", "-m", message], self.repo_path
+                )
+                if not success:
+                    self.logger.error(
+                        f"[{self.repo_name}] Command failed: git commit\n{stderr}"
+                    )
+                    return False, False
+                committed = True
+
+        # Push if there are unpushed commits (from this run or previous merges)
+        has_unpushed = self.git.has_unpushed_commits()
+        if not committed and not has_unpushed:
+            self.logger.debug(f"[{self.repo_name}] No changes to commit or push")
             return True, False
 
-        if self.config.dry_run:
-            self.logger.info(
-                f"[{self.repo_name}] DRY RUN: Would commit and push changes"
-            )
-            return True, True  # Would have committed
-
-        # Commit
-        self.logger.debug(f"[{self.repo_name}] Committing changes...")
-
-        # Stage all changes (including new files created by AI)
-        success, _, stderr = run_command(["git", "add", "-A"], self.repo_path)
-        if not success:
-            self.logger.error(
-                f"[{self.repo_name}] Command failed: git add -A\n{stderr}"
-            )
-            return False, False
-
-        # Check if anything was actually staged
-        success, stdout, _ = run_command(
-            ["git", "diff", "--cached", "--name-only"], self.repo_path
-        )
-        if not success or not stdout.strip():
-            self.logger.debug(f"[{self.repo_name}] No changes staged for commit")
-            return True, False  # Not an error, just nothing to commit
-
-        success, _, stderr = run_command(
-            ["git", "commit", "-m", message], self.repo_path
-        )
-        if not success:
-            self.logger.error(
-                f"[{self.repo_name}] Command failed: git commit\n{stderr}"
-            )
-            return False, False
-
-        # Push
-        self.logger.debug(f"[{self.repo_name}] Pushing to remote...")
-        success, _, stderr = run_command(["git", "push"], self.repo_path)
-        if not success:
-            self.logger.error(f"[{self.repo_name}] Command failed: git push\n{stderr}")
-            # Undo the commit since we couldn't push it
-            self.logger.warning(f"[{self.repo_name}] Undoing commit since push failed")
-            reset_success, _, reset_stderr = run_command(
-                ["git", "reset", "--hard", "HEAD^"], self.repo_path
-            )
-            if not reset_success:
-                self.logger.error(
-                    f"[{self.repo_name}] Failed to undo commit after push failure\n{reset_stderr}"
+        if has_unpushed or committed:
+            if self.config.dry_run:
+                self.logger.info(
+                    f"[{self.repo_name}] DRY RUN: Would push unpushed commits"
                 )
-            return False, False
+                return True, True
+
+            self.logger.debug(f"[{self.repo_name}] Pushing to remote...")
+            success, _, stderr = run_command(["git", "push"], self.repo_path)
+            if not success:
+                self.logger.error(f"[{self.repo_name}] Command failed: git push\n{stderr}")
+                if committed:
+                    # Undo only the commit we just made since we couldn't push it
+                    self.logger.warning(f"[{self.repo_name}] Undoing commit since push failed")
+                    reset_success, _, reset_stderr = run_command(
+                        ["git", "reset", "--hard", "HEAD^"], self.repo_path
+                    )
+                    if not reset_success:
+                        self.logger.error(
+                            f"[{self.repo_name}] Failed to undo commit after push failure\n{reset_stderr}"
+                        )
+                return False, False
 
         # Log with commit URL if available
         commit_sha = self.git.get_head_sha()
@@ -1369,8 +1396,8 @@ class Maintainer:
             self.git.reset_changes()
             return False, False
 
-        # Close merged dependabot PRs on GitHub
-        if committed_changes and merged_prs:
+        # Close merged/obsolete dependabot PRs on GitHub
+        if merged_prs:
             self.close_dependabot_prs(merged_prs)
 
         # Monitor CI after push and fix failures if we caused them
@@ -1627,9 +1654,20 @@ class Maintainer:
                     return False, merged_prs
                 continue
 
+            # Check if squash merge actually staged anything
+            success, stdout, _ = run_command(
+                ["git", "diff", "--cached", "--name-only"], self.repo_path
+            )
+            if not stdout.strip():
+                self.logger.info(
+                    f"[{self.repo_name}] PR #{pr_num} changes already on main, skipping"
+                )
+                merged_prs.append(pr_num)
+                continue
+
             commit_msg = f"Merge dependabot PR #{pr_num}\n\nCreated by ai-maintainer\n{TOOL_REPO_URL}"
             success, _, stderr = run_command(
-                ["git", "commit", "-m", commit_msg], self.repo_path
+                ["git", "commit", "--no-verify", "-m", commit_msg], self.repo_path
             )
             if not success:
                 self.logger.warning(
