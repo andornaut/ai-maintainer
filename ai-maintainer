@@ -48,6 +48,9 @@ DEFAULT_MAX_FIX_ATTEMPTS = 4
 # Other constants
 TOOL_REPO_URL = "https://github.com/andornaut/ai-maintainer"
 
+# Workflow name prefixes to exclude from CI detection (e.g. GitHub-managed workflows)
+IGNORED_WORKFLOW_PREFIXES = ("Dependabot",)
+
 # Dependency files to check for in repositories
 DEPENDENCY_FILES = (
     "Cargo.toml",
@@ -421,9 +424,9 @@ class GitClient:
     def repo_name(self) -> str:
         return self.repo_path.name
 
-    @functools.cached_property
+    @property
     def current_branch(self) -> Optional[str]:
-        """Get current branch name (cached)."""
+        """Get current branch name."""
         success, stdout, _ = run_command(
             ["git", "branch", "--show-current"], self.repo_path
         )
@@ -609,7 +612,7 @@ class GitHubClient:
         return url
 
     def close_pr(self, pr_num: int, comment: str) -> bool:
-        """Close a PR with a comment."""
+        """Close a PR with a comment and delete its remote branch."""
         success, _, _ = run_command(
             [
                 "gh",
@@ -618,6 +621,7 @@ class GitHubClient:
                 str(pr_num),
                 "--comment",
                 comment,
+                "--delete-branch",
             ],
             self.repo_path,
         )
@@ -658,7 +662,8 @@ class GitHubClient:
         return stdout
 
     def get_dependabot_prs(self) -> List[Dict[str, Any]]:
-        """Get open dependabot PRs."""
+        """Get open dependabot PRs targeting the current branch."""
+        base_branch = self._git.current_branch or "main"
         success, stdout, _ = run_command(
             [
                 "gh",
@@ -666,6 +671,8 @@ class GitHubClient:
                 "list",
                 "--author",
                 "app/dependabot",
+                "--base",
+                base_branch,
                 "--json",
                 "number,title,author,headRefName,headRefOid,url",
             ],
@@ -780,10 +787,12 @@ class GitHubClient:
                     "list",
                     "--branch",
                     branch,
+                    "--event",
+                    "push",
                     "--limit",
                     "5",
                     "--json",
-                    "status,conclusion,headSha",
+                    "status,conclusion,headSha,workflowName",
                 ],
                 self.repo_path,
             )
@@ -793,6 +802,15 @@ class GitHubClient:
             runs = safe_json_parse(stdout, default=None)
             if runs is None:
                 return None
+
+            # Exclude ignored workflows (e.g. Dependabot Updates)
+            runs = [
+                r for r in runs
+                if not any(
+                    r.get("workflowName", "").startswith(prefix)
+                    for prefix in IGNORED_WORKFLOW_PREFIXES
+                )
+            ]
 
             # Find the run for our commit
             run = next((r for r in runs if r.get("headSha") == head_sha), None)
@@ -813,8 +831,10 @@ class GitHubClient:
     def _get_runs(
         self, limit: int = 1, fields: str = "status,conclusion"
     ) -> List[Dict]:
-        """Get recent CI runs for the current branch."""
+        """Get recent CI runs for the current branch, excluding ignored workflows."""
         branch = self._git.current_branch or "main"
+        # Always include workflowName so we can filter out ignored workflows
+        field_set = set(fields.split(",")) | {"workflowName"}
         success, stdout, _ = run_command(
             [
                 "gh",
@@ -827,13 +847,20 @@ class GitHubClient:
                 "--limit",
                 str(limit),
                 "--json",
-                fields,
+                ",".join(field_set),
             ],
             self.repo_path,
         )
         if not success:
             return []
-        return safe_json_parse(stdout, default=[])
+        runs = safe_json_parse(stdout, default=[])
+        return [
+            r for r in runs
+            if not any(
+                r.get("workflowName", "").startswith(prefix)
+                for prefix in IGNORED_WORKFLOW_PREFIXES
+            )
+        ]
 
 
 class Maintainer:
@@ -907,6 +934,7 @@ class Maintainer:
             self.logger.debug(f"[{self.repo_name}] Push disabled in config")
             return True, False
 
+        pre_commit_sha = self.git.get_head_sha()
         workdir_dirty = not self.git.is_workdir_clean()
         committed = False
 
@@ -963,15 +991,15 @@ class Maintainer:
             success, _, stderr = run_command(["git", "push"], self.repo_path)
             if not success:
                 self.logger.error(f"[{self.repo_name}] Command failed: git push\n{stderr}")
-                if committed:
-                    # Undo only the commit we just made since we couldn't push it
-                    self.logger.warning(f"[{self.repo_name}] Undoing commit since push failed")
+                if committed and pre_commit_sha:
+                    # Undo all unpushed commits since we couldn't push them
+                    self.logger.warning(f"[{self.repo_name}] Undoing commits since push failed")
                     reset_success, _, reset_stderr = run_command(
-                        ["git", "reset", "--hard", "HEAD^"], self.repo_path
+                        ["git", "reset", "--hard", pre_commit_sha], self.repo_path
                     )
                     if not reset_success:
                         self.logger.error(
-                            f"[{self.repo_name}] Failed to undo commit after push failure\n{reset_stderr}"
+                            f"[{self.repo_name}] Failed to undo commits after push failure\n{reset_stderr}"
                         )
                 return False, False
 
@@ -1604,6 +1632,7 @@ class Maintainer:
 
     def _merge_prs_locally(self, pr_numbers: List[int]) -> MergeResult:
         """Merge PRs locally by fetching and squash-merging their branches."""
+        pre_merge_sha = self.git.get_head_sha()
         merged_prs: List[int] = []
 
         for pr_num in pr_numbers:
@@ -1623,7 +1652,9 @@ class Maintainer:
                 self.logger.error(
                     f"[{self.repo_name}] Failed to get branch name for PR #{pr_num}"
                 )
-                return False, merged_prs
+                if pre_merge_sha:
+                    run_command(["git", "reset", "--hard", pre_merge_sha], self.repo_path)
+                return False, []
 
             # Fetch and merge the PR branch
             success, _, stderr = run_command(
@@ -1633,7 +1664,9 @@ class Maintainer:
                 self.logger.error(
                     f"[{self.repo_name}] Command failed: git fetch origin {branch_name}\n{stderr}"
                 )
-                return False, merged_prs
+                if pre_merge_sha:
+                    run_command(["git", "reset", "--hard", pre_merge_sha], self.repo_path)
+                return False, []
 
             success, _, stderr = run_command(
                 ["git", "merge", "--squash", f"origin/{branch_name}"], self.repo_path
@@ -1651,7 +1684,9 @@ class Maintainer:
                     self.logger.error(
                         f"[{self.repo_name}] Failed to reset after merge conflict\n{reset_stderr}"
                     )
-                    return False, merged_prs
+                    if pre_merge_sha:
+                        run_command(["git", "reset", "--hard", pre_merge_sha], self.repo_path)
+                    return False, []
                 continue
 
             # Check if squash merge actually staged anything
@@ -1677,7 +1712,9 @@ class Maintainer:
                     self.logger.error(
                         f"[{self.repo_name}] Failed to reset after commit failure"
                     )
-                    return False, merged_prs
+                    if pre_merge_sha:
+                        run_command(["git", "reset", "--hard", pre_merge_sha], self.repo_path)
+                    return False, []
                 continue
 
             self.logger.info(
