@@ -27,7 +27,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
-__version__ = "0.0.1"
+__version__ = "0.1.0"
 
 # Type aliases for common return types
 CommandResult = Tuple[bool, str, str]  # (success, stdout, stderr)
