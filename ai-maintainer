@@ -105,7 +105,8 @@ def run_command(
     """Run a command and return (success, stdout, stderr)."""
     try:
         result = subprocess.run(
-            cmd, cwd=cwd, capture_output=True, text=True, shell=shell, timeout=timeout
+            cmd, cwd=cwd, capture_output=True, text=True, shell=shell,
+            stdin=subprocess.DEVNULL, timeout=timeout,
         )
         return result.returncode == 0, result.stdout, result.stderr
     except subprocess.TimeoutExpired:
@@ -594,9 +595,10 @@ class GitClient:
 class GitHubClient:
     """Handles GitHub CLI operations and caching."""
 
-    def __init__(self, repo_path: Path, git: GitClient):
+    def __init__(self, repo_path: Path, git: GitClient, logger: logging.Logger):
         self.repo_path = repo_path
         self._git = git
+        self.logger = logger
 
     @functools.cached_property
     def repo_url(self) -> Optional[str]:
@@ -762,15 +764,15 @@ class GitHubClient:
 
         return stdout.strip().lower() == "true"
 
-    def wait_for_ci(self, head_sha: str, timeout_minutes: int, logger, repo_name: str = "") -> Optional[str]:
+    def wait_for_ci(self, head_sha: str, timeout_minutes: int) -> Optional[str]:
         """Wait for CI to complete on a specific commit.
 
         Returns 'success', 'failure', or None if unable to determine.
         """
-        prefix = f"[{repo_name}] " if repo_name else ""
+        repo_name = self.repo_path.name
         if not self.is_authenticated:
-            logger.warning(
-                f"{prefix}GitHub CLI not authenticated, skipping CI check. "
+            self.logger.warning(
+                f"[{repo_name}] GitHub CLI not authenticated, skipping CI check. "
                 "Run 'gh auth login' to enable CI monitoring."
             )
             return None
@@ -807,25 +809,25 @@ class GitHubClient:
             runs = [
                 r for r in runs
                 if not any(
-                    r.get("workflowName", "").startswith(prefix)
-                    for prefix in IGNORED_WORKFLOW_PREFIXES
+                    r.get("workflowName", "").startswith(wf_prefix)
+                    for wf_prefix in IGNORED_WORKFLOW_PREFIXES
                 )
             ]
 
             # Find the run for our commit
             run = next((r for r in runs if r.get("headSha") == head_sha), None)
             if not run:
-                logger.debug(f"{prefix}No CI run for {head_sha[:7]} yet, waiting...")
+                self.logger.debug(f"[{repo_name}] No CI run for {head_sha[:7]} yet, waiting...")
                 time.sleep(poll_interval)
                 continue
 
             if run.get("status") == "completed":
                 return run.get("conclusion")
 
-            logger.debug(f"{prefix}CI status: {run.get('status')}, waiting...")
+            self.logger.debug(f"[{repo_name}] CI status: {run.get('status')}, waiting...")
             time.sleep(poll_interval)
 
-        logger.error(f"{prefix}CI timed out after {timeout_minutes} minutes")
+        self.logger.error(f"[{repo_name}] CI timed out after {timeout_minutes} minutes")
         return None
 
     def _get_runs(
@@ -872,7 +874,7 @@ class Maintainer:
         self.config = config
         self.logger = logging.getLogger(__name__)
         self.git = GitClient(repo_path, self.logger)
-        self.github = GitHubClient(repo_path, self.git)
+        self.github = GitHubClient(repo_path, self.git, self.logger)
         self.agent = AgentClient(repo_path, self.repo_name, config, self.logger)
 
     @functools.cached_property
@@ -975,33 +977,31 @@ class Maintainer:
                 committed = True
 
         # Push if there are unpushed commits (from this run or previous merges)
-        has_unpushed = self.git.has_unpushed_commits()
-        if not committed and not has_unpushed:
+        if not committed and not self.git.has_unpushed_commits():
             self.logger.debug(f"[{self.repo_name}] No changes to commit or push")
             return True, False
 
-        if has_unpushed or committed:
-            if self.config.dry_run:
-                self.logger.info(
-                    f"[{self.repo_name}] DRY RUN: Would push unpushed commits"
-                )
-                return True, True
+        if self.config.dry_run:
+            self.logger.info(
+                f"[{self.repo_name}] DRY RUN: Would push unpushed commits"
+            )
+            return True, True
 
-            self.logger.debug(f"[{self.repo_name}] Pushing to remote...")
-            success, _, stderr = run_command(["git", "push"], self.repo_path)
-            if not success:
-                self.logger.error(f"[{self.repo_name}] Command failed: git push\n{stderr}")
-                if committed and pre_commit_sha:
-                    # Undo all unpushed commits since we couldn't push them
-                    self.logger.warning(f"[{self.repo_name}] Undoing commits since push failed")
-                    reset_success, _, reset_stderr = run_command(
-                        ["git", "reset", "--hard", pre_commit_sha], self.repo_path
+        self.logger.debug(f"[{self.repo_name}] Pushing to remote...")
+        success, _, stderr = run_command(["git", "push"], self.repo_path)
+        if not success:
+            self.logger.error(f"[{self.repo_name}] Command failed: git push\n{stderr}")
+            if committed and pre_commit_sha:
+                # Undo all unpushed commits since we couldn't push them
+                self.logger.warning(f"[{self.repo_name}] Undoing commits since push failed")
+                reset_success, _, reset_stderr = run_command(
+                    ["git", "reset", "--hard", pre_commit_sha], self.repo_path
+                )
+                if not reset_success:
+                    self.logger.error(
+                        f"[{self.repo_name}] Failed to undo commits after push failure\n{reset_stderr}"
                     )
-                    if not reset_success:
-                        self.logger.error(
-                            f"[{self.repo_name}] Failed to undo commits after push failure\n{reset_stderr}"
-                        )
-                return False, False
+            return False, False
 
         # Log with commit URL if available
         commit_sha = self.git.get_head_sha()
@@ -1017,8 +1017,7 @@ class Maintainer:
     def detect_test_command(self) -> Optional[str]:
         """Detect how to run tests in this repository."""
         p = self.repo_path
-        env = ProjectEnvironment(p)
-        prefix = f"{env.env_runner} " if env.env_runner else ""
+        prefix = f"{self.project_env.env_runner} " if self.project_env.env_runner else ""
 
         # Node.js - check for npm test script
         if (p / "package.json").exists():
@@ -1165,50 +1164,64 @@ class Maintainer:
         """Attempt to fix test failures with retries. Returns True if tests pass.
 
         Uses git stash to preserve dependency updates across retry attempts.
-        On each failed attempt, resets to the original dependency-updated state.
+        _try_fix_tests calls reset_changes() on failure, which wipes all
+        uncommitted changes including dependency updates. We stash once and
+        use 'stash apply' (not pop) to restore them at the start of each attempt.
         """
         max_attempts = self.config.max_fix_attempts
+        has_stash = False
+
+        # Stash uncommitted dependency updates if present
+        if not self.git.is_workdir_clean():
+            success, _, _ = run_command(
+                ["git", "stash", "push", "-m", "ai-maintainer: dependency updates"],
+                self.repo_path,
+            )
+            if not success:
+                self.logger.error(
+                    f"[{self.repo_name}] Failed to stash changes before fix attempts"
+                )
+                return False
+            has_stash = True
 
         for attempt in range(1, max_attempts + 1):
             self.logger.info(
                 f"[{self.repo_name}] Test fix attempt {attempt}/{max_attempts}"
             )
 
-            # Stash dependency updates so we can restore them if the fix fails
-            stash_success, _, _ = run_command(
-                ["git", "stash", "push", "-m", "ai-maintainer: dependency updates"],
-                self.repo_path,
-            )
-            if not stash_success:
-                self.logger.error(
-                    f"[{self.repo_name}] Failed to stash changes before fix attempt"
-                )
-                return False
-
             # Restore dependency updates as the starting point for this attempt
-            pop_success, _, stderr = run_command(
-                ["git", "stash", "pop"], self.repo_path
-            )
-            if not pop_success:
-                self.logger.error(
-                    f"[{self.repo_name}] Failed to restore stashed changes: {stderr}"
+            if has_stash:
+                success, _, stderr = run_command(
+                    ["git", "stash", "apply"], self.repo_path
                 )
-                return False
+                if not success:
+                    self.logger.error(
+                        f"[{self.repo_name}] Failed to restore dependency updates: {stderr}"
+                    )
+                    break
 
             if self._try_fix_tests(test_output):
+                if has_stash:
+                    run_command(["git", "stash", "drop"], self.repo_path)
                 self.logger.info(
                     f"[{self.repo_name}] Tests passed after {attempt} fix attempt(s)"
                 )
                 return True
 
-            # _try_fix_tests already reset AI's changes; dep updates are still
-            # in the working tree, so re-run tests to capture fresh output
+            # _try_fix_tests reset all changes. Re-apply deps and re-run tests
+            # to capture fresh failure output for the next attempt.
             if attempt < max_attempts:
+                if has_stash:
+                    run_command(["git", "stash", "apply"], self.repo_path)
                 _, test_output = self.run_tests()
+                if has_stash:
+                    self.git.reset_changes()
 
         self.logger.error(
             f"[{self.repo_name}] Exhausted all {max_attempts} fix attempts"
         )
+        if has_stash:
+            run_command(["git", "stash", "drop"], self.repo_path)
         self.git.reset_changes()
         return False
 
@@ -1733,7 +1746,7 @@ class Maintainer:
         self.logger.debug(
             f"[{self.repo_name}] Waiting for CI on commit {head_sha[:7]}..."
         )
-        return self.github.wait_for_ci(head_sha, timeout_minutes, self.logger, self.repo_name)
+        return self.github.wait_for_ci(head_sha, timeout_minutes)
 
 
 def find_repos(base_dir: Path, logger: logging.Logger) -> List[Path]:
