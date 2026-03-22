@@ -40,7 +40,7 @@ For each repository:
 
 1. Pull latest changes
 2. Merge dependabot PRs (GPG-verified, branch pattern checked)
-3. Ask AI to analyze and update direct dependencies (skips new packages < 30 days old)
+3. Ask AI to analyze and update direct dependencies (respects `--dependency-min-age-days`)
 4. Run tests, ask AI to fix failures (with retries)
 5. Commit and push changes
 6. Wait for CI and fix build failures (automatic if CI exists)
@@ -58,7 +58,7 @@ Skips repos that are: not git repos, not on default branch, have uncommitted cha
 | `--no-run-tests`              | Skip running tests                                                    |
 | `--no-push`                   | Don't push to remote (local commits only)                             |
 | `--rollback-on-ci-failure`    | Automatically rollback (force push) if CI fails after push            |
-| `--dependency-min-age-days N` | Skip dependencies newer than N days (default: 30)                     |
+| `--dependency-min-age-days N` | Skip dependencies newer than N days (default: 0)                      |
 | `--max-fix-attempts N`        | Max AI fix retry attempts per repo (default: 4)                       |
 | `--agent-command CMD`         | AI agent executable (default: `claude`)                               |
 | `--agent-flags FLAGS`         | Flags passed to agent (default: `--dangerously-skip-permissions`)     |
