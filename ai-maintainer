@@ -528,6 +528,8 @@ class GitClient:
     def reset_changes(self) -> bool:
         """Reset working directory to HEAD, discarding all uncommitted changes."""
         self.logger.debug(f"[{self.repo_name}] Resetting working directory...")
+        # Reset index first to clear any unmerged entries
+        run_command(["git", "reset", "HEAD"], self.repo_path)
         # Reset staged and unstaged changes
         success, _, stderr = run_command(["git", "checkout", "--", "."], self.repo_path)
         if not success:
@@ -624,6 +626,18 @@ class GitHubClient:
             ],
             self.repo_path,
         )
+        # Fall back to full logs if --log-failed returns empty
+        if not stdout:
+            success, stdout, _ = run_command(
+                [
+                    "gh",
+                    "run",
+                    "view",
+                    str(run_id),
+                    "--log",
+                ],
+                self.repo_path,
+            )
         if not success or not stdout:
             return None
         # Truncate if too long
@@ -1598,41 +1612,35 @@ class Maintainer:
                 ["git", "merge", "--squash", f"origin/{branch_name}"], self.repo_path
             )
             if not success:
-                self.logger.error(
-                    f"[{self.repo_name}] Command failed: git merge --squash origin/{branch_name}\n{stderr}"
+                self.logger.warning(
+                    f"[{self.repo_name}] PR #{pr_num} has merge conflicts, skipping\n{stderr}"
                 )
-                # Attempt to abort the merge
-                abort_success, _, abort_stderr = run_command(
-                    ["git", "merge", "--abort"], self.repo_path
+                # git merge --squash doesn't create MERGE_HEAD, so
+                # git merge --abort won't work. Use reset --merge instead.
+                reset_success, _, reset_stderr = run_command(
+                    ["git", "reset", "--merge"], self.repo_path
                 )
-                if not abort_success:
-                    self.logger.warning(
-                        f"[{self.repo_name}] git merge --abort failed, forcing reset\n{abort_stderr}"
+                if not reset_success:
+                    self.logger.error(
+                        f"[{self.repo_name}] Failed to reset after merge conflict\n{reset_stderr}"
                     )
-                    # If abort fails, force reset to clean state
-                    if not self.git.reset_changes():
-                        self.logger.error(
-                            f"[{self.repo_name}] Failed to reset after merge abort failure"
-                        )
-                return False, merged_prs
+                    return False, merged_prs
+                continue
 
             commit_msg = f"Merge dependabot PR #{pr_num}\n\nCreated by ai-maintainer\n{TOOL_REPO_URL}"
             success, _, stderr = run_command(
                 ["git", "commit", "-m", commit_msg], self.repo_path
             )
             if not success:
-                self.logger.error(
-                    f"[{self.repo_name}] Command failed: git commit\n{stderr}"
-                )
-                # Reset changes to clean up the partial merge
                 self.logger.warning(
-                    f"[{self.repo_name}] Resetting partial merge after commit failure"
+                    f"[{self.repo_name}] Failed to commit PR #{pr_num}, skipping\n{stderr}"
                 )
                 if not self.git.reset_changes():
                     self.logger.error(
                         f"[{self.repo_name}] Failed to reset after commit failure"
                     )
-                return False, merged_prs
+                    return False, merged_prs
+                continue
 
             self.logger.info(
                 f"[{self.repo_name}] PR #{pr_num} merged locally successfully"
