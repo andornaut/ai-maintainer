@@ -882,18 +882,6 @@ class Maintainer:
             details + ["", "Created by ai-maintainer", TOOL_REPO_URL]
         )
 
-    def pull_dependabot_changes(self, merged_prs: List[int]) -> bool:
-        """Pull changes after merging dependabot PRs on GitHub."""
-        if not merged_prs:
-            return True
-        self.logger.debug(f"[{self.repo_name}] Pulling merged dependabot changes")
-        if not self.git.pull_changes():
-            self.logger.error(
-                f"[{self.repo_name}] Failed to pull after merging dependabot PRs"
-            )
-            return False
-        return True
-
     def commit_and_push(self, message: str) -> MaintainResult:
         """Commit changes and push to remote.
 
@@ -1374,8 +1362,12 @@ class Maintainer:
         if not success:
             self.logger.error(f"[{self.repo_name}] Failed to merge dependabot PRs")
             return False, False
-        if not self.pull_dependabot_changes(merged_prs):
-            return False, False
+        if merged_prs and not self.config.dry_run:
+            if not self.git.pull_changes():
+                self.logger.error(
+                    f"[{self.repo_name}] Failed to pull after merging dependabot PRs"
+                )
+                return False, False
 
         # Update dependencies
         success, had_dep_updates = self.update_dependencies()
