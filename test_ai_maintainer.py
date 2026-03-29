@@ -318,6 +318,81 @@ class TestDetectTestCommand:
             assert maintainer.detect_test_command() is None
 
 
+class TestMergePrsOnGithub:
+    """Tests for _merge_prs_on_github method."""
+
+    def test_dry_run_skips_merge(self, default_config):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            (tmppath / ".git").mkdir()
+            maintainer = gm.Maintainer(tmppath, default_config)
+            success, merged = maintainer._merge_prs_on_github([1, 2])
+            assert success is True
+            assert merged == [1, 2]
+
+    def test_merge_success(self, default_config):
+        config = gm.Config(**{**default_config.__dict__, "dry_run": False})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            (tmppath / ".git").mkdir()
+            maintainer = gm.Maintainer(tmppath, config)
+            maintainer.github.merge_pr = MagicMock(return_value=True)
+            success, merged = maintainer._merge_prs_on_github([1, 2])
+            assert success is True
+            assert merged == [1, 2]
+            assert maintainer.github.merge_pr.call_count == 2
+
+    def test_merge_partial_failure(self, default_config):
+        config = gm.Config(**{**default_config.__dict__, "dry_run": False})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            (tmppath / ".git").mkdir()
+            maintainer = gm.Maintainer(tmppath, config)
+            maintainer.github.merge_pr = MagicMock(side_effect=[True, False, True])
+            success, merged = maintainer._merge_prs_on_github([1, 2, 3])
+            assert success is True
+            assert merged == [1, 3]
+
+    def test_empty_list(self, default_config):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            (tmppath / ".git").mkdir()
+            maintainer = gm.Maintainer(tmppath, default_config)
+            success, merged = maintainer._merge_prs_on_github([])
+            assert success is True
+            assert merged == []
+
+
+class TestPullDependabotChanges:
+    """Tests for pull_dependabot_changes method."""
+
+    def test_no_merged_prs_skips_pull(self, default_config):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            (tmppath / ".git").mkdir()
+            maintainer = gm.Maintainer(tmppath, default_config)
+            maintainer.git.pull_changes = MagicMock()
+            assert maintainer.pull_dependabot_changes([]) is True
+            maintainer.git.pull_changes.assert_not_called()
+
+    def test_pull_success(self, default_config):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            (tmppath / ".git").mkdir()
+            maintainer = gm.Maintainer(tmppath, default_config)
+            maintainer.git.pull_changes = MagicMock(return_value=True)
+            assert maintainer.pull_dependabot_changes([1, 2]) is True
+            maintainer.git.pull_changes.assert_called_once()
+
+    def test_pull_failure(self, default_config):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            (tmppath / ".git").mkdir()
+            maintainer = gm.Maintainer(tmppath, default_config)
+            maintainer.git.pull_changes = MagicMock(return_value=False)
+            assert maintainer.pull_dependabot_changes([1]) is False
+
+
 class TestBuildCommitMessage:
     """Tests for commit message building."""
 
@@ -326,24 +401,23 @@ class TestBuildCommitMessage:
             tmppath = Path(tmpdir)
             (tmppath / ".git").mkdir()
             maintainer = gm.Maintainer(tmppath, default_config)
-            msg = maintainer.build_commit_message([], had_dep_updates=True)
+            msg = maintainer.build_commit_message(had_dep_updates=True)
             assert "chore(deps): update direct dependencies" in msg
 
-    def test_commit_message_prs_only(self, default_config):
+    def test_commit_message_no_changes(self, default_config):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmppath = Path(tmpdir)
             (tmppath / ".git").mkdir()
             maintainer = gm.Maintainer(tmppath, default_config)
-            msg = maintainer.build_commit_message([123], had_dep_updates=False)
-            assert "#123" in msg
-            assert "dependabot" in msg.lower()
+            msg = maintainer.build_commit_message(had_dep_updates=False)
+            assert "chore: automated maintenance" in msg
 
     def test_commit_message_fix(self, default_config):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmppath = Path(tmpdir)
             (tmppath / ".git").mkdir()
             maintainer = gm.Maintainer(tmppath, default_config)
-            msg = maintainer.build_commit_message([], had_dep_updates=False, is_fix=True)
+            msg = maintainer.build_commit_message(had_dep_updates=False, is_fix=True)
             assert "fix: CI build failure" in msg
 
 
