@@ -38,12 +38,13 @@ ai-maintainer --agent-command "ollama run llama3"
 
 For each repository:
 
-1. Pull latest changes
-2. Merge dependabot PRs (GPG-verified, branch pattern checked)
-3. Ask AI to analyze and update direct dependencies (respects `--dependency-min-age-days`)
-4. Run tests, ask AI to fix failures (with retries)
-5. Commit and push changes
-6. Wait for CI and fix build failures (automatic if CI exists)
+1. Validate repo (git repo, default branch, clean working dir, writable)
+2. Check and fix pre-existing CI failures
+3. Merge dependabot PRs on GitHub and pull changes (GPG-verified, branch pattern checked)
+4. Ask AI to analyze and update direct dependencies (respects `--dependency-min-age-days`)
+5. Run tests, ask AI to fix failures (with retries)
+6. Commit and push changes
+7. Wait for CI and fix build failures (automatic if CI exists)
 
 Skips repos that are: not git repos, not on default branch, have uncommitted changes, are archived/read-only, or have no dependency files.
 
