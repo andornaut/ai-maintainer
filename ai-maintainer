@@ -613,16 +613,15 @@ class GitHubClient:
             url = url[:-4]
         return url
 
-    def close_pr(self, pr_num: int, comment: str) -> bool:
-        """Close a PR with a comment and delete its remote branch."""
+    def merge_pr(self, pr_num: int) -> bool:
+        """Squash-merge a PR on GitHub and delete its remote branch."""
         success, _, _ = run_command(
             [
                 "gh",
                 "pr",
-                "close",
+                "merge",
                 str(pr_num),
-                "--comment",
-                comment,
+                "--squash",
                 "--delete-branch",
             ],
             self.repo_path,
@@ -709,23 +708,6 @@ class GitHubClient:
         if runs and "databaseId" in runs[0]:
             return runs[0]["databaseId"]
         return None
-
-    def get_pr_branch(self, pr_num: int) -> Optional[str]:
-        """Get the branch name for a PR."""
-        success, stdout, _ = run_command(
-            [
-                "gh",
-                "pr",
-                "view",
-                str(pr_num),
-                "--json",
-                "headRefName",
-                "-q",
-                ".headRefName",
-            ],
-            self.repo_path,
-        )
-        return stdout.strip() if success and stdout.strip() else None
 
     @functools.cached_property
     def is_authenticated(self) -> bool:
@@ -883,22 +865,12 @@ class Maintainer:
         return ProjectEnvironment(self.repo_path)
 
     def build_commit_message(
-        self, merged_prs: List[int], had_dep_updates: bool, is_fix: bool = False
+        self, had_dep_updates: bool, is_fix: bool = False
     ) -> str:
         """Build a descriptive commit message based on what was done."""
         if is_fix:
             title = "fix: CI build failure"
             details = ["Fixed CI build failure with AI assistance"]
-        elif merged_prs and had_dep_updates:
-            title = "chore(deps): merge dependabot PRs and update dependencies"
-            details = [
-                f"Merged dependabot PRs: {', '.join(f'#{n}' for n in merged_prs)}",
-                "Updated direct dependencies",
-            ]
-        elif merged_prs:
-            pr_nums = ", ".join(f"#{n}" for n in merged_prs)
-            title = f"chore(deps): merge dependabot PR{'s' if len(merged_prs) > 1 else ''} {pr_nums}"
-            details = [f"Merged dependabot PRs: {pr_nums}"]
         elif had_dep_updates:
             title = "chore(deps): update direct dependencies"
             details = ["Updated direct dependencies"]
@@ -910,19 +882,17 @@ class Maintainer:
             details + ["", "Created by ai-maintainer", TOOL_REPO_URL]
         )
 
-    def close_dependabot_prs(self, pr_numbers: List[int]) -> None:
-        """Close dependabot PRs after they've been merged locally and pushed."""
-        for pr_num in pr_numbers:
-            if self.config.dry_run:
-                self.logger.info(
-                    f"[{self.repo_name}] DRY RUN: Would close PR #{pr_num}"
-                )
-            elif self.github.close_pr(
-                pr_num, "Closed: merged locally by ai-maintainer"
-            ):
-                self.logger.debug(f"[{self.repo_name}] Closed PR #{pr_num}")
-            else:
-                self.logger.error(f"[{self.repo_name}] Failed to close PR #{pr_num}")
+    def pull_dependabot_changes(self, merged_prs: List[int]) -> bool:
+        """Pull changes after merging dependabot PRs on GitHub."""
+        if not merged_prs:
+            return True
+        self.logger.debug(f"[{self.repo_name}] Pulling merged dependabot changes")
+        if not self.git.pull_changes():
+            self.logger.error(
+                f"[{self.repo_name}] Failed to pull after merging dependabot PRs"
+            )
+            return False
+        return True
 
     def commit_and_push(self, message: str) -> MaintainResult:
         """Commit changes and push to remote.
@@ -1088,7 +1058,7 @@ class Maintainer:
             return False
 
         success, _ = self.commit_and_push(
-            self.build_commit_message([], False, is_fix=True)
+            self.build_commit_message(False, is_fix=True)
         )
         if not success:
             self.git.reset_changes()
@@ -1399,11 +1369,12 @@ class Maintainer:
         if not should_continue:
             return False, False
 
-        # Merge dependabot PRs locally
+        # Merge dependabot PRs on GitHub and pull changes
         success, merged_prs = self.merge_dependabot_prs()
         if not success:
             self.logger.error(f"[{self.repo_name}] Failed to merge dependabot PRs")
-            self.git.reset_changes()
+            return False, False
+        if not self.pull_dependabot_changes(merged_prs):
             return False, False
 
         # Update dependencies
@@ -1431,15 +1402,11 @@ class Maintainer:
                     return False, False
 
         # Commit and push (only if we have changes)
-        commit_msg = self.build_commit_message(merged_prs, had_dep_updates)
+        commit_msg = self.build_commit_message(had_dep_updates)
         success, committed_changes = self.commit_and_push(commit_msg)
         if not success:
             self.git.reset_changes()
             return False, False
-
-        # Close merged/obsolete dependabot PRs on GitHub
-        if merged_prs:
-            self.close_dependabot_prs(merged_prs)
 
         # Monitor CI after push and fix failures if we caused them
         if committed_changes:
@@ -1457,7 +1424,7 @@ class Maintainer:
         return True, committed_changes
 
     def merge_dependabot_prs(self) -> MergeResult:
-        """Merge dependabot PRs locally after programmatic verification.
+        """Merge dependabot PRs on GitHub after programmatic verification.
 
         Returns (success, merged_prs).
         """
@@ -1490,7 +1457,7 @@ class Maintainer:
             self.logger.debug(f"[{self.repo_name}] No PRs passed verification")
             return True, []
 
-        return self._merge_prs_locally(safe_prs)
+        return self._merge_prs_on_github(safe_prs)
 
     def run_tests(self) -> TestResult:
         """Run tests if available."""
@@ -1643,97 +1610,27 @@ class Maintainer:
 
         return True
 
-    def _merge_prs_locally(self, pr_numbers: List[int]) -> MergeResult:
-        """Merge PRs locally by fetching and squash-merging their branches."""
-        pre_merge_sha = self.git.get_head_sha()
+    def _merge_prs_on_github(self, pr_numbers: List[int]) -> MergeResult:
+        """Squash-merge PRs on GitHub and delete their remote branches."""
         merged_prs: List[int] = []
 
         for pr_num in pr_numbers:
             if self.config.dry_run:
                 self.logger.info(
-                    f"[{self.repo_name}] DRY RUN: Would merge PR #{pr_num} locally"
+                    f"[{self.repo_name}] DRY RUN: Would merge PR #{pr_num} on GitHub"
                 )
                 merged_prs.append(pr_num)
                 continue
 
-            self.logger.debug(
-                f"[{self.repo_name}] Fetching and merging PR #{pr_num} locally"
-            )
-
-            branch_name = self.github.get_pr_branch(pr_num)
-            if not branch_name:
-                self.logger.error(
-                    f"[{self.repo_name}] Failed to get branch name for PR #{pr_num}"
-                )
-                if pre_merge_sha:
-                    run_command(["git", "reset", "--hard", pre_merge_sha], self.repo_path)
-                return False, []
-
-            # Fetch and merge the PR branch
-            success, _, stderr = run_command(
-                ["git", "fetch", "origin", branch_name], self.repo_path
-            )
-            if not success:
-                self.logger.error(
-                    f"[{self.repo_name}] Command failed: git fetch origin {branch_name}\n{stderr}"
-                )
-                if pre_merge_sha:
-                    run_command(["git", "reset", "--hard", pre_merge_sha], self.repo_path)
-                return False, []
-
-            success, _, stderr = run_command(
-                ["git", "merge", "--squash", f"origin/{branch_name}"], self.repo_path
-            )
-            if not success:
-                self.logger.warning(
-                    f"[{self.repo_name}] PR #{pr_num} has merge conflicts, skipping\n{stderr}"
-                )
-                # git merge --squash doesn't create MERGE_HEAD, so
-                # git merge --abort won't work. Use reset --merge instead.
-                reset_success, _, reset_stderr = run_command(
-                    ["git", "reset", "--merge"], self.repo_path
-                )
-                if not reset_success:
-                    self.logger.error(
-                        f"[{self.repo_name}] Failed to reset after merge conflict\n{reset_stderr}"
-                    )
-                    if pre_merge_sha:
-                        run_command(["git", "reset", "--hard", pre_merge_sha], self.repo_path)
-                    return False, []
-                continue
-
-            # Check if squash merge actually staged anything
-            success, stdout, _ = run_command(
-                ["git", "diff", "--cached", "--name-only"], self.repo_path
-            )
-            if not stdout.strip():
+            if self.github.merge_pr(pr_num):
                 self.logger.info(
-                    f"[{self.repo_name}] PR #{pr_num} changes already on main, skipping"
+                    f"[{self.repo_name}] PR #{pr_num} merged on GitHub"
                 )
                 merged_prs.append(pr_num)
-                continue
-
-            commit_msg = f"Merge dependabot PR #{pr_num}\n\nCreated by ai-maintainer\n{TOOL_REPO_URL}"
-            success, _, stderr = run_command(
-                ["git", "commit", "--no-verify", "-m", commit_msg], self.repo_path
-            )
-            if not success:
+            else:
                 self.logger.warning(
-                    f"[{self.repo_name}] Failed to commit PR #{pr_num}, skipping\n{stderr}"
+                    f"[{self.repo_name}] Failed to merge PR #{pr_num} on GitHub, skipping"
                 )
-                if not self.git.reset_changes():
-                    self.logger.error(
-                        f"[{self.repo_name}] Failed to reset after commit failure"
-                    )
-                    if pre_merge_sha:
-                        run_command(["git", "reset", "--hard", pre_merge_sha], self.repo_path)
-                    return False, []
-                continue
-
-            self.logger.info(
-                f"[{self.repo_name}] PR #{pr_num} merged locally successfully"
-            )
-            merged_prs.append(pr_num)
 
         return True, merged_prs
 
