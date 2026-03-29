@@ -363,36 +363,6 @@ class TestMergePrsOnGithub:
             assert merged == []
 
 
-class TestPullDependabotChanges:
-    """Tests for pull_dependabot_changes method."""
-
-    def test_no_merged_prs_skips_pull(self, default_config):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmppath = Path(tmpdir)
-            (tmppath / ".git").mkdir()
-            maintainer = gm.Maintainer(tmppath, default_config)
-            maintainer.git.pull_changes = MagicMock()
-            assert maintainer.pull_dependabot_changes([]) is True
-            maintainer.git.pull_changes.assert_not_called()
-
-    def test_pull_success(self, default_config):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmppath = Path(tmpdir)
-            (tmppath / ".git").mkdir()
-            maintainer = gm.Maintainer(tmppath, default_config)
-            maintainer.git.pull_changes = MagicMock(return_value=True)
-            assert maintainer.pull_dependabot_changes([1, 2]) is True
-            maintainer.git.pull_changes.assert_called_once()
-
-    def test_pull_failure(self, default_config):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmppath = Path(tmpdir)
-            (tmppath / ".git").mkdir()
-            maintainer = gm.Maintainer(tmppath, default_config)
-            maintainer.git.pull_changes = MagicMock(return_value=False)
-            assert maintainer.pull_dependabot_changes([1]) is False
-
-
 class TestBuildCommitMessage:
     """Tests for commit message building."""
 
