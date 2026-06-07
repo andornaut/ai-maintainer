@@ -46,6 +46,8 @@ For each repository:
 6. Commit and push changes
 7. Wait for CI and fix build failures (automatic if CI exists)
 
+ai-maintainer auto-detects each project's toolchain (Node via nvm/fnm, Python via pipenv/poetry/venv, Ruby via chruby/rbenv, plus Go and Rust) and activates it when running tests and git operations, so git hooks (e.g. husky `pre-commit`) use the project's runtime rather than whatever is on the ambient PATH.
+
 Skips repos that are: not git repos, not on default branch, have uncommitted changes, are archived/read-only, or have no dependency files.
 
 ## Options

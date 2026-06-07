@@ -126,6 +126,25 @@ def run_shell_command(
     return run_command(["bash", "-c", cmd], cwd, timeout=timeout)
 
 
+def run_git(
+    args: List[str],
+    cwd: Path,
+    env_runner: Optional[str] = None,
+    timeout: int = DEFAULT_COMMAND_TIMEOUT_SECONDS,
+) -> CommandResult:
+    """Run a git command, optionally activating the project env runner first.
+
+    When env_runner is set (e.g. nvm/fnm for .nvmrc, pipenv/poetry/venv for
+    Python, the Go/Rust toolchain PATH), the command runs through a shell so
+    git hooks (pre-commit, pre-push) resolve the project's toolchain instead
+    of whatever is on the ambient PATH.
+    """
+    if env_runner:
+        quoted = " ".join(shlex.quote(arg) for arg in args)
+        return run_shell_command(f"{env_runner} git {quoted}", cwd, timeout=timeout)
+    return run_command(["git", *args], cwd, timeout=timeout)
+
+
 def safe_json_parse(text: str, default: Any = None) -> Any:
     """Parse JSON text, returning default value on error.
 
@@ -169,6 +188,12 @@ class ProjectEnvironment:
             self.repo_path / "poetry.lock"
         ).exists():
             self._env_runner = self._detect_python_runner()
+        # Go projects (go.mod)
+        elif (self.repo_path / "go.mod").exists():
+            self._env_runner = self._detect_go_runner()
+        # Rust projects (Cargo.toml)
+        elif (self.repo_path / "Cargo.toml").exists():
+            self._env_runner = self._detect_cargo_runner()
 
     def _detect_node_runner(self) -> Optional[str]:
         """Detect Node.js version manager (nvm or fnm)."""
@@ -212,6 +237,49 @@ class ProjectEnvironment:
             activate = p / venv_dir / "bin" / "activate"
             if activate.exists():
                 return f"source {venv_dir}/bin/activate &&"
+
+        return None
+
+    def _detect_go_runner(self) -> Optional[str]:
+        """Ensure the Go toolchain is on PATH for Go projects."""
+        p = self.repo_path
+
+        # Already on PATH - no prefix needed
+        if run_command(["which", "go"], p)[0]:
+            return None
+
+        # Common Go install locations (the binary lives at <dir>/go)
+        go_bin_paths = [
+            "/usr/local/go/bin",
+            "/usr/lib/go/bin",
+            "/opt/homebrew/bin",
+            "~/.local/go/bin",
+            "~/go/bin",
+        ]
+        for go_bin in go_bin_paths:
+            expanded = Path(go_bin).expanduser()
+            if (expanded / "go").exists():
+                # Also expose $HOME/go/bin so Go-installed test tools resolve
+                return f'export PATH="{expanded}:$HOME/go/bin:$PATH" &&'
+
+        return None
+
+    def _detect_cargo_runner(self) -> Optional[str]:
+        """Ensure the Rust/Cargo toolchain is on PATH for Rust projects."""
+        p = self.repo_path
+
+        # Already on PATH - no prefix needed
+        if run_command(["which", "cargo"], p)[0]:
+            return None
+
+        # rustup writes an env script that puts cargo on PATH
+        cargo_env = Path("~/.cargo/env").expanduser()
+        if cargo_env.exists():
+            return f"source {cargo_env} &&"
+
+        cargo_bin = Path("~/.cargo/bin").expanduser()
+        if (cargo_bin / "cargo").exists():
+            return f'export PATH="{cargo_bin}:$PATH" &&'
 
         return None
 
@@ -417,9 +485,16 @@ Respond with ONLY a JSON object. No explanations, no markdown outside the JSON.
 class GitClient:
     """Handles pure git operations (not GitHub API)."""
 
-    def __init__(self, repo_path: Path, logger: logging.Logger):
+    def __init__(
+        self,
+        repo_path: Path,
+        logger: logging.Logger,
+        env_runner: Optional[str] = None,
+    ):
         self.repo_path = repo_path
         self.logger = logger
+        # Activate this before git ops that may fire hooks (pre-commit/pre-push)
+        self.env_runner = env_runner
 
     @property
     def repo_name(self) -> str:
@@ -507,7 +582,9 @@ class GitClient:
     def pull_changes(self) -> bool:
         """Pull latest changes from remote."""
         self.logger.debug(f"[{self.repo_name}] Pulling changes...")
-        success, _, stderr = run_command(["git", "pull"], self.repo_path)
+        # Run through the project env runner so post-merge hooks resolve the
+        # project's toolchain instead of the ambient PATH.
+        success, _, stderr = run_git(["pull"], self.repo_path, self.env_runner)
         if not success:
             self.logger.error(f"[{self.repo_name}] Command failed: git pull\n{stderr}")
         return success
@@ -517,7 +594,9 @@ class GitClient:
 
         This detects archived/read-only repositories before making changes.
         """
-        success, _, stderr = run_command(["git", "push", "--dry-run"], self.repo_path)
+        success, _, stderr = run_git(
+            ["push", "--dry-run"], self.repo_path, self.env_runner
+        )
         if not success:
             # Check if error indicates archived/read-only repository
             error_msg = stderr.lower()
@@ -581,7 +660,9 @@ class GitClient:
             return False
 
         # Force push to remote
-        success, _, stderr = run_command(["git", "push", "--force"], self.repo_path)
+        success, _, stderr = run_git(
+            ["push", "--force"], self.repo_path, self.env_runner
+        )
         if not success:
             self.logger.error(
                 f"[{self.repo_name}] Failed to force push rollback: {stderr}"
@@ -855,7 +936,7 @@ class Maintainer:
         self.repo_name = repo_path.name
         self.config = config
         self.logger = logging.getLogger(__name__)
-        self.git = GitClient(repo_path, self.logger)
+        self.git = GitClient(repo_path, self.logger, self.project_env.env_runner)
         self.github = GitHubClient(repo_path, self.git, self.logger)
         self.agent = AgentClient(repo_path, self.repo_name, config, self.logger)
 
@@ -924,8 +1005,10 @@ class Maintainer:
                 self.logger.debug(f"[{self.repo_name}] No changes staged for commit")
                 workdir_dirty = False
             else:
-                success, _, stderr = run_command(
-                    ["git", "commit", "-m", message], self.repo_path
+                # Run through the project env runner so pre-commit hooks
+                # resolve the project's toolchain instead of the ambient PATH.
+                success, _, stderr = run_git(
+                    ["commit", "-m", message], self.repo_path, self.git.env_runner
                 )
                 if not success:
                     self.logger.error(
@@ -946,7 +1029,9 @@ class Maintainer:
             return True, True
 
         self.logger.debug(f"[{self.repo_name}] Pushing to remote...")
-        success, _, stderr = run_command(["git", "push"], self.repo_path)
+        # Run through the project env runner too, so pre-push hooks resolve
+        # the project's toolchain instead of the ambient PATH.
+        success, _, stderr = run_git(["push"], self.repo_path, self.git.env_runner)
         if not success:
             self.logger.error(f"[{self.repo_name}] Command failed: git push\n{stderr}")
             if committed and pre_commit_sha:
@@ -1004,11 +1089,12 @@ class Maintainer:
             if (p / "spec").exists() or (p / ".rspec").exists():
                 return f"{prefix}rspec"
 
-        # Other languages (no version managers yet)
+        # Rust
         if (p / "Cargo.toml").exists():
-            return "cargo test"
+            return f"{prefix}cargo test"
+        # Go
         if (p / "go.mod").exists():
-            return "go test ./..."
+            return f"{prefix}go test ./..."
 
         # Makefile (check if 'test' target exists)
         if (p / "Makefile").exists():
