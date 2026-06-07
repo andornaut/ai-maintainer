@@ -92,6 +92,36 @@ class TestProjectEnvironment:
             env = gm.ProjectEnvironment(tmppath)
             assert env.env_runner == "poetry run"
 
+    def test_go_detection_no_crash(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            (tmppath / "go.mod").write_text("module example.com/foo\n")
+            env = gm.ProjectEnvironment(tmppath)
+            # None if go is already on PATH, else a PATH-export prefix
+            assert env.env_runner is None or env.env_runner.startswith(
+                'export PATH="'
+            )
+
+    def test_go_runner_when_not_on_path(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            (tmppath / "go.mod").write_text("module example.com/foo\n")
+            # Pretend `which go` fails so it falls back to known install dirs
+            monkeypatch.setattr(gm, "run_command", lambda *a, **k: (False, "", ""))
+            # True for the real go.mod and the simulated go binary location
+            real_exists = Path.exists
+            monkeypatch.setattr(
+                Path,
+                "exists",
+                lambda self: str(self).endswith("/usr/local/go/bin/go")
+                or real_exists(self),
+            )
+            env = gm.ProjectEnvironment(tmppath)
+            assert (
+                env.env_runner
+                == 'export PATH="/usr/local/go/bin:$HOME/go/bin:$PATH" &&'
+            )
+
 
 class TestAgentClientJsonExtraction:
     """Tests for AgentClient JSON extraction."""
@@ -308,7 +338,15 @@ class TestDetectTestCommand:
             (tmppath / ".git").mkdir()
             (tmppath / "Cargo.toml").write_text("[package]")
             maintainer = gm.Maintainer(tmppath, default_config)
-            assert maintainer.detect_test_command() == "cargo test"
+            assert maintainer.detect_test_command().endswith("cargo test")
+
+    def test_detect_go_test(self, default_config):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            (tmppath / ".git").mkdir()
+            (tmppath / "go.mod").write_text("module example.com/foo\n")
+            maintainer = gm.Maintainer(tmppath, default_config)
+            assert maintainer.detect_test_command().endswith("go test ./...")
 
     def test_detect_no_test(self, default_config):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -316,6 +354,143 @@ class TestDetectTestCommand:
             (tmppath / ".git").mkdir()
             maintainer = gm.Maintainer(tmppath, default_config)
             assert maintainer.detect_test_command() is None
+
+
+class TestCommitAndPushEnvRunner:
+    """commit_and_push runs git through the project env runner so hooks
+    (pre-commit/pre-push) resolve the same toolchain used for testing."""
+
+    def _maintainer(self, tmppath, default_config, env_runner):
+        config = gm.Config(
+            **{**default_config.__dict__, "dry_run": False, "push_changes": True}
+        )
+        maintainer = gm.Maintainer(tmppath, config)
+        # Force the env runner as if .nvmrc + nvm were present
+        maintainer.git.env_runner = env_runner
+        maintainer.git.get_head_sha = MagicMock(return_value="abc1234")
+        maintainer.git.is_workdir_clean = MagicMock(return_value=False)
+        maintainer.git.has_unpushed_commits = MagicMock(return_value=True)
+        maintainer.github.repo_url = None
+        return maintainer
+
+    def test_commit_and_push_use_env_runner_prefix(self, default_config, monkeypatch):
+        prefix = "source ~/.nvm/nvm.sh && nvm use &&"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            (tmppath / ".git").mkdir()
+            maintainer = self._maintainer(tmppath, default_config, prefix)
+
+            shell_calls = []
+
+            def fake_run_command(cmd, cwd, *a, **k):
+                if cmd[:3] == ["git", "diff", "--cached"]:
+                    return True, "package.json\n", ""
+                # git commit / git push must NOT go through here when prefixed
+                assert cmd[:2] not in (["git", "commit"], ["git", "push"])
+                return True, "", ""
+
+            def fake_run_shell_command(cmd, cwd, *a, **k):
+                shell_calls.append(cmd)
+                return True, "", ""
+
+            monkeypatch.setattr(gm, "run_command", fake_run_command)
+            monkeypatch.setattr(gm, "run_shell_command", fake_run_shell_command)
+
+            success, had_changes = maintainer.commit_and_push("fix: bump deps")
+
+            assert success is True
+            assert had_changes is True
+            assert any(
+                c.startswith(f"{prefix} git commit -m ") and "fix: bump deps" in c
+                for c in shell_calls
+            )
+            assert f"{prefix} git push" in shell_calls
+
+    def test_commit_and_push_without_env_runner(self, default_config, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            (tmppath / ".git").mkdir()
+            maintainer = self._maintainer(tmppath, default_config, None)
+
+            commit_calls = []
+
+            def fake_run_command(cmd, cwd, *a, **k):
+                if cmd[:3] == ["git", "diff", "--cached"]:
+                    return True, "package.json\n", ""
+                if cmd[:2] == ["git", "commit"]:
+                    commit_calls.append(cmd)
+                return True, "", ""
+
+            def fake_run_shell_command(cmd, cwd, *a, **k):
+                raise AssertionError("env_runner is None; should not use a shell")
+
+            monkeypatch.setattr(gm, "run_command", fake_run_command)
+            monkeypatch.setattr(gm, "run_shell_command", fake_run_shell_command)
+
+            success, had_changes = maintainer.commit_and_push("fix: bump deps")
+
+            assert success is True
+            assert commit_calls == [["git", "commit", "-m", "fix: bump deps"]]
+
+
+class TestRunGit:
+    """Tests for the run_git helper."""
+
+    def test_no_env_runner_uses_run_command(self, monkeypatch):
+        calls = []
+
+        def fake_run_command(cmd, cwd, **k):
+            calls.append(cmd)
+            return True, "", ""
+
+        def fail_shell(*a, **k):
+            raise AssertionError("env_runner is None; should not use a shell")
+
+        monkeypatch.setattr(gm, "run_command", fake_run_command)
+        monkeypatch.setattr(gm, "run_shell_command", fail_shell)
+
+        ok, _, _ = gm.run_git(["push"], Path("/tmp"))
+        assert ok is True
+        assert calls == [["git", "push"]]
+
+    def test_env_runner_uses_shell_and_quotes(self, monkeypatch):
+        shell = []
+
+        def fake_run_shell_command(cmd, cwd, **k):
+            shell.append(cmd)
+            return True, "", ""
+
+        monkeypatch.setattr(gm, "run_shell_command", fake_run_shell_command)
+
+        ok, _, _ = gm.run_git(["commit", "-m", "a b"], Path("/tmp"), "nvm use &&")
+        assert ok is True
+        assert shell == ["nvm use && git commit -m 'a b'"]
+
+    def test_gitclient_is_writable_uses_env_runner(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = gm.GitClient(Path(tmpdir), MagicMock(), "nvm use &&")
+            shell = []
+
+            def fake_run_shell_command(cmd, cwd, **k):
+                shell.append(cmd)
+                return True, "", ""
+
+            monkeypatch.setattr(gm, "run_shell_command", fake_run_shell_command)
+            assert client.is_writable() is True
+            assert shell == ["nvm use && git push --dry-run"]
+
+    def test_gitclient_pull_uses_env_runner(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = gm.GitClient(Path(tmpdir), MagicMock(), "nvm use &&")
+            shell = []
+
+            def fake_run_shell_command(cmd, cwd, **k):
+                shell.append(cmd)
+                return True, "", ""
+
+            monkeypatch.setattr(gm, "run_shell_command", fake_run_shell_command)
+            assert client.pull_changes() is True
+            assert shell == ["nvm use && git pull"]
 
 
 class TestMergePrsOnGithub:
