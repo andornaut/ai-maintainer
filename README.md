@@ -59,12 +59,16 @@ Skips repos that are: not git repos, not on default branch, have uncommitted cha
 | `--no-merge-dependabot`       | Skip merging dependabot PRs                                           |
 | `--no-update-dependencies`    | Skip dependency updates                                               |
 | `--no-run-tests`              | Skip running tests                                                    |
+| `--test-timeout N`            | Timeout in seconds for the test suite (default: 600)                  |
 | `--no-push`                   | Don't push to remote (local commits only)                             |
 | `--rollback-on-ci-failure`    | Automatically rollback (force push) if CI fails after push            |
+| `--ci-timeout N`              | Minutes to wait for CI to complete (default: 10)                      |
 | `--dependency-min-age-days N` | Skip dependencies newer than N days (default: 0)                      |
 | `--max-fix-attempts N`        | Max AI fix retry attempts per repo (default: 4)                       |
 | `--agent-command CMD`         | AI agent executable (default: `claude`)                               |
 | `--agent-flags FLAGS`         | Flags passed to agent (default: `--dangerously-skip-permissions`)     |
+| `--agent-timeout N`           | Timeout in seconds per AI agent invocation (default: 300)             |
+| `--command-timeout N`         | Timeout in seconds for git/gh and shell commands (default: 120)       |
 | `-e/--exclude REPO`           | Exclude repository by name (repeatable)                               |
 | `-v/--verbose`                | Verbose output (debug level)                                          |
 | `-q/--quiet`                  | Errors only                                                           |

@@ -26,8 +26,10 @@ def default_config():
     return gm.Config(
         agent_command="echo",
         agent_flags="",
+        agent_timeout_seconds=300,
         auto_merge_dependabot=True,
         auto_update_dependencies=True,
+        ci_timeout_minutes=10,
         dependency_min_age_days=30,
         dry_run=True,
         exclude=set(),
@@ -35,6 +37,7 @@ def default_config():
         push_changes=False,
         rollback_on_ci_failure=False,
         run_tests=True,
+        test_timeout_seconds=600,
     )
 
 
@@ -157,6 +160,12 @@ class TestAgentClientJsonExtraction:
         result = client._extract_json_from_response(response)
         assert result == '{"updated": false, "changes_made": "", "reasoning": "All up to date"}'
 
+    def test_extract_json_with_text_after(self, default_config):
+        client = gm.AgentClient(Path("/tmp"), "test-repo", default_config, MagicMock())
+        response = '{"fixed": true, "changes_made": "bumped"}\n\nDone, hope that helps!'
+        result = client._extract_json_from_response(response)
+        assert result == '{"fixed": true, "changes_made": "bumped"}'
+
     def test_extract_json_empty_response(self, default_config):
         client = gm.AgentClient(Path("/tmp"), "test-repo", default_config, MagicMock())
         result = client._extract_json_from_response("")
@@ -203,8 +212,10 @@ class TestConfig:
         config = gm.Config(
             agent_command="claude",
             agent_flags="--dangerously-skip-permissions",
+            agent_timeout_seconds=300,
             auto_merge_dependabot=True,
             auto_update_dependencies=True,
+            ci_timeout_minutes=10,
             dependency_min_age_days=30,
             dry_run=False,
             exclude={"excluded-repo"},
@@ -212,6 +223,7 @@ class TestConfig:
             push_changes=True,
             rollback_on_ci_failure=False,
             run_tests=True,
+            test_timeout_seconds=600,
         )
         assert config.agent_command == "claude"
         assert config.dependency_min_age_days == 30
