@@ -43,6 +43,7 @@ DEFAULT_CI_LOG_MAX_LENGTH = 10000
 DEFAULT_CI_TIMEOUT_MINUTES = 10
 DEFAULT_DEPENDENCY_MIN_AGE_DAYS = 0
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 120
+DEFAULT_TEST_TIMEOUT_SECONDS = 600
 DEFAULT_MAX_FIX_ATTEMPTS = 4
 
 # Other constants
@@ -85,8 +86,10 @@ class Config:
 
     agent_command: str
     agent_flags: str
+    agent_timeout_seconds: int
     auto_merge_dependabot: bool
     auto_update_dependencies: bool
+    ci_timeout_minutes: int
     dependency_min_age_days: int
     dry_run: bool
     exclude: Set[str]
@@ -94,15 +97,29 @@ class Config:
     push_changes: bool
     rollback_on_ci_failure: bool
     run_tests: bool
+    test_timeout_seconds: int
+
+
+# Effective default timeout for run_command and its wrappers. Overridable once
+# at startup via --command-timeout; call sites that don't pass timeout inherit it.
+_command_timeout_seconds = DEFAULT_COMMAND_TIMEOUT_SECONDS
+
+
+def set_command_timeout(seconds: int) -> None:
+    """Set the global default timeout (seconds) for run_command and its wrappers."""
+    global _command_timeout_seconds
+    _command_timeout_seconds = seconds
 
 
 def run_command(
     cmd: Union[List[str], str],
     cwd: Path,
     shell: bool = False,
-    timeout: int = DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    timeout: Optional[int] = None,
 ) -> CommandResult:
     """Run a command and return (success, stdout, stderr)."""
+    if timeout is None:
+        timeout = _command_timeout_seconds
     try:
         result = subprocess.run(
             cmd, cwd=cwd, capture_output=True, text=True, shell=shell,
@@ -120,7 +137,7 @@ def run_command(
 def run_shell_command(
     cmd: str,
     cwd: Path,
-    timeout: int = DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    timeout: Optional[int] = None,
 ) -> CommandResult:
     """Run a shell command string via bash and return (success, stdout, stderr)."""
     return run_command(["bash", "-c", cmd], cwd, timeout=timeout)
@@ -130,7 +147,7 @@ def run_git(
     args: List[str],
     cwd: Path,
     env_runner: Optional[str] = None,
-    timeout: int = DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    timeout: Optional[int] = None,
 ) -> CommandResult:
     """Run a git command, optionally activating the project env runner first.
 
@@ -413,7 +430,7 @@ Respond with ONLY a JSON object. No explanations, no markdown outside the JSON.
                 env=env,
                 start_new_session=True,
             )
-            deadline = time.monotonic() + DEFAULT_AGENT_TIMEOUT_SECONDS
+            deadline = time.monotonic() + self.config.agent_timeout_seconds
             try:
                 while proc.poll() is None:
                     if time.monotonic() >= deadline:
@@ -470,10 +487,13 @@ Respond with ONLY a JSON object. No explanations, no markdown outside the JSON.
             if extracted:
                 return extracted
 
-        # Try to find a valid JSON object by attempting to parse from each '{'
+        # Try to find a valid JSON object by attempting to parse from each '{'.
+        # raw_decode stops at the end of the first valid JSON value, so this
+        # also handles a JSON object followed by trailing prose.
+        decoder = json.JSONDecoder()
         for match in re.finditer(r"\{", response):
             try:
-                obj = json.loads(response[match.start() :])
+                obj, _ = decoder.raw_decode(response[match.start() :])
                 if isinstance(obj, dict):
                     return json.dumps(obj)
             except json.JSONDecodeError:
@@ -842,40 +862,11 @@ class GitHubClient:
 
         poll_interval = 30
         max_polls = (timeout_minutes * 60) // poll_interval
-        branch = self._git.current_branch or "main"
 
         for _ in range(max_polls):
-            success, stdout, _ = run_command(
-                [
-                    "gh",
-                    "run",
-                    "list",
-                    "--branch",
-                    branch,
-                    "--event",
-                    "push",
-                    "--limit",
-                    "5",
-                    "--json",
-                    "status,conclusion,headSha,workflowName",
-                ],
-                self.repo_path,
-            )
-            if not success:
-                return None
-
-            runs = safe_json_parse(stdout, default=None)
-            if runs is None:
-                return None
-
-            # Exclude ignored workflows (e.g. Dependabot Updates)
-            runs = [
-                r for r in runs
-                if not any(
-                    r.get("workflowName", "").startswith(wf_prefix)
-                    for wf_prefix in IGNORED_WORKFLOW_PREFIXES
-                )
-            ]
+            # _get_runs lists recent push runs for the branch and already
+            # excludes ignored workflows (e.g. Dependabot Updates).
+            runs = self._get_runs(5, "status,conclusion,headSha")
 
             # Find the run for our commit
             run = next((r for r in runs if r.get("headSha") == head_sha), None)
@@ -1160,7 +1151,7 @@ class Maintainer:
                 continue
 
             self.logger.info(f"[{self.repo_name}] Waiting for CI after fix...")
-            ci_status = self._wait_for_ci(DEFAULT_CI_TIMEOUT_MINUTES)
+            ci_status = self._wait_for_ci(self.config.ci_timeout_minutes)
 
             if ci_status == "success":
                 self.logger.info(
@@ -1351,9 +1342,9 @@ class Maintainer:
         """
         initial_ci = self.github.get_latest_ci_conclusion()
         if not initial_ci:
+            # No CI runs found - nothing to monitor after push
             return True, None
 
-        ci_was_passing = initial_ci == "success"
         if initial_ci == "failure":
             if self.git.is_latest_commit_from_maintainer():
                 self.logger.warning(
@@ -1366,13 +1357,18 @@ class Maintainer:
                     self.logger.error(
                         f"[{self.repo_name}] Could not fix previous CI failure, skipping repo"
                     )
-                    return False, ci_was_passing
+                    return False, False
             else:
                 self.logger.warning(
                     f"[{self.repo_name}] CI is already failing (not from ai-maintainer), will not attempt fixes"
                 )
+                return True, False
 
-        return True, ci_was_passing
+        # "success", "in_progress", or any other non-failure status. Treat an
+        # in-progress (or otherwise unknown) baseline as healthy so that if our
+        # push breaks CI we still attempt a fix/rollback - we cannot confirm a
+        # pre-existing failure, so we hold ourselves responsible.
+        return True, True
 
     def _handle_post_push_ci(self, ci_was_passing: Optional[bool]) -> bool:
         """Monitor CI after push and fix failures if we caused them.
@@ -1386,7 +1382,7 @@ class Maintainer:
         if ci_was_passing is None:
             return True
 
-        ci_status = self._wait_for_ci(DEFAULT_CI_TIMEOUT_MINUTES)
+        ci_status = self._wait_for_ci(self.config.ci_timeout_minutes)
         ci_url = self.github.get_latest_ci_run_url()
         ci_url_suffix = f": {ci_url}" if ci_url else ""
 
@@ -1548,11 +1544,14 @@ class Maintainer:
             self.logger.debug(f"[{self.repo_name}] Running tests: {test_cmd}")
             # Use shell for commands with shell operators (&&, source, etc.)
             use_shell = "&&" in test_cmd or test_cmd.startswith("source ")
+            timeout = self.config.test_timeout_seconds
             if use_shell:
-                success, stdout, stderr = run_shell_command(test_cmd, self.repo_path)
+                success, stdout, stderr = run_shell_command(
+                    test_cmd, self.repo_path, timeout=timeout
+                )
             else:
                 success, stdout, stderr = run_command(
-                    shlex.split(test_cmd), self.repo_path
+                    shlex.split(test_cmd), self.repo_path, timeout=timeout
                 )
             output = f"Command: {test_cmd}\n\nSTDOUT:\n{stdout}\n\nSTDERR:\n{stderr}"
 
@@ -1807,6 +1806,14 @@ def check_prerequisites(agent_command: str) -> List[str]:
     return missing
 
 
+def positive_int(value: str) -> int:
+    """argparse type for CLI flags that must be a positive integer."""
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {parsed}")
+    return parsed
+
+
 def parse_args():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -1864,6 +1871,18 @@ Examples:
             "(non-interactive with auto-approve). Use --dry-run to preview changes first."
         ),
     )
+    parser.add_argument(
+        "--agent-timeout",
+        type=positive_int,
+        default=DEFAULT_AGENT_TIMEOUT_SECONDS,
+        help=f"Timeout in seconds for each AI agent invocation (default: {DEFAULT_AGENT_TIMEOUT_SECONDS})",
+    )
+    parser.add_argument(
+        "--command-timeout",
+        type=positive_int,
+        default=DEFAULT_COMMAND_TIMEOUT_SECONDS,
+        help=f"Timeout in seconds for git/gh and other shell commands (default: {DEFAULT_COMMAND_TIMEOUT_SECONDS})",
+    )
 
     # Dependency configuration
     parser.add_argument(
@@ -1888,12 +1907,24 @@ Examples:
         "--no-run-tests", action="store_true", help="Skip running tests"
     )
     parser.add_argument(
+        "--test-timeout",
+        type=positive_int,
+        default=DEFAULT_TEST_TIMEOUT_SECONDS,
+        help=f"Timeout in seconds for running the test suite (default: {DEFAULT_TEST_TIMEOUT_SECONDS})",
+    )
+    parser.add_argument(
         "--no-push", action="store_true", help="Don't push changes to remote"
     )
     parser.add_argument(
         "--rollback-on-ci-failure",
         action="store_true",
         help="Automatically rollback (force push previous commit) if CI fails after push",
+    )
+    parser.add_argument(
+        "--ci-timeout",
+        type=positive_int,
+        default=DEFAULT_CI_TIMEOUT_MINUTES,
+        help=f"Timeout in minutes to wait for CI to complete (default: {DEFAULT_CI_TIMEOUT_MINUTES})",
     )
     parser.add_argument(
         "--max-fix-attempts",
@@ -1913,7 +1944,7 @@ Examples:
     # Limiting
     parser.add_argument(
         "--limit",
-        type=int,
+        type=positive_int,
         help="Only update N repositories with changes (default: unlimited)",
     )
     parser.add_argument(
@@ -1940,13 +1971,8 @@ def main():
     """Main entry point."""
     args = parse_args()
 
-    # Validate arguments
-    if args.limit is not None and args.limit <= 0:
-        print(
-            f"Error: --limit must be a positive integer, got {args.limit}",
-            file=sys.stderr,
-        )
-        return 1
+    # Apply the global default timeout for git/gh and other shell commands
+    set_command_timeout(args.command_timeout)
 
     # Setup logging
     logger = setup_logging(args.verbose, args.quiet)
@@ -1962,8 +1988,10 @@ def main():
     config = Config(
         agent_command=args.agent_command,
         agent_flags=args.agent_flags,
+        agent_timeout_seconds=args.agent_timeout,
         auto_merge_dependabot=not args.no_merge_dependabot,
         auto_update_dependencies=not args.no_update_dependencies,
+        ci_timeout_minutes=args.ci_timeout,
         dependency_min_age_days=args.dependency_min_age_days,
         dry_run=args.dry_run,
         exclude=set(args.exclude),
@@ -1971,6 +1999,7 @@ def main():
         push_changes=not args.no_push,
         rollback_on_ci_failure=args.rollback_on_ci_failure,
         run_tests=not args.no_run_tests,
+        test_timeout_seconds=args.test_timeout,
     )
 
     logger.info("=" * 80)
@@ -1979,6 +2008,12 @@ def main():
     logger.info(f"Agent: {config.agent_command} {config.agent_flags}")
     logger.info(f"Dependency min age: {config.dependency_min_age_days} days")
     logger.info(f"Max fix attempts: {config.max_fix_attempts}")
+    logger.info(
+        f"Timeouts: agent={config.agent_timeout_seconds}s, "
+        f"test={config.test_timeout_seconds}s, "
+        f"command={args.command_timeout}s, "
+        f"ci={config.ci_timeout_minutes}m"
+    )
     logger.info(
         f"Features: dependabot={config.auto_merge_dependabot}, "
         f"deps={config.auto_update_dependencies}, "
