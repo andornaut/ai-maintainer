@@ -60,6 +60,7 @@ Skips repos that are: not git repos, not on default branch, have uncommitted cha
 
 | Flag                          | Description                                                           |
 | ----------------------------- | --------------------------------------------------------------------- |
+| `--base-dir`, `-d DIR`        | Directory to scan for repositories (default: current directory)       |
 | `--dry-run`, `-n`             | Preview without making changes                                        |
 | `--limit N`                   | Process at most N repos with changes                                  |
 | `--no-merge-dependabot`       | Skip merging dependabot PRs                                           |
