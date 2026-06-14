@@ -523,7 +523,7 @@ class TestMergePrsOnGithub:
             tmppath = Path(tmpdir)
             (tmppath / ".git").mkdir()
             maintainer = gm.Maintainer(tmppath, config)
-            maintainer.github.merge_pr = MagicMock(return_value=True)
+            maintainer.github.merge_pr = MagicMock(return_value=(True, ""))
             success, merged = maintainer._merge_prs_on_github([1, 2])
             assert success is True
             assert merged == [1, 2]
@@ -535,7 +535,9 @@ class TestMergePrsOnGithub:
             tmppath = Path(tmpdir)
             (tmppath / ".git").mkdir()
             maintainer = gm.Maintainer(tmppath, config)
-            maintainer.github.merge_pr = MagicMock(side_effect=[True, False, True])
+            maintainer.github.merge_pr = MagicMock(
+                side_effect=[(True, ""), (False, "merge blocked"), (True, "")]
+            )
             success, merged = maintainer._merge_prs_on_github([1, 2, 3])
             assert success is True
             assert merged == [1, 3]

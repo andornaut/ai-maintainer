@@ -714,9 +714,13 @@ class GitHubClient:
             url = url[:-4]
         return url
 
-    def merge_pr(self, pr_num: int) -> bool:
-        """Squash-merge a PR on GitHub and delete its remote branch."""
-        success, _, _ = run_command(
+    def merge_pr(self, pr_num: int) -> Tuple[bool, str]:
+        """Squash-merge a PR on GitHub and delete its remote branch.
+
+        Returns (success, error) where error is gh's stderr (or stdout) on
+        failure, so callers can log the root cause instead of a bare failure.
+        """
+        success, stdout, stderr = run_command(
             [
                 "gh",
                 "pr",
@@ -727,7 +731,7 @@ class GitHubClient:
             ],
             self.repo_path,
         )
-        return success
+        return success, (stderr or stdout).strip()
 
     def get_ci_failure_logs(self) -> Optional[str]:
         """Get logs from the latest failed CI run."""
@@ -1699,14 +1703,16 @@ class Maintainer:
                 merged_prs.append(pr_num)
                 continue
 
-            if self.github.merge_pr(pr_num):
+            success, error = self.github.merge_pr(pr_num)
+            if success:
                 self.logger.info(
                     f"[{self.repo_name}] PR #{pr_num} merged on GitHub"
                 )
                 merged_prs.append(pr_num)
             else:
+                detail = f": {error}" if error else ""
                 self.logger.warning(
-                    f"[{self.repo_name}] Failed to merge PR #{pr_num} on GitHub, skipping"
+                    f"[{self.repo_name}] Failed to merge PR #{pr_num} on GitHub, skipping{detail}"
                 )
 
         return True, merged_prs
