@@ -13,7 +13,13 @@ chmod +x ai-maintainer
 ln -s "$(pwd)/ai-maintainer" ~/.local/bin/
 ```
 
-**Requirements**: Python 3.7+, Git, [GitHub CLI](https://cli.github.com/) (`gh auth login`), and [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) (or [Ollama](https://ollama.ai/))
+**Requirements**: Python 3.7+, Git, [GitHub CLI](https://cli.github.com/), and [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) (or [Ollama](https://ollama.ai/))
+
+Authenticate the GitHub CLI with `gh auth login`. The token needs the `repo` **and** `workflow` scopes. `workflow` is required to merge dependabot PRs that bump GitHub Actions (they edit `.github/workflows/`); without it those merges fail with `refusing to allow an OAuth App to create or update workflow ... without 'workflow' scope`. Add the scope to an existing login with:
+
+```bash
+gh auth refresh -h github.com -s workflow
+```
 
 ## Usage
 
