@@ -83,7 +83,7 @@ Skips repos that are: not git repos, not on default branch, have uncommitted cha
 
 AI agents receive untrusted data (CI logs, dependency files, test output) that could contain prompt injection attacks. See [AGENTS.md](AGENTS.md) for detailed security analysis.
 
-**Risks**: AI-generated commands are executed with `shell=True`. No verification that package updates are legitimate. CI logs (up to 10KB) sent to AI provider may leak secrets.
+**Risks**: The AI agent runs with `--dangerously-skip-permissions`, so it executes package-manager and other shell commands with your user privileges. No verification that package updates are legitimate. CI logs (up to 10KB) sent to AI provider may leak secrets.
 
 **Mitigations**: Security warnings in prompts, JSON schema enforcement, GPG signature checking for dependabot (no AI), process isolation with timeouts.
 
