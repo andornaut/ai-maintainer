@@ -590,6 +590,15 @@ class GitClient:
         )
         return success and stdout.strip() not in ("", "0")
 
+    def stage_all(self) -> CommandResult:
+        """Stage all changes, including untracked files (git add -A)."""
+        return self._run(["git", "add", "-A"])
+
+    def has_staged_changes(self) -> bool:
+        """Check whether any changes are staged for commit."""
+        success, stdout, _ = self._run(["git", "diff", "--cached", "--name-only"])
+        return success and bool(stdout.strip())
+
     def pull_changes(self) -> bool:
         """Pull latest changes from remote."""
         self.logger.debug(f"[{self.repo_name}] Pulling changes...")
@@ -655,6 +664,22 @@ class GitClient:
         self.logger.debug(f"[{self.repo_name}] Working directory reset")
         return True
 
+    def reset_hard(self, sha: str) -> CommandResult:
+        """Hard-reset the working tree and branch to the given commit."""
+        return self._run(["git", "reset", "--hard", sha])
+
+    def stash_push(self, message: str) -> CommandResult:
+        """Stash uncommitted changes under a label."""
+        return self._run(["git", "stash", "push", "-m", message])
+
+    def stash_apply(self) -> CommandResult:
+        """Re-apply the most recent stash without dropping it."""
+        return self._run(["git", "stash", "apply"])
+
+    def stash_drop(self) -> CommandResult:
+        """Drop the most recent stash."""
+        return self._run(["git", "stash", "drop"])
+
     def rollback_to(self, sha: str) -> bool:
         """Reset the branch to the given SHA and force push to remote.
 
@@ -666,7 +691,7 @@ class GitClient:
         self.logger.warning(f"[{self.repo_name}] Rolling back to {sha[:7]}...")
 
         # Reset to the pre-change commit
-        success, _, stderr = self._run(["git", "reset", "--hard", sha])
+        success, _, stderr = self.reset_hard(sha)
         if not success:
             self.logger.error(
                 f"[{self.repo_name}] Failed to reset to {sha[:7]}: {stderr}"
@@ -993,7 +1018,7 @@ class Maintainer:
             self.logger.debug(f"[{self.repo_name}] Committing changes...")
 
             # Stage all changes (including new files created by AI)
-            success, _, stderr = self.git._run(["git", "add", "-A"])
+            success, _, stderr = self.git.stage_all()
             if not success:
                 self.logger.error(
                     f"[{self.repo_name}] Command failed: git add -A\n{stderr}"
@@ -1001,10 +1026,7 @@ class Maintainer:
                 return False, False
 
             # Check if anything was actually staged
-            success, stdout, _ = self.git._run(
-                ["git", "diff", "--cached", "--name-only"]
-            )
-            if not success or not stdout.strip():
+            if not self.git.has_staged_changes():
                 self.logger.debug(f"[{self.repo_name}] No changes staged for commit")
                 workdir_dirty = False
             else:
@@ -1045,9 +1067,7 @@ class Maintainer:
             if committed and pre_commit_sha:
                 # Undo all unpushed commits since we couldn't push them
                 self.logger.warning(f"[{self.repo_name}] Undoing commits since push failed")
-                reset_success, _, reset_stderr = self.git._run(
-                    ["git", "reset", "--hard", pre_commit_sha]
-                )
+                reset_success, _, reset_stderr = self.git.reset_hard(pre_commit_sha)
                 if not reset_success:
                     self.logger.error(
                         f"[{self.repo_name}] Failed to undo commits after push failure\n{reset_stderr}"
@@ -1228,9 +1248,7 @@ class Maintainer:
 
         # Stash uncommitted dependency updates if present
         if not self.git.is_workdir_clean():
-            success, _, _ = self.git._run(
-                ["git", "stash", "push", "-m", "ai-maintainer: dependency updates"]
-            )
+            success, _, _ = self.git.stash_push("ai-maintainer: dependency updates")
             if not success:
                 self.logger.error(
                     f"[{self.repo_name}] Failed to stash changes before fix attempts"
@@ -1238,44 +1256,48 @@ class Maintainer:
                 return False
             has_stash = True
 
-        for attempt in range(1, max_attempts + 1):
-            self.logger.info(
-                f"[{self.repo_name}] Test fix attempt {attempt}/{max_attempts}"
-            )
-
-            # Restore dependency updates as the starting point for this attempt
-            if has_stash:
-                success, _, stderr = self.git._run(["git", "stash", "apply"])
-                if not success:
-                    self.logger.error(
-                        f"[{self.repo_name}] Failed to restore dependency updates: {stderr}"
-                    )
-                    break
-
-            if self._try_fix_tests(test_output):
-                if has_stash:
-                    self.git._run(["git", "stash", "drop"])
+        # Guarantee the stash is dropped on every exit path - including the
+        # apply-failure return and any exception - so a failed run never leaves
+        # a dangling stash behind.
+        try:
+            for attempt in range(1, max_attempts + 1):
                 self.logger.info(
-                    f"[{self.repo_name}] Tests passed after {attempt} fix attempt(s)"
+                    f"[{self.repo_name}] Test fix attempt {attempt}/{max_attempts}"
                 )
-                return True
 
-            # _try_fix_tests reset all changes. Re-apply deps and re-run tests
-            # to capture fresh failure output for the next attempt.
-            if attempt < max_attempts:
+                # Restore dependency updates as the starting point for this attempt
                 if has_stash:
-                    self.git._run(["git", "stash", "apply"])
-                _, test_output = self.run_tests()
-                if has_stash:
-                    self.git.reset_changes()
+                    success, _, stderr = self.git.stash_apply()
+                    if not success:
+                        self.logger.error(
+                            f"[{self.repo_name}] Failed to restore dependency updates: {stderr}"
+                        )
+                        self.git.reset_changes()
+                        return False
 
-        self.logger.error(
-            f"[{self.repo_name}] Exhausted all {max_attempts} fix attempts"
-        )
-        if has_stash:
-            self.git._run(["git", "stash", "drop"])
-        self.git.reset_changes()
-        return False
+                if self._try_fix_tests(test_output):
+                    self.logger.info(
+                        f"[{self.repo_name}] Tests passed after {attempt} fix attempt(s)"
+                    )
+                    return True
+
+                # _try_fix_tests reset all changes. Re-apply deps and re-run tests
+                # to capture fresh failure output for the next attempt.
+                if attempt < max_attempts:
+                    if has_stash:
+                        self.git.stash_apply()
+                    _, test_output = self.run_tests()
+                    if has_stash:
+                        self.git.reset_changes()
+
+            self.logger.error(
+                f"[{self.repo_name}] Exhausted all {max_attempts} fix attempts"
+            )
+            self.git.reset_changes()
+            return False
+        finally:
+            if has_stash:
+                self.git.stash_drop()
 
     def _validate_repo(self) -> bool:
         """Validate repository is ready for maintenance.
