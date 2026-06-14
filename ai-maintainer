@@ -662,20 +662,23 @@ class GitClient:
         self.logger.debug(f"[{self.repo_name}] Working directory reset")
         return True
 
-    def rollback_last_commit(self) -> bool:
-        """Rollback the last commit and force push to remote.
+    def rollback_to(self, sha: str) -> bool:
+        """Reset the branch to the given SHA and force push to remote.
+
+        Used to undo every change this run pushed - maintainer commits and any
+        merged dependabot PRs - when CI breaks and cannot be fixed.
 
         Returns True if successful, False otherwise.
         """
-        self.logger.warning(f"[{self.repo_name}] Rolling back last commit...")
+        self.logger.warning(f"[{self.repo_name}] Rolling back to {sha[:7]}...")
 
-        # Reset to previous commit
+        # Reset to the pre-change commit
         success, _, stderr = run_command(
-            ["git", "reset", "--hard", "HEAD~1"], self.repo_path
+            ["git", "reset", "--hard", sha], self.repo_path
         )
         if not success:
             self.logger.error(
-                f"[{self.repo_name}] Failed to reset to previous commit: {stderr}"
+                f"[{self.repo_name}] Failed to reset to {sha[:7]}: {stderr}"
             )
             return False
 
@@ -689,7 +692,7 @@ class GitClient:
             )
             return False
 
-        self.logger.info(f"[{self.repo_name}] Successfully rolled back last commit")
+        self.logger.info(f"[{self.repo_name}] Successfully rolled back to {sha[:7]}")
         return True
 
 
@@ -1374,15 +1377,21 @@ class Maintainer:
         # pre-existing failure, so we hold ourselves responsible.
         return True, True
 
-    def _handle_post_push_ci(self, ci_was_passing: Optional[bool]) -> bool:
+    def _handle_post_push_ci(
+        self, baseline_sha: Optional[str], ci_was_passing: Optional[bool]
+    ) -> bool:
         """Monitor CI after push and fix failures if we caused them.
 
         Args:
+            baseline_sha: HEAD before this run's changes, used as the rollback target
             ci_was_passing: Whether CI was passing before our changes (None if no CI)
 
         Returns:
             True if CI passed or was already failing, False if we broke it and couldn't fix.
         """
+        if self.config.dry_run:
+            return True
+
         if ci_was_passing is None:
             return True
 
@@ -1416,7 +1425,7 @@ class Maintainer:
         # Failed to fix CI
         self.logger.error(f"[{self.repo_name}] Failed to fix CI failure{ci_url_suffix}")
         if self.config.rollback_on_ci_failure and self.config.push_changes:
-            if self.git.rollback_last_commit():
+            if baseline_sha and self.git.rollback_to(baseline_sha):
                 self.logger.warning(f"[{self.repo_name}] Rolled back failed changes")
             else:
                 self.logger.error(
@@ -1442,6 +1451,11 @@ class Maintainer:
         should_continue, ci_was_passing = self._check_and_fix_pre_existing_ci()
         if not should_continue:
             return False, False
+
+        # Capture HEAD before this run's changes so we can roll the branch back
+        # to it if a merged dependabot PR or dependency update breaks CI and we
+        # cannot fix it. Captured after any pre-existing CI fix so that fix is kept.
+        baseline_sha = self.git.get_head_sha()
 
         # Merge dependabot PRs on GitHub and pull changes
         success, merged_prs = self.merge_dependabot_prs()
@@ -1486,9 +1500,11 @@ class Maintainer:
             self.git.reset_changes()
             return False, False
 
-        # Monitor CI after push and fix failures if we caused them
-        if committed_changes:
-            if not self._handle_post_push_ci(ci_was_passing):
+        # Monitor CI after push and fix failures if we caused them. Runs whenever
+        # this run pushed a commit or merged a dependabot PR on GitHub, since a
+        # merged PR triggers CI even when ai-maintainer made no local commit.
+        if committed_changes or merged_prs:
+            if not self._handle_post_push_ci(baseline_sha, ci_was_passing):
                 return False, committed_changes
 
         if committed_changes:
@@ -1924,7 +1940,7 @@ Examples:
     parser.add_argument(
         "--rollback-on-ci-failure",
         action="store_true",
-        help="Automatically rollback (force push previous commit) if CI fails after push",
+        help="Automatically roll back (reset to the pre-run commit and force push, undoing merged dependabot PRs and dependency updates) if CI fails after push and cannot be fixed",
     )
     parser.add_argument(
         "--ci-timeout",
