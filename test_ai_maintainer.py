@@ -553,6 +553,41 @@ class TestMergePrsOnGithub:
             assert success is True
             assert merged == []
 
+    def test_merge_conflict_triggers_rebase(self, default_config):
+        config = gm.Config(**{**default_config.__dict__, "dry_run": False})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            (tmppath / ".git").mkdir()
+            maintainer = gm.Maintainer(tmppath, config)
+            maintainer.github.merge_pr = MagicMock(
+                return_value=(
+                    False,
+                    "GraphQL: Pull Request has merge conflicts (mergePullRequest)",
+                )
+            )
+            maintainer.github.comment_pr = MagicMock(return_value=True)
+            success, merged = maintainer._merge_prs_on_github([5])
+            assert success is True
+            assert merged == []
+            maintainer.github.comment_pr.assert_called_once_with(
+                5, gm.DEPENDABOT_REBASE_COMMAND
+            )
+
+    def test_non_conflict_failure_skips_without_rebase(self, default_config):
+        config = gm.Config(**{**default_config.__dict__, "dry_run": False})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            (tmppath / ".git").mkdir()
+            maintainer = gm.Maintainer(tmppath, config)
+            maintainer.github.merge_pr = MagicMock(
+                return_value=(False, "merge blocked by branch protection")
+            )
+            maintainer.github.comment_pr = MagicMock(return_value=True)
+            success, merged = maintainer._merge_prs_on_github([7])
+            assert success is True
+            assert merged == []
+            maintainer.github.comment_pr.assert_not_called()
+
 
 class TestBuildCommitMessage:
     """Tests for commit message building."""

@@ -52,6 +52,11 @@ TOOL_REPO_URL = "https://github.com/andornaut/ai-maintainer"
 # Workflow name prefixes to exclude from CI detection (e.g. GitHub-managed workflows)
 IGNORED_WORKFLOW_PREFIXES = ("Dependabot",)
 
+# Comment that asks dependabot to rebase a PR and regenerate its dependency
+# files against the base branch, resolving merge conflicts. The rebased PR
+# becomes mergeable on a subsequent run.
+DEPENDABOT_REBASE_COMMAND = "@dependabot rebase"
+
 # Dependency files to check for in repositories
 DEPENDENCY_FILES = (
     "Cargo.toml",
@@ -761,6 +766,17 @@ class GitHubClient:
             ]
         )
         return success, (stderr or stdout).strip()
+
+    def comment_pr(self, pr_num: int, body: str) -> bool:
+        """Post a comment on a PR. Returns True on success."""
+        success, _, stderr = self._run(
+            ["gh", "pr", "comment", str(pr_num), "--body", body]
+        )
+        if not success:
+            self.logger.debug(
+                f"Failed to comment on PR #{pr_num}: {stderr.strip()}"
+            )
+        return success
 
     def get_ci_failure_logs(self) -> Optional[str]:
         """Get logs from the latest failed CI run."""
@@ -1757,6 +1773,8 @@ class Maintainer:
                     f"[{self.repo_name}] PR #{pr_num} merged on GitHub"
                 )
                 merged_prs.append(pr_num)
+            elif "merge conflict" in error.lower():
+                self._rebase_conflicted_pr(pr_num)
             else:
                 detail = f": {error}" if error else ""
                 self.logger.warning(
@@ -1764,6 +1782,19 @@ class Maintainer:
                 )
 
         return True, merged_prs
+
+    def _rebase_conflicted_pr(self, pr_num: int) -> None:
+        """Ask dependabot to rebase a conflicted PR so it can merge next run."""
+        if self.github.comment_pr(pr_num, DEPENDABOT_REBASE_COMMAND):
+            self.logger.info(
+                f"[{self.repo_name}] PR #{pr_num} has merge conflicts, "
+                f"asked dependabot to rebase"
+            )
+        else:
+            self.logger.warning(
+                f"[{self.repo_name}] PR #{pr_num} has merge conflicts and "
+                f"rebase request failed, skipping"
+            )
 
     def _wait_for_ci(self, timeout_minutes: int) -> Optional[str]:
         """Wait for CI to complete on the current HEAD commit."""
