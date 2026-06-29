@@ -1769,9 +1769,17 @@ class Maintainer:
 
             success, error = self.github.merge_pr(pr_num)
             if success:
-                self.logger.info(
-                    f"[{self.repo_name}] PR #{pr_num} merged on GitHub"
-                )
+                # gh exits 0 with an "already merged" notice when the PR was
+                # merged out of band; its changes are on the base branch, so
+                # still treat it as merged (pull happens upstream).
+                if "already merged" in error.lower():
+                    self.logger.info(
+                        f"[{self.repo_name}] PR #{pr_num} was already merged"
+                    )
+                else:
+                    self.logger.info(
+                        f"[{self.repo_name}] PR #{pr_num} merged on GitHub"
+                    )
                 merged_prs.append(pr_num)
             elif "merge conflict" in error.lower():
                 self._rebase_conflicted_pr(pr_num)

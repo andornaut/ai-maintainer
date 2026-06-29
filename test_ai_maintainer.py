@@ -573,6 +573,21 @@ class TestMergePrsOnGithub:
                 5, gm.DEPENDABOT_REBASE_COMMAND
             )
 
+    def test_already_merged_counts_as_merged(self, default_config):
+        config = gm.Config(**{**default_config.__dict__, "dry_run": False})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            (tmppath / ".git").mkdir()
+            maintainer = gm.Maintainer(tmppath, config)
+            maintainer.github.merge_pr = MagicMock(
+                return_value=(True, "! Pull request #9 was already merged")
+            )
+            maintainer.github.comment_pr = MagicMock(return_value=True)
+            success, merged = maintainer._merge_prs_on_github([9])
+            assert success is True
+            assert merged == [9]
+            maintainer.github.comment_pr.assert_not_called()
+
     def test_non_conflict_failure_skips_without_rebase(self, default_config):
         config = gm.Config(**{**default_config.__dict__, "dry_run": False})
         with tempfile.TemporaryDirectory() as tmpdir:
