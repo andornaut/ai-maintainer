@@ -25,7 +25,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 __version__ = "0.1.0"
 
@@ -33,7 +33,13 @@ __version__ = "0.1.0"
 CommandResult = Tuple[bool, str, str]  # (success, stdout, stderr)
 MaintainResult = Tuple[bool, bool]  # (success, had_changes)
 MergeResult = Tuple[bool, List[int]]  # (success, merged_pr_numbers)
+RepoResult = Tuple[str, bool]  # (status, had_changes); status is a STATUS_* value
 TestResult = Tuple[bool, str]  # (success, output)
+
+# Per-repository maintenance outcomes
+STATUS_SUCCESS = "success"
+STATUS_SKIPPED = "skipped"
+STATUS_FAILED = "failed"
 
 # Default values for CLI arguments and configuration
 DEFAULT_AGENT_COMMAND = "claude"
@@ -106,9 +112,8 @@ class Config:
 
 
 def run_command(
-    cmd: Union[List[str], str],
+    cmd: List[str],
     cwd: Path,
-    shell: bool = False,
     timeout: Optional[int] = None,
 ) -> CommandResult:
     """Run a command and return (success, stdout, stderr).
@@ -120,7 +125,7 @@ def run_command(
         timeout = DEFAULT_COMMAND_TIMEOUT_SECONDS
     try:
         result = subprocess.run(
-            cmd, cwd=cwd, capture_output=True, text=True, shell=shell,
+            cmd, cwd=cwd, capture_output=True, text=True,
             stdin=subprocess.DEVNULL, timeout=timeout,
         )
         return result.returncode == 0, result.stdout, result.stderr
@@ -128,7 +133,7 @@ def run_command(
         return False, "", f"Command timed out after {timeout}s"
     except KeyboardInterrupt:
         raise
-    except (subprocess.SubprocessError, OSError, FileNotFoundError) as e:
+    except (subprocess.SubprocessError, OSError) as e:
         return False, "", str(e)
 
 
@@ -212,14 +217,8 @@ class ProjectEnvironment:
 
     def _detect_node_runner(self) -> Optional[str]:
         """Detect Node.js version manager (nvm or fnm)."""
-        p = self.repo_path
-        nvmrc_file = p / ".nvmrc"
-        if not nvmrc_file.exists():
-            return None
-
         # Try fnm first (faster, Rust-based)
-        success, _, _ = run_command(["which", "fnm"], p)
-        if success:
+        if shutil.which("fnm"):
             return 'eval "$(fnm env)" && fnm use &&'
 
         # Try nvm (more common)
@@ -257,10 +256,8 @@ class ProjectEnvironment:
 
     def _detect_go_runner(self) -> Optional[str]:
         """Ensure the Go toolchain is on PATH for Go projects."""
-        p = self.repo_path
-
         # Already on PATH - no prefix needed
-        if run_command(["which", "go"], p)[0]:
+        if shutil.which("go"):
             return None
 
         # Common Go install locations (the binary lives at <dir>/go)
@@ -281,10 +278,8 @@ class ProjectEnvironment:
 
     def _detect_cargo_runner(self) -> Optional[str]:
         """Ensure the Rust/Cargo toolchain is on PATH for Rust projects."""
-        p = self.repo_path
-
         # Already on PATH - no prefix needed
-        if run_command(["which", "cargo"], p)[0]:
+        if shutil.which("cargo"):
             return None
 
         # rustup writes an env script that puts cargo on PATH
@@ -300,38 +295,33 @@ class ProjectEnvironment:
 
     def _detect_ruby_runner(self) -> Optional[str]:
         """Detect Ruby version manager (chruby or rbenv)."""
-        p = self.repo_path
-        ruby_version_file = p / ".ruby-version"
-
+        ruby_version_file = self.repo_path / ".ruby-version"
         if not ruby_version_file.exists():
             return None
 
         try:
             ruby_version = ruby_version_file.read_text().strip()
-
-            # Try chruby first
-            chruby_paths = [
-                "/usr/local/share/chruby/chruby.sh",
-                "/opt/homebrew/opt/chruby/share/chruby/chruby.sh",
-                "/usr/share/chruby/chruby.sh",
-                "~/.local/share/chruby/chruby.sh",
-            ]
-            for chruby_path in chruby_paths:
-                expanded_path = Path(chruby_path).expanduser()
-                if expanded_path.exists():
-                    auto_path = expanded_path.parent / "auto.sh"
-                    if auto_path.exists():
-                        return f"source {expanded_path} && source {auto_path} && chruby {ruby_version} &&"
-                    else:
-                        return f"source {expanded_path} && chruby {ruby_version} &&"
-
-            # Try rbenv
-            success, _, _ = run_command(["which", "rbenv"], p)
-            if success:
-                return 'eval "$(rbenv init - bash)" &&'
-
         except (OSError, UnicodeDecodeError):
-            pass
+            return None
+
+        # Try chruby first
+        chruby_paths = [
+            "/usr/local/share/chruby/chruby.sh",
+            "/opt/homebrew/opt/chruby/share/chruby/chruby.sh",
+            "/usr/share/chruby/chruby.sh",
+            "~/.local/share/chruby/chruby.sh",
+        ]
+        for chruby_path in chruby_paths:
+            expanded_path = Path(chruby_path).expanduser()
+            if expanded_path.exists():
+                auto_path = expanded_path.parent / "auto.sh"
+                if auto_path.exists():
+                    return f"source {expanded_path} && source {auto_path} && chruby {ruby_version} &&"
+                return f"source {expanded_path} && chruby {ruby_version} &&"
+
+        # Try rbenv
+        if shutil.which("rbenv"):
+            return 'eval "$(rbenv init - bash)" &&'
 
         return None
 
@@ -365,8 +355,11 @@ class AgentClient:
         except OSError:
             pass
 
-    def ask(self, prompt: str, context: Optional[Dict[str, Any]] = None) -> str:
+    def ask(self, prompt: str, context: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """Ask the AI agent for a decision.
+
+        Returns the agent's raw response, or None if the agent could not be
+        run, timed out, or exited non-zero (the cause is logged here).
 
         Note: Context may contain untrusted data (PR titles, CI logs, etc.).
         The prompt includes a security warning against prompt injection.
@@ -401,7 +394,7 @@ Respond with ONLY a JSON object. No explanations, no markdown outside the JSON.
         agent_cmd = shlex.split(self.config.agent_command)
         if not agent_cmd:
             self.logger.error(f"[{self.repo_name}] Empty agent command")
-            return json.dumps({"error": "Empty agent command"})
+            return None
 
         if self.config.agent_flags:
             agent_cmd.extend(shlex.split(self.config.agent_flags))
@@ -417,8 +410,9 @@ Respond with ONLY a JSON object. No explanations, no markdown outside the JSON.
             # Use Popen with start_new_session and stdin=DEVNULL so the agent
             # runs in its own process group without terminal access. This
             # prevents it from setting the terminal to raw mode (which
-            # disables SIGINT generation from CTRL+C) and allows
-            # KeyboardInterrupt to be raised in our polling loop.
+            # disables SIGINT generation from CTRL+C). communicate() drains
+            # stdout/stderr while waiting, so a verbose agent cannot block on
+            # a full pipe buffer.
             proc = subprocess.Popen(
                 agent_cmd,
                 stdin=subprocess.DEVNULL,
@@ -428,15 +422,14 @@ Respond with ONLY a JSON object. No explanations, no markdown outside the JSON.
                 env=env,
                 start_new_session=True,
             )
-            deadline = time.monotonic() + self.config.agent_timeout_seconds
             try:
-                while proc.poll() is None:
-                    if time.monotonic() >= deadline:
-                        self._kill_agent(proc)
-                        self.logger.error(f"[{self.repo_name}] Agent timed out")
-                        return json.dumps({"error": "Agent timed out"})
-                    time.sleep(0.5)
-                stdout, stderr = proc.communicate()
+                stdout, stderr = proc.communicate(
+                    timeout=self.config.agent_timeout_seconds
+                )
+            except subprocess.TimeoutExpired:
+                self._kill_agent(proc)
+                self.logger.error(f"[{self.repo_name}] Agent timed out")
+                return None
             except KeyboardInterrupt:
                 self.logger.warning(f"[{self.repo_name}] Interrupted by user")
                 self._kill_agent(proc)
@@ -445,7 +438,7 @@ Respond with ONLY a JSON object. No explanations, no markdown outside the JSON.
             raise
         except (subprocess.SubprocessError, OSError) as e:
             self.logger.error(f"[{self.repo_name}] Agent error: {e}")
-            return json.dumps({"error": str(e)})
+            return None
 
         if proc.returncode == 0:
             return stdout
@@ -455,35 +448,27 @@ Respond with ONLY a JSON object. No explanations, no markdown outside the JSON.
             error_parts.append(f"stderr: {stderr.strip()}")
         if stdout.strip():
             error_parts.append(f"stdout: {stdout.strip()[:500]}")
-        error_msg = "; ".join(error_parts) if len(error_parts) > 1 else error_parts[0]
-        self.logger.error(f"[{self.repo_name}] Agent failed: {error_msg}")
-        return json.dumps({"error": error_msg})
+        self.logger.error(f"[{self.repo_name}] Agent failed: {'; '.join(error_parts)}")
+        return None
 
-    def parse_json(self, response: str) -> Dict[str, Any]:
-        """Extract and parse JSON from agent response.
+    def parse_json(self, response: str) -> Optional[Dict[str, Any]]:
+        """Extract and parse a JSON object from an agent response.
 
-        Raises:
-            json.JSONDecodeError: If the response is not valid JSON.
-        """
-        return json.loads(self._extract_json_from_response(response))
-
-    def _extract_json_from_response(self, response: str) -> str:
-        """Extract JSON from agent response, handling various formats.
-
-        Handles:
-        - Markdown code blocks (```json ... ``` or ``` ... ```)
-        - Raw JSON objects with surrounding text
-        - Plain JSON responses
+        Handles markdown code blocks (```json ... ``` or ``` ... ```), JSON
+        with surrounding prose, and plain JSON. Returns None when no JSON
+        object can be found.
         """
         if not response or not response.strip():
-            return '{"error": "Empty agent response"}'
+            return None
 
-        # Try markdown code blocks first
+        # Prefer a fenced code block, but only when its content is a JSON
+        # object; a non-JSON block (e.g. a bash snippet) falls through to
+        # scanning the whole response.
         match = re.search(r"```(?:json)?\s*([\s\S]*?)```", response)
         if match:
-            extracted = match.group(1).strip()
-            if extracted:
-                return extracted
+            obj = safe_json_parse(match.group(1).strip())
+            if isinstance(obj, dict):
+                return obj
 
         # Try to find a valid JSON object by attempting to parse from each '{'.
         # raw_decode stops at the end of the first valid JSON value, so this
@@ -493,11 +478,11 @@ Respond with ONLY a JSON object. No explanations, no markdown outside the JSON.
             try:
                 obj, _ = decoder.raw_decode(response[match.start() :])
                 if isinstance(obj, dict):
-                    return json.dumps(obj)
+                    return obj
             except json.JSONDecodeError:
                 continue
 
-        return '{"error": "No JSON found in agent response"}'
+        return None
 
 
 class GitClient:
@@ -548,8 +533,10 @@ class GitClient:
             ["git", "symbolic-ref", "refs/remotes/origin/HEAD"]
         )
         if success and stdout.strip():
-            # Output is like: refs/remotes/origin/main
-            branch = stdout.strip().split("/")[-1]
+            # Output is like: refs/remotes/origin/main. Strip the fixed prefix
+            # rather than splitting on "/" so branch names containing slashes
+            # (e.g. release/1.0) survive intact.
+            branch = stdout.strip().removeprefix("refs/remotes/origin/")
             # Verify the branch actually exists (origin/HEAD may be stale)
             if f"origin/{branch}" in remote_branches:
                 return branch
@@ -576,12 +563,21 @@ class GitClient:
         return (self.repo_path / ".git").exists()
 
     def is_latest_commit_from_maintainer(self) -> bool:
-        """Check if the latest commit was created by ai-maintainer."""
-        success, stdout, _ = self._run(["git", "log", "-1", "--format=%B"])
+        """Check if the latest commit was created by ai-maintainer.
+
+        Also matches dependabot-authored commits: squash-merging a dependabot
+        PR keeps dependabot as the commit author, and this tool merges those
+        PRs, so a failure on such a commit is ours to fix.
+        """
+        success, stdout, _ = self._run(["git", "log", "-1", "--format=%an%n%B"])
         if not success:
             return False
-        # Check for our attribution in the commit message
-        return TOOL_REPO_URL in stdout or "ai-maintainer" in stdout.lower()
+        author, _, message = stdout.partition("\n")
+        return (
+            TOOL_REPO_URL in message
+            or "ai-maintainer" in message.lower()
+            or author.strip().lower().startswith("dependabot")
+        )
 
     def is_workdir_clean(self) -> bool:
         """Check if working directory is clean."""
@@ -593,7 +589,11 @@ class GitClient:
         success, stdout, _ = self._run(
             ["git", "rev-list", "@{u}..HEAD", "--count"]
         )
-        return success and stdout.strip() not in ("", "0")
+        if not success:
+            # No upstream configured (or rev-list failed): attempt the push
+            # and let it surface the real error instead of silently skipping.
+            return True
+        return stdout.strip() not in ("", "0")
 
     def stage_all(self) -> CommandResult:
         """Stage all changes, including untracked files (git add -A)."""
@@ -1131,7 +1131,7 @@ class Maintainer:
 
         # Python - detect test framework
         if (p / "tox.ini").exists():
-            return f"{prefix}tox" if prefix else "tox"
+            return f"{prefix}tox"
         if (p / "pyproject.toml").exists() and (p / "tests").exists():
             return f"{prefix}pytest"
         if (p / "pytest.ini").exists() or (p / "setup.py").exists():
@@ -1159,7 +1159,7 @@ class Maintainer:
                 ["make", "-n", "test"], p,
                 timeout=self.config.command_timeout_seconds,
             )[0]:
-                return "make test"
+                return f"{prefix}make test"
 
         return None
 
@@ -1200,6 +1200,13 @@ class Maintainer:
 
     def fix_ci_with_retries(self) -> bool:
         """Attempt to fix CI failures with retries. Returns True if CI passes."""
+        if not self.config.push_changes:
+            self.logger.info(
+                f"[{self.repo_name}] Push disabled; skipping CI fix "
+                "(a fix must be pushed to affect CI)"
+            )
+            return False
+
         max_attempts = self.config.max_fix_attempts
 
         for attempt in range(1, max_attempts + 1):
@@ -1415,6 +1422,11 @@ class Maintainer:
 
         if initial_ci == "failure":
             if self.git.is_latest_commit_from_maintainer():
+                if self.config.dry_run:
+                    self.logger.info(
+                        f"[{self.repo_name}] DRY RUN: Would attempt to fix pre-existing CI failure"
+                    )
+                    return True, False
                 self.logger.warning(
                     f"[{self.repo_name}] CI is failing from a previous ai-maintainer run, will attempt to fix"
                 )
@@ -1494,24 +1506,25 @@ class Maintainer:
                 )
         return False
 
-    def maintain(self) -> MaintainResult:
+    def maintain(self) -> RepoResult:
         """Run full maintenance workflow.
 
         Returns:
-            Tuple of (success, had_changes) where:
-            - success: whether the operation completed successfully
+            Tuple of (status, had_changes) where:
+            - status: STATUS_SUCCESS, STATUS_SKIPPED (repo not eligible), or
+              STATUS_FAILED (maintenance was attempted but went wrong)
             - had_changes: whether there were changes that were committed
         """
         self.logger.debug(f"[{self.repo_name}] Starting maintenance")
 
         # Validate repository is ready for maintenance
         if not self._validate_repo():
-            return False, False
+            return STATUS_SKIPPED, False
 
         # Check and fix pre-existing CI failures
         should_continue, ci_was_passing = self._check_and_fix_pre_existing_ci()
         if not should_continue:
-            return False, False
+            return STATUS_FAILED, False
 
         # Capture HEAD before this run's changes so we can roll the branch back
         # to it if a merged dependabot PR or dependency update breaks CI and we
@@ -1522,23 +1535,24 @@ class Maintainer:
         success, merged_prs = self.merge_dependabot_prs()
         if not success:
             self.logger.error(f"[{self.repo_name}] Failed to merge dependabot PRs")
-            return False, False
+            return STATUS_FAILED, False
         if merged_prs and not self.config.dry_run:
             if not self.git.pull_changes():
                 self.logger.error(
                     f"[{self.repo_name}] Failed to pull after merging dependabot PRs"
                 )
-                return False, False
+                return STATUS_FAILED, False
 
         # Update dependencies
         success, had_dep_updates = self.update_dependencies()
         if not success:
             self.logger.error(f"[{self.repo_name}] Failed to update dependencies")
             self.git.reset_changes()
-            return False, False
+            return STATUS_FAILED, False
 
-        # Only run tests if we made changes (merged PRs or updated dependencies)
-        had_changes = bool(merged_prs) or had_dep_updates
+        # Only run tests if we made changes (merged PRs or updated dependencies).
+        # Dry-run merges are simulated, so there is nothing to test or fix.
+        had_changes = (bool(merged_prs) and not self.config.dry_run) or had_dep_updates
         if had_changes:
             tests_passed, test_output = self.run_tests()
             if not tests_passed:
@@ -1552,21 +1566,21 @@ class Maintainer:
                         f"[{self.repo_name}] Could not fix test failures, not committing changes"
                     )
                     self.git.reset_changes()
-                    return False, False
+                    return STATUS_FAILED, False
 
         # Commit and push (only if we have changes)
         commit_msg = self.build_commit_message(had_dep_updates)
         success, committed_changes = self.commit_and_push(commit_msg)
         if not success:
             self.git.reset_changes()
-            return False, False
+            return STATUS_FAILED, False
 
         # Monitor CI after push and fix failures if we caused them. Runs whenever
         # this run pushed a commit or merged a dependabot PR on GitHub, since a
         # merged PR triggers CI even when ai-maintainer made no local commit.
         if committed_changes or merged_prs:
             if not self._handle_post_push_ci(baseline_sha, ci_was_passing):
-                return False, committed_changes
+                return STATUS_FAILED, committed_changes
 
         if committed_changes:
             self.logger.info(
@@ -1576,7 +1590,7 @@ class Maintainer:
             self.logger.debug(
                 f"[{self.repo_name}] Maintenance completed successfully (no changes)"
             )
-        return True, committed_changes
+        return STATUS_SUCCESS, committed_changes
 
     def merge_dependabot_prs(self) -> MergeResult:
         """Merge dependabot PRs on GitHub after programmatic verification.
@@ -1623,17 +1637,10 @@ class Maintainer:
 
         if test_cmd:
             self.logger.debug(f"[{self.repo_name}] Running tests: {test_cmd}")
-            # Use shell for commands with shell operators (&&, source, etc.)
-            use_shell = "&&" in test_cmd or test_cmd.startswith("source ")
-            timeout = self.config.test_timeout_seconds
-            if use_shell:
-                success, stdout, stderr = run_shell_command(
-                    test_cmd, self.repo_path, timeout=timeout
-                )
-            else:
-                success, stdout, stderr = run_command(
-                    shlex.split(test_cmd), self.repo_path, timeout=timeout
-                )
+            # Always run through a shell: env runner prefixes use shell syntax
+            success, stdout, stderr = run_shell_command(
+                test_cmd, self.repo_path, timeout=self.config.test_timeout_seconds
+            )
             output = f"Command: {test_cmd}\n\nSTDOUT:\n{stdout}\n\nSTDERR:\n{stderr}"
 
             if success:
@@ -1691,52 +1698,63 @@ class Maintainer:
         context = {"dependency_files": dep_files}
 
         response = self.agent.ask(prompt, context)
-
-        try:
-            decision = self.agent.parse_json(response)
-            updated = decision.get("updated", False)
-            changes_made = decision.get("changes_made", "")
-            reasoning = decision.get("reasoning", "No reasoning provided")
-
-            self.logger.debug(f"[{self.repo_name}] Agent reasoning: {reasoning}")
-
-            if not updated:
-                self.logger.debug(f"[{self.repo_name}] No dependency updates needed")
-                return True, False
-
-            # Check if AI actually made changes
-            had_changes = not self.git.is_workdir_clean()
-            if had_changes:
-                self.logger.info(
-                    f"[{self.repo_name}] Dependencies updated: {changes_made}"
+        decision = self.agent.parse_json(response) if response is not None else None
+        if decision is None:
+            # ask() already logged agent errors; log parse failures here
+            if response is not None:
+                self.logger.debug(f"[{self.repo_name}] Agent response: {response}")
+                self.logger.error(
+                    f"[{self.repo_name}] No JSON object in agent response"
                 )
-            else:
-                self.logger.debug(
-                    f"[{self.repo_name}] AI reported updates but no files changed"
-                )
-
-            return True, had_changes
-
-        except json.JSONDecodeError as e:
-            self.logger.debug(f"[{self.repo_name}] Agent response: {response}")
-            self.logger.error(f"[{self.repo_name}] Failed to parse agent response: {e}")
             return False, False
+
+        updated = decision.get("updated", False)
+        changes_made = decision.get("changes_made", "")
+        reasoning = decision.get("reasoning", "No reasoning provided")
+
+        self.logger.debug(f"[{self.repo_name}] Agent reasoning: {reasoning}")
+
+        if not updated:
+            self.logger.debug(f"[{self.repo_name}] No dependency updates needed")
+            return True, False
+
+        # Check if AI actually made changes
+        had_changes = not self.git.is_workdir_clean()
+        if had_changes:
+            self.logger.info(
+                f"[{self.repo_name}] Dependencies updated: {changes_made}"
+            )
+        else:
+            self.logger.debug(
+                f"[{self.repo_name}] AI reported updates but no files changed"
+            )
+
+        return True, had_changes
 
     def _ask_ai_to_fix(self, prompt: str, context: Dict[str, Any]) -> Optional[str]:
         """Ask AI to fix an error. Returns changes_made description or None if failed."""
-        response = self.agent.ask(prompt, context)
-        try:
-            decision = self.agent.parse_json(response)
-            if not decision.get("fixed", False):
-                self.logger.warning(
-                    f"[{self.repo_name}] AI could not fix: {decision.get('reasoning', 'No reason')}"
-                )
-                return None
-            return decision.get("changes_made", "Changes made")
-        except json.JSONDecodeError as e:
-            self.logger.debug(f"[{self.repo_name}] Agent response: {response}")
-            self.logger.error(f"[{self.repo_name}] Failed to parse AI response: {e}")
+        if self.config.dry_run:
+            self.logger.info(
+                f"[{self.repo_name}] DRY RUN: Would ask AI to fix failures"
+            )
             return None
+
+        response = self.agent.ask(prompt, context)
+        decision = self.agent.parse_json(response) if response is not None else None
+        if decision is None:
+            # ask() already logged agent errors; log parse failures here
+            if response is not None:
+                self.logger.debug(f"[{self.repo_name}] Agent response: {response}")
+                self.logger.error(
+                    f"[{self.repo_name}] No JSON object in agent response"
+                )
+            return None
+        if not decision.get("fixed", False):
+            self.logger.warning(
+                f"[{self.repo_name}] AI could not fix: {decision.get('reasoning', 'No reason')}"
+            )
+            return None
+        return decision.get("changes_made", "Changes made")
 
     def _is_valid_dependabot_pr(self, pr: Dict[str, Any]) -> bool:
         """Verify a PR is legitimately from dependabot using structural checks.
@@ -2167,6 +2185,7 @@ def main():
     # Process each repository
     success_count = 0
     skip_count = 0
+    fail_count = 0
     error_count = 0
     repos_with_changes = 0
     interrupted = False
@@ -2182,13 +2201,15 @@ def main():
 
             maintainer = Maintainer(repo_path, config)
             try:
-                success, had_changes = maintainer.maintain()
-                if success:
+                status, had_changes = maintainer.maintain()
+                if status == STATUS_SUCCESS:
                     success_count += 1
-                    if had_changes:
-                        repos_with_changes += 1
-                else:
+                elif status == STATUS_SKIPPED:
                     skip_count += 1
+                else:
+                    fail_count += 1
+                if had_changes:
+                    repos_with_changes += 1
             except KeyboardInterrupt:
                 raise  # Re-raise to exit the loop
             except Exception as e:
@@ -2204,10 +2225,11 @@ def main():
     logger.info(f"Successful: {success_count}")
     logger.info(f"With changes: {repos_with_changes}")
     logger.info(f"Skipped: {skip_count}")
+    logger.info(f"Failed: {fail_count}")
     logger.info(f"Errors: {error_count}")
     logger.info("=" * 80)
 
-    return 1 if interrupted or error_count > 0 else 0
+    return 1 if interrupted or fail_count > 0 or error_count > 0 else 0
 
 
 if __name__ == "__main__":
