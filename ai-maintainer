@@ -451,6 +451,23 @@ Respond with ONLY a JSON object. No explanations, no markdown outside the JSON.
         self.logger.error(f"[{self.repo_name}] Agent failed: {'; '.join(error_parts)}")
         return None
 
+    def ask_json(
+        self, prompt: str, context: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Ask the agent and parse the JSON object from its response.
+
+        Returns None if the agent failed (logged by ask()) or its response
+        contained no JSON object (logged here).
+        """
+        response = self.ask(prompt, context)
+        if response is None:
+            return None
+        decision = self.parse_json(response)
+        if decision is None:
+            self.logger.debug(f"[{self.repo_name}] Agent response: {response}")
+            self.logger.error(f"[{self.repo_name}] No JSON object in agent response")
+        return decision
+
     def parse_json(self, response: str) -> Optional[Dict[str, Any]]:
         """Extract and parse a JSON object from an agent response.
 
@@ -565,19 +582,16 @@ class GitClient:
     def is_latest_commit_from_maintainer(self) -> bool:
         """Check if the latest commit was created by ai-maintainer.
 
-        Also matches dependabot-authored commits: squash-merging a dependabot
-        PR keeps dependabot as the commit author, and this tool merges those
-        PRs, so a failure on such a commit is ours to fix.
+        Matches only this tool's commit-message attribution. Dependabot-authored
+        commits are deliberately not matched: a squash merge made by a human
+        looks identical to one made by this tool, and the author name is
+        spoofable, so authorship alone must not trigger the AI fix path.
         """
-        success, stdout, _ = self._run(["git", "log", "-1", "--format=%an%n%B"])
+        success, stdout, _ = self._run(["git", "log", "-1", "--format=%B"])
         if not success:
             return False
-        author, _, message = stdout.partition("\n")
-        return (
-            TOOL_REPO_URL in message
-            or "ai-maintainer" in message.lower()
-            or author.strip().lower().startswith("dependabot")
-        )
+        # Check for our attribution in the commit message
+        return TOOL_REPO_URL in stdout or "ai-maintainer" in stdout.lower()
 
     def is_workdir_clean(self) -> bool:
         """Check if working directory is clean."""
@@ -590,9 +604,14 @@ class GitClient:
             ["git", "rev-list", "@{u}..HEAD", "--count"]
         )
         if not success:
-            # No upstream configured (or rev-list failed): attempt the push
-            # and let it surface the real error instead of silently skipping.
-            return True
+            # No upstream configured (or rev-list failed): unpushed commits
+            # cannot be detected. Warn instead of guessing, so a dry run does
+            # not report a phantom push for a clean repo.
+            self.logger.warning(
+                f"[{self.repo_name}] Could not check for unpushed commits "
+                "(no upstream tracking branch?)"
+            )
+            return False
         return stdout.strip() not in ("", "0")
 
     def stage_all(self) -> CommandResult:
@@ -1427,6 +1446,14 @@ class Maintainer:
                         f"[{self.repo_name}] DRY RUN: Would attempt to fix pre-existing CI failure"
                     )
                     return True, False
+                if not self.config.push_changes:
+                    # A fix cannot be delivered without a push; treat like a
+                    # failure we will not attempt to fix rather than an error.
+                    self.logger.warning(
+                        f"[{self.repo_name}] CI is failing from a previous ai-maintainer run, "
+                        "but push is disabled so a fix cannot be delivered; continuing"
+                    )
+                    return True, False
                 self.logger.warning(
                     f"[{self.repo_name}] CI is failing from a previous ai-maintainer run, will attempt to fix"
                 )
@@ -1697,15 +1724,8 @@ class Maintainer:
 
         context = {"dependency_files": dep_files}
 
-        response = self.agent.ask(prompt, context)
-        decision = self.agent.parse_json(response) if response is not None else None
+        decision = self.agent.ask_json(prompt, context)
         if decision is None:
-            # ask() already logged agent errors; log parse failures here
-            if response is not None:
-                self.logger.debug(f"[{self.repo_name}] Agent response: {response}")
-                self.logger.error(
-                    f"[{self.repo_name}] No JSON object in agent response"
-                )
             return False, False
 
         updated = decision.get("updated", False)
@@ -1739,15 +1759,8 @@ class Maintainer:
             )
             return None
 
-        response = self.agent.ask(prompt, context)
-        decision = self.agent.parse_json(response) if response is not None else None
+        decision = self.agent.ask_json(prompt, context)
         if decision is None:
-            # ask() already logged agent errors; log parse failures here
-            if response is not None:
-                self.logger.debug(f"[{self.repo_name}] Agent response: {response}")
-                self.logger.error(
-                    f"[{self.repo_name}] No JSON object in agent response"
-                )
             return None
         if not decision.get("fixed", False):
             self.logger.warning(
@@ -2204,12 +2217,14 @@ def main():
                 status, had_changes = maintainer.maintain()
                 if status == STATUS_SUCCESS:
                     success_count += 1
+                    # Only successful repos consume --limit slots; a failed
+                    # repo's changes may have been rolled back
+                    if had_changes:
+                        repos_with_changes += 1
                 elif status == STATUS_SKIPPED:
                     skip_count += 1
                 else:
                     fail_count += 1
-                if had_changes:
-                    repos_with_changes += 1
             except KeyboardInterrupt:
                 raise  # Re-raise to exit the loop
             except Exception as e:

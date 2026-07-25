@@ -262,6 +262,13 @@ class TestGitClient:
         client = gm.GitClient(Path("/path/to/my-repo"), MagicMock())
         assert client.repo_name == "my-repo"
 
+    def test_has_unpushed_commits_false_when_no_upstream(self):
+        client = gm.GitClient(Path("/path/to/my-repo"), MagicMock())
+        client._run = MagicMock(
+            return_value=(False, "", "fatal: no upstream configured")
+        )
+        assert client.has_unpushed_commits() is False
+
 
 class TestFindRepos:
     """Tests for find_repos function."""
@@ -568,7 +575,7 @@ class TestMergePrsOnGithub:
 
 
 class TestDryRunGuards:
-    """Dry-run must never invoke the AI fix paths or wait on CI."""
+    """The AI fix paths must not run in dry-run or when a fix cannot land."""
 
     def test_ask_ai_to_fix_skips_agent(self, maintainer):
         maintainer.agent.ask = MagicMock()
@@ -589,6 +596,20 @@ class TestDryRunGuards:
         maintainer.github.get_ci_failure_logs = MagicMock()
         assert maintainer.fix_ci_with_retries() is False
         maintainer.github.get_ci_failure_logs.assert_not_called()
+
+    def test_pre_existing_ci_failure_continues_when_push_disabled(
+        self, repo_path, default_config
+    ):
+        # push_changes=False: a pre-existing failure the tool cannot fix
+        # must not fail the repo; maintenance continues without a fix attempt
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False)
+        maintainer.github.get_latest_ci_conclusion = MagicMock(return_value="failure")
+        maintainer.git.is_latest_commit_from_maintainer = MagicMock(return_value=True)
+        maintainer.fix_ci_with_retries = MagicMock()
+        should_continue, ci_was_passing = maintainer._check_and_fix_pre_existing_ci()
+        assert should_continue is True
+        assert ci_was_passing is False
+        maintainer.fix_ci_with_retries.assert_not_called()
 
 
 class TestBuildCommitMessage:
