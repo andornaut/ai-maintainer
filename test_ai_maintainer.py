@@ -110,8 +110,8 @@ class TestProjectEnvironment:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmppath = Path(tmpdir)
             (tmppath / "go.mod").write_text("module example.com/foo\n")
-            # Pretend `which go` fails so it falls back to known install dirs
-            monkeypatch.setattr(gm, "run_command", lambda *a, **k: (False, "", ""))
+            # Pretend go is not on PATH so it falls back to known install dirs
+            monkeypatch.setattr(gm.shutil, "which", lambda name: None)
             # True for the real go.mod and the simulated go binary location
             real_exists = Path.exists
             monkeypatch.setattr(
@@ -127,55 +127,70 @@ class TestProjectEnvironment:
             )
 
 
-class TestAgentClientJsonExtraction:
-    """Tests for AgentClient JSON extraction."""
+class TestAgentClientParseJson:
+    """Tests for AgentClient.parse_json."""
 
-    def test_extract_plain_json(self, default_config):
-        client = gm.AgentClient(Path("/tmp"), "test-repo", default_config, MagicMock())
-        result = client._extract_json_from_response('{"key": "value"}')
-        assert result == '{"key": "value"}'
+    def _client(self, default_config):
+        return gm.AgentClient(Path("/tmp"), "test-repo", default_config, MagicMock())
 
-    def test_extract_json_from_markdown_block(self, default_config):
-        client = gm.AgentClient(Path("/tmp"), "test-repo", default_config, MagicMock())
+    def test_plain_json(self, default_config):
+        client = self._client(default_config)
+        assert client.parse_json('{"key": "value"}') == {"key": "value"}
+
+    def test_json_from_markdown_block(self, default_config):
+        client = self._client(default_config)
         response = """Here's the result:
 ```json
 {"should_update": true, "commands": ["npm update"]}
 ```
 """
-        result = client._extract_json_from_response(response)
-        assert result == '{"should_update": true, "commands": ["npm update"]}'
+        assert client.parse_json(response) == {
+            "should_update": True,
+            "commands": ["npm update"],
+        }
 
-    def test_extract_json_from_code_block_without_lang(self, default_config):
-        client = gm.AgentClient(Path("/tmp"), "test-repo", default_config, MagicMock())
+    def test_json_from_code_block_without_lang(self, default_config):
+        client = self._client(default_config)
         response = """```
 {"fixed": false}
 ```"""
-        result = client._extract_json_from_response(response)
-        assert result == '{"fixed": false}'
+        assert client.parse_json(response) == {"fixed": False}
 
-    def test_extract_json_with_text_before(self, default_config):
-        client = gm.AgentClient(Path("/tmp"), "test-repo", default_config, MagicMock())
+    def test_json_with_text_before(self, default_config):
+        client = self._client(default_config)
         response = """Some explanation text here.
 
 {"updated": false, "changes_made": "", "reasoning": "All up to date"}"""
-        result = client._extract_json_from_response(response)
-        assert result == '{"updated": false, "changes_made": "", "reasoning": "All up to date"}'
+        assert client.parse_json(response) == {
+            "updated": False,
+            "changes_made": "",
+            "reasoning": "All up to date",
+        }
 
-    def test_extract_json_with_text_after(self, default_config):
-        client = gm.AgentClient(Path("/tmp"), "test-repo", default_config, MagicMock())
+    def test_json_with_text_after(self, default_config):
+        client = self._client(default_config)
         response = '{"fixed": true, "changes_made": "bumped"}\n\nDone, hope that helps!'
-        result = client._extract_json_from_response(response)
-        assert result == '{"fixed": true, "changes_made": "bumped"}'
+        assert client.parse_json(response) == {"fixed": True, "changes_made": "bumped"}
 
-    def test_extract_json_empty_response(self, default_config):
-        client = gm.AgentClient(Path("/tmp"), "test-repo", default_config, MagicMock())
-        result = client._extract_json_from_response("")
-        assert "error" in result
+    def test_non_json_code_block_falls_through_to_json(self, default_config):
+        client = self._client(default_config)
+        response = """I ran:
+```bash
+npm update lodash
+```
+{"updated": true, "changes_made": "bumped lodash"}"""
+        assert client.parse_json(response) == {
+            "updated": True,
+            "changes_made": "bumped lodash",
+        }
 
-    def test_extract_json_no_json_found(self, default_config):
-        client = gm.AgentClient(Path("/tmp"), "test-repo", default_config, MagicMock())
-        result = client._extract_json_from_response("Just plain text with no JSON")
-        assert "error" in result
+    def test_empty_response(self, default_config):
+        client = self._client(default_config)
+        assert client.parse_json("") is None
+
+    def test_no_json_found(self, default_config):
+        client = self._client(default_config)
+        assert client.parse_json("Just plain text with no JSON") is None
 
 
 class TestRunCommand:
@@ -198,8 +213,8 @@ class TestRunCommand:
         assert success is False
 
     def test_shell_command(self):
-        success, stdout, stderr = gm.run_command(
-            "echo hello && echo world", Path("/tmp"), shell=True
+        success, stdout, stderr = gm.run_shell_command(
+            "echo hello && echo world", Path("/tmp")
         )
         assert success is True
         assert "hello" in stdout
