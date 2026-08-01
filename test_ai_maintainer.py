@@ -113,6 +113,36 @@ class TestProjectEnvironment:
         (tmp_path / "poetry.lock").write_text("")
         assert gm.ProjectEnvironment(tmp_path).env_runner == "poetry run"
 
+    def _make_venv(self, tmp_path, name=".venv"):
+        (tmp_path / name / "bin").mkdir(parents=True)
+        (tmp_path / name / "bin" / "activate").write_text("")
+
+    def test_venv_without_pipenv_or_poetry(self, tmp_path):
+        # A venv is the only marker such a project has; gating detection on
+        # Pipfile/poetry.lock left it running against the ambient interpreter
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'x'\n")
+        self._make_venv(tmp_path)
+        assert (
+            gm.ProjectEnvironment(tmp_path).env_runner
+            == "source .venv/bin/activate &&"
+        )
+
+    def test_bare_venv_is_enough(self, tmp_path):
+        self._make_venv(tmp_path, "venv")
+        assert (
+            gm.ProjectEnvironment(tmp_path).env_runner
+            == "source venv/bin/activate &&"
+        )
+
+    def test_pipenv_takes_precedence_over_venv(self, tmp_path):
+        (tmp_path / "Pipfile").write_text("[packages]")
+        self._make_venv(tmp_path)
+        assert gm.ProjectEnvironment(tmp_path).env_runner == "pipenv run"
+
+    def test_no_venv_and_no_manager_is_undetected(self, tmp_path):
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'x'\n")
+        assert gm.ProjectEnvironment(tmp_path).env_runner is None
+
     def test_go_detection_no_crash(self, tmp_path):
         (tmp_path / "go.mod").write_text("module example.com/foo\n")
         env = gm.ProjectEnvironment(tmp_path)
@@ -360,6 +390,20 @@ class TestMaintainerValidation:
             "headRefOid": "abc123",
         }
         assert maintainer._is_valid_dependabot_pr(pr) is False
+
+    def test_is_valid_dependabot_pr_missing_head_sha_fails_closed(
+        self, maintainer
+    ):
+        # The signature is the only cryptographic gate on an automatic merge,
+        # so a PR with nothing to verify must not pass on branch name alone
+        maintainer.github.is_commit_verified = MagicMock(return_value=True)
+        pr = {
+            "number": 123,
+            "headRefName": "dependabot/npm_and_yarn/lodash-4.17.21",
+            "headRefOid": "",
+        }
+        assert maintainer._is_valid_dependabot_pr(pr) is False
+        maintainer.github.is_commit_verified.assert_not_called()
 
 
 class TestDetectTestCommand:
@@ -1154,6 +1198,18 @@ class TestMaintainMergedPrCiMonitoring:
         status, _ = maintainer.maintain()
         assert status == gm.STATUS_FAILED
         maintainer._handle_post_push_ci.assert_not_called()
+
+    def test_monitoring_records_that_it_ran(self, repo_path, default_config):
+        # _maintain's re-entry guard reads this flag, so the real method must
+        # set it; a test that sets it via a mock would not pin that
+        maintainer = make_maintainer(
+            repo_path, default_config, dry_run=False, push_changes=True
+        )
+        assert maintainer._ci_monitored is False
+        maintainer._wait_for_ci = MagicMock(return_value="success")
+        maintainer._ci_url_suffix = MagicMock(return_value="")
+        assert maintainer._handle_post_push_ci("base", True, "sha") is True
+        assert maintainer._ci_monitored is True
 
     def test_ci_is_not_monitored_twice_when_the_fix_path_raises(
         self, repo_path, default_config
