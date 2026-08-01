@@ -525,17 +525,20 @@ class TestRunGit:
 class TestGitHubClientMergePr:
     """merge_pr stamps the squash commit so later runs can recognize it."""
 
-    def _client_with_pr_body(self, tmp_path, pr_body, calls):
+    def _client_with_pr(self, tmp_path, payload, calls):
         client = gm.GitHubClient(tmp_path, MagicMock(), MagicMock())
 
         def fake_run(args):
             calls.append(args)
             if args[:3] == ["gh", "pr", "view"]:
-                return True, json.dumps({"body": pr_body}), ""
+                return True, json.dumps(payload), ""
             return True, "", ""
 
         client._run = fake_run
         return client
+
+    def _client_with_pr_body(self, tmp_path, pr_body, calls):
+        return self._client_with_pr(tmp_path, {"body": pr_body}, calls)
 
     def test_merge_pr_appends_attribution_to_pr_body(self, tmp_path):
         calls = []
@@ -558,6 +561,38 @@ class TestGitHubClientMergePr:
         assert success is True
         merge_args = calls[-1]
         assert merge_args[merge_args.index("--body") + 1] == gm.COMMIT_ATTRIBUTION
+
+    def test_merge_pr_preserves_coauthors_excluding_pr_author(self, tmp_path):
+        calls = []
+        alice = {"login": "alice", "name": "Alice", "email": "alice@example.com"}
+        payload = {
+            "body": "Bumps lodash.",
+            "author": {"login": "dependabot"},
+            "commits": [
+                {
+                    "authors": [
+                        {
+                            "login": "dependabot",
+                            "name": "dependabot[bot]",
+                            "email": "support@github.com",
+                        }
+                    ]
+                },
+                # A human follow-up commit, listed twice to verify dedup
+                {"authors": [alice]},
+                {"authors": [alice]},
+            ],
+        }
+        client = self._client_with_pr(tmp_path, payload, calls)
+        success, _ = client.merge_pr(42)
+        assert success is True
+        merge_args = calls[-1]
+        body = merge_args[merge_args.index("--body") + 1]
+        assert body == (
+            "Bumps lodash.\n\n"
+            f"{gm.COMMIT_ATTRIBUTION}\n\n"
+            "Co-authored-by: Alice <alice@example.com>"
+        )
 
 
 class TestMergePrsOnGithub:

@@ -795,32 +795,55 @@ class GitHubClient:
             url = url[:-4]
         return url
 
-    def get_pr_body(self, pr_num: int) -> str:
-        """Return a PR's description body, or empty string on failure."""
+    def get_pr_body_and_coauthors(self, pr_num: int) -> Tuple[str, List[str]]:
+        """Return a PR's description and its Co-authored-by trailers.
+
+        The trailers credit commit authors other than the PR author,
+        mirroring what GitHub's default squash message would add (the PR
+        author is credited as the squash commit's author, not a co-author).
+        Returns ("", []) on failure.
+        """
         success, stdout, _ = self._run(
-            ["gh", "pr", "view", str(pr_num), "--json", "body"]
+            ["gh", "pr", "view", str(pr_num), "--json", "body,commits,author"]
         )
         if not success:
-            return ""
+            return "", []
         data = safe_json_parse(stdout, default={})
-        return (data.get("body") or "").strip()
+        body = (data.get("body") or "").strip()
+        pr_author = (data.get("author") or {}).get("login", "")
+        coauthors: List[str] = []
+        seen = set()
+        for commit in data.get("commits", []):
+            for author in commit.get("authors", []):
+                login = author.get("login") or ""
+                name = author.get("name") or login
+                email = author.get("email") or ""
+                key = (name, email)
+                if login == pr_author or not email or key in seen:
+                    continue
+                seen.add(key)
+                coauthors.append(f"Co-authored-by: {name} <{email}>")
+        return body, coauthors
 
     def merge_pr(self, pr_num: int) -> Tuple[bool, str]:
         """Squash-merge a PR on GitHub and delete its remote branch.
 
         The squash-commit body is the PR description with this tool's
-        attribution appended, so the PR's release notes stay in git history
-        and a later run can recognize the merge as ai-maintainer's work
-        (the default body, which varies with the repo's squash-message
-        setting, would be indistinguishable from a human merge). On branches
-        that require a merge queue, gh ignores these flags, so the merge is
+        attribution and the PR's Co-authored-by trailers appended, so the
+        PR's release notes and co-author credits stay in git history and a
+        later run can recognize the merge as ai-maintainer's work (the
+        default body, which varies with the repo's squash-message setting,
+        would be indistinguishable from a human merge). On branches that
+        require a merge queue, gh ignores these flags, so the merge is
         recorded without attribution and is not recognized later.
 
         Returns (success, error) where error is gh's stderr (or stdout) on
         failure, so callers can log the root cause instead of a bare failure.
         """
-        pr_body = self.get_pr_body(pr_num)
-        body = f"{pr_body}\n\n{COMMIT_ATTRIBUTION}" if pr_body else COMMIT_ATTRIBUTION
+        pr_body, coauthors = self.get_pr_body_and_coauthors(pr_num)
+        # Trailers go in the final block so git interprets them as trailers
+        parts = [pr_body, COMMIT_ATTRIBUTION, "\n".join(coauthors)]
+        body = "\n\n".join(p for p in parts if p)
         success, stdout, stderr = self._run(
             [
                 "gh",
