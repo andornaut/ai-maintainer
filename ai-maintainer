@@ -32,7 +32,7 @@ __version__ = "0.1.0"
 # Type aliases for common return types
 CommandResult = Tuple[bool, str, str]  # (success, stdout, stderr)
 MaintainResult = Tuple[bool, bool]  # (success, had_changes)
-MergeResult = Tuple[bool, List[int]]  # (success, merged_pr_numbers)
+MergeResult = List[int]  # merged_pr_numbers
 RepoResult = Tuple[str, bool]  # (status, had_changes); status is a STATUS_* value
 TestResult = Tuple[bool, str]  # (success, output)
 
@@ -90,7 +90,7 @@ Provide a concise changes_made description summarizing what you changed.
 """
 
 
-@dataclass
+@dataclass(frozen=True)
 class Config:
     """Configuration for repository maintenance."""
 
@@ -125,7 +125,7 @@ def run_command(
         timeout = DEFAULT_COMMAND_TIMEOUT_SECONDS
     try:
         result = subprocess.run(
-            cmd, cwd=cwd, capture_output=True, text=True,
+            cmd, cwd=cwd, capture_output=True, text=True, errors="replace",
             stdin=subprocess.DEVNULL, timeout=timeout,
         )
         return result.returncode == 0, result.stdout, result.stderr
@@ -761,9 +761,11 @@ class GitHubClient:
         url = self._git.get_remote_url()
         if not url:
             return None
-        # Convert SSH URL to HTTPS
+        # Convert SSH URL forms to HTTPS
         if url.startswith("git@github.com:"):
             url = url.replace("git@github.com:", "https://github.com/")
+        elif url.startswith("ssh://git@github.com/"):
+            url = url.replace("ssh://git@github.com/", "https://github.com/")
         if url.endswith(".git"):
             url = url[:-4]
         return url
@@ -863,16 +865,19 @@ class GitHubClient:
         return safe_json_parse(stdout, default=[])
 
     def get_latest_ci_conclusion(self) -> Optional[str]:
-        """Get the conclusion of the latest CI run without waiting."""
+        """Get the combined conclusion of the latest commit's CI runs.
+
+        A push can trigger several workflows, so all runs for the newest
+        commit are considered; a passing run must not mask a failing one.
+        """
         if not self.is_authenticated:
             return None
-        runs = self._get_runs(1, "status,conclusion")
+        runs = self._get_runs(10, "status,conclusion,headSha")
         if not runs:
             return None
-        run = runs[0]
-        if run.get("status") != "completed":
-            return "in_progress"
-        return run.get("conclusion")
+        head_sha = runs[0].get("headSha")
+        latest = [r for r in runs if r.get("headSha") == head_sha]
+        return self._combine_run_conclusions(latest)
 
     def get_latest_ci_run_url(self) -> Optional[str]:
         """Get the URL for the latest CI run."""
@@ -944,24 +949,44 @@ class GitHubClient:
             # _get_runs lists recent push runs for the branch and already
             # excludes ignored workflows (e.g. Dependabot Updates). Request a
             # wider window so a push that triggers several workflows doesn't
-            # bury the run for our commit beyond the limit.
+            # bury the runs for our commit beyond the limit.
             runs = self._get_runs(10, "status,conclusion,headSha")
 
-            # Find the run for our commit
-            run = next((r for r in runs if r.get("headSha") == head_sha), None)
-            if not run:
+            # A push can trigger several workflows; consider every run for
+            # our commit so a passing run does not mask a failing one.
+            runs_for_sha = [r for r in runs if r.get("headSha") == head_sha]
+            if not runs_for_sha:
                 self.logger.debug(f"[{repo_name}] No CI run for {head_sha[:7]} yet, waiting...")
                 time.sleep(poll_interval)
                 continue
 
-            if run.get("status") == "completed":
-                return run.get("conclusion")
+            conclusion = self._combine_run_conclusions(runs_for_sha)
+            if conclusion != "in_progress":
+                return conclusion
 
-            self.logger.debug(f"[{repo_name}] CI status: {run.get('status')}, waiting...")
+            self.logger.debug(f"[{repo_name}] CI status: in_progress, waiting...")
             time.sleep(poll_interval)
 
         self.logger.error(f"[{repo_name}] CI timed out after {timeout_minutes} minutes")
         return None
+
+    @staticmethod
+    def _combine_run_conclusions(runs: List[Dict]) -> Optional[str]:
+        """Combine the conclusions of all CI runs for a single commit.
+
+        Returns 'failure' as soon as any completed run failed (even if others
+        are still running), 'in_progress' while runs are pending, 'success'
+        only when every run succeeded, or the first non-success conclusion
+        (e.g. 'cancelled') otherwise.
+        """
+        conclusions = [
+            r.get("conclusion") for r in runs if r.get("status") == "completed"
+        ]
+        if "failure" in conclusions:
+            return "failure"
+        if any(r.get("status") != "completed" for r in runs):
+            return "in_progress"
+        return next((c for c in conclusions if c != "success"), "success")
 
     def _get_runs(
         self, limit: int = 1, fields: str = "status,conclusion"
@@ -970,6 +995,9 @@ class GitHubClient:
         branch = self._git.current_branch or "main"
         # Always include workflowName so we can filter out ignored workflows
         field_set = set(fields.split(",")) | {"workflowName"}
+        # Over-fetch so that ignored workflows filtered out below cannot leave
+        # the result empty (or short) when relevant runs exist beyond the limit
+        fetch_limit = limit + len(IGNORED_WORKFLOW_PREFIXES) * 5
         success, stdout, _ = self._run(
             [
                 "gh",
@@ -980,7 +1008,7 @@ class GitHubClient:
                 "--event",
                 "push",
                 "--limit",
-                str(limit),
+                str(fetch_limit),
                 "--json",
                 ",".join(field_set),
             ]
@@ -988,13 +1016,14 @@ class GitHubClient:
         if not success:
             return []
         runs = safe_json_parse(stdout, default=[])
-        return [
+        filtered = [
             r for r in runs
             if not any(
                 r.get("workflowName", "").startswith(prefix)
                 for prefix in IGNORED_WORKFLOW_PREFIXES
             )
         ]
+        return filtered[:limit]
 
 
 class Maintainer:
@@ -1559,10 +1588,7 @@ class Maintainer:
         baseline_sha = self.git.get_head_sha()
 
         # Merge dependabot PRs on GitHub and pull changes
-        success, merged_prs = self.merge_dependabot_prs()
-        if not success:
-            self.logger.error(f"[{self.repo_name}] Failed to merge dependabot PRs")
-            return STATUS_FAILED, False
+        merged_prs = self.merge_dependabot_prs()
         if merged_prs and not self.config.dry_run:
             if not self.git.pull_changes():
                 self.logger.error(
@@ -1575,6 +1601,10 @@ class Maintainer:
         if not success:
             self.logger.error(f"[{self.repo_name}] Failed to update dependencies")
             self.git.reset_changes()
+            # Merged dependabot PRs are already on the remote and have
+            # triggered CI; monitor it even though this run is aborting.
+            if merged_prs:
+                self._handle_post_push_ci(baseline_sha, ci_was_passing)
             return STATUS_FAILED, False
 
         # Only run tests if we made changes (merged PRs or updated dependencies).
@@ -1593,6 +1623,11 @@ class Maintainer:
                         f"[{self.repo_name}] Could not fix test failures, not committing changes"
                     )
                     self.git.reset_changes()
+                    # Merged dependabot PRs are already on the remote and have
+                    # triggered CI; monitor it (fixing or rolling back on
+                    # failure) even though local changes were discarded.
+                    if merged_prs:
+                        self._handle_post_push_ci(baseline_sha, ci_was_passing)
                     return STATUS_FAILED, False
 
         # Commit and push (only if we have changes)
@@ -1622,16 +1657,17 @@ class Maintainer:
     def merge_dependabot_prs(self) -> MergeResult:
         """Merge dependabot PRs on GitHub after programmatic verification.
 
-        Returns (success, merged_prs).
+        Returns the merged PR numbers. PRs that fail to merge are skipped
+        (with a warning), not treated as a repo-level failure.
         """
         if not self.config.auto_merge_dependabot:
             self.logger.debug(f"[{self.repo_name}] Dependabot auto-merge disabled")
-            return True, []
+            return []
 
         prs = self.github.get_dependabot_prs()
         if not prs:
             self.logger.debug(f"[{self.repo_name}] No dependabot PRs found")
-            return True, []
+            return []
 
         self.logger.debug(f"[{self.repo_name}] Found {len(prs)} dependabot PR(s)")
 
@@ -1651,7 +1687,7 @@ class Maintainer:
 
         if not safe_prs:
             self.logger.debug(f"[{self.repo_name}] No PRs passed verification")
-            return True, []
+            return []
 
         return self._merge_prs_on_github(safe_prs)
 
@@ -1734,12 +1770,21 @@ class Maintainer:
 
         self.logger.debug(f"[{self.repo_name}] Agent reasoning: {reasoning}")
 
+        # Verify the workdir against the agent's claim rather than trusting it:
+        # unreported changes must not slip into an untested commit downstream.
+        had_changes = not self.git.is_workdir_clean()
+
         if not updated:
-            self.logger.debug(f"[{self.repo_name}] No dependency updates needed")
+            if had_changes:
+                self.logger.warning(
+                    f"[{self.repo_name}] AI reported no updates but modified files; "
+                    "discarding changes"
+                )
+                self.git.reset_changes()
+            else:
+                self.logger.debug(f"[{self.repo_name}] No dependency updates needed")
             return True, False
 
-        # Check if AI actually made changes
-        had_changes = not self.git.is_workdir_clean()
         if had_changes:
             self.logger.info(
                 f"[{self.repo_name}] Dependencies updated: {changes_made}"
@@ -1833,7 +1878,7 @@ class Maintainer:
                     f"[{self.repo_name}] Failed to merge PR #{pr_num} on GitHub, skipping{detail}"
                 )
 
-        return True, merged_prs
+        return merged_prs
 
     def _rebase_conflicted_pr(self, pr_num: int) -> None:
         """Ask dependabot to rebase a conflicted PR so it can merge next run.
