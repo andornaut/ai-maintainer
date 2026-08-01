@@ -95,6 +95,9 @@ IGNORED_WORKFLOW_PREFIXES = ("Dependabot",)
 # becomes mergeable on a subsequent run.
 DEPENDABOT_REBASE_COMMAND = "@dependabot rebase"
 
+# Directories a project-local virtualenv is conventionally created in
+VENV_DIRS = (".venv", "venv", ".env", "env")
+
 # Dependency files to check for in repositories
 DEPENDENCY_FILES = (
     "Cargo.toml",
@@ -245,10 +248,8 @@ class ProjectEnvironment:
             self.repo_path / ".ruby-version"
         ).exists():
             self._env_runner = self._detect_ruby_runner()
-        # Python projects (Pipfile or poetry.lock)
-        elif (self.repo_path / "Pipfile").exists() or (
-            self.repo_path / "poetry.lock"
-        ).exists():
+        # Python projects (pipenv, poetry, or an in-repo virtualenv)
+        elif self._is_python_project():
             self._env_runner = self._detect_python_runner()
         # Go projects (go.mod)
         elif (self.repo_path / "go.mod").exists():
@@ -276,6 +277,20 @@ class ProjectEnvironment:
 
         return None
 
+    def _is_python_project(self) -> bool:
+        """Whether _detect_python_runner has something to activate.
+
+        Must cover everything that method looks for. Gating only on
+        Pipfile/poetry.lock made its virtualenv branch unreachable, leaving
+        venv-only projects running against the ambient interpreter.
+        """
+        p = self.repo_path
+        if (p / "Pipfile").exists() or (p / "poetry.lock").exists():
+            return True
+        return any(
+            (p / venv_dir / "bin" / "activate").exists() for venv_dir in VENV_DIRS
+        )
+
     def _detect_python_runner(self) -> Optional[str]:
         """Detect Python environment runner (pipenv, poetry, or venv)."""
         p = self.repo_path
@@ -289,7 +304,7 @@ class ProjectEnvironment:
             return "poetry run"
 
         # Virtual environment
-        for venv_dir in [".venv", "venv", ".env", "env"]:
+        for venv_dir in VENV_DIRS:
             activate = p / venv_dir / "bin" / "activate"
             if activate.exists():
                 return f"source {venv_dir}/bin/activate &&"
@@ -2237,8 +2252,15 @@ class Maintainer:
             )
             return False
 
-        # Check GPG signature verification (GitHub signs dependabot commits)
-        if head_sha and not self.github.is_commit_verified(head_sha):
+        # Check GPG signature verification (GitHub signs dependabot commits).
+        # A missing SHA fails closed: this is the only cryptographic gate on
+        # an automatic merge, so absent evidence is not evidence of safety.
+        if not head_sha:
+            self.logger.warning(
+                f"[{self.repo_name}] PR #{pr_num} has no head commit SHA to verify"
+            )
+            return False
+        if not self.github.is_commit_verified(head_sha):
             self.logger.warning(
                 f"[{self.repo_name}] PR #{pr_num} head commit {head_sha[:7]} is not GPG verified"
             )
