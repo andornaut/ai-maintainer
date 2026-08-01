@@ -278,11 +278,35 @@ class TestGitClient:
         assert client.is_latest_commit_from_maintainer() is True
 
     def test_latest_commit_not_from_maintainer_without_attribution(self):
-        # A human squash merge of a dependabot PR has no attribution body
         client = gm.GitClient(Path("/path/to/my-repo"), MagicMock())
-        message = "chore(deps): bump lodash from 1.0.0 to 1.0.1 (#12)\n"
+        for message in (
+            # A human squash merge of a dependabot PR has no attribution body
+            "chore(deps): bump lodash from 1.0.0 to 1.0.1 (#12)\n",
+            # Mentioning the tool's name is not attribution
+            "ci: stop running ai-maintainer nightly\n",
+            "chore(deps): bump ai-maintainer from 0.1.0 to 0.2.0 (#12)\n",
+        ):
+            client._run = MagicMock(return_value=(True, message, ""))
+            assert client.is_latest_commit_from_maintainer() is False, message
+
+    def test_latest_commit_ci_fix(self):
+        client = gm.GitClient(Path("/path/to/my-repo"), MagicMock())
+        message = (
+            f"{gm.CI_FIX_COMMIT_TITLE}\n\nFixed CI build failure with AI "
+            f"assistance\n\n{gm.COMMIT_ATTRIBUTION}\n"
+        )
         client._run = MagicMock(return_value=(True, message, ""))
-        assert client.is_latest_commit_from_maintainer() is False
+        assert client.is_latest_commit_ci_fix() is True
+
+    def test_latest_commit_ci_fix_false_for_other_maintainer_commits(self):
+        # Attributed, but a dependency update rather than a CI fix
+        client = gm.GitClient(Path("/path/to/my-repo"), MagicMock())
+        message = (
+            "chore(deps): update direct dependencies\n\nUpdated direct "
+            f"dependencies\n\n{gm.COMMIT_ATTRIBUTION}\n"
+        )
+        client._run = MagicMock(return_value=(True, message, ""))
+        assert client.is_latest_commit_ci_fix() is False
 
 
 class TestFindRepos:
@@ -501,21 +525,39 @@ class TestRunGit:
 class TestGitHubClientMergePr:
     """merge_pr stamps the squash commit so later runs can recognize it."""
 
-    def test_merge_pr_sets_attribution_body(self, tmp_path):
+    def _client_with_pr_body(self, tmp_path, pr_body, calls):
         client = gm.GitHubClient(tmp_path, MagicMock(), MagicMock())
-        captured = {}
 
         def fake_run(args):
-            captured["args"] = args
+            calls.append(args)
+            if args[:3] == ["gh", "pr", "view"]:
+                return True, json.dumps({"body": pr_body}), ""
             return True, "", ""
 
         client._run = fake_run
+        return client
+
+    def test_merge_pr_appends_attribution_to_pr_body(self, tmp_path):
+        calls = []
+        client = self._client_with_pr_body(
+            tmp_path, "Bumps lodash from 1 to 2.", calls
+        )
         success, error = client.merge_pr(42)
         assert success is True
         assert error == ""
-        args = captured["args"]
-        assert "--squash" in args
-        assert args[args.index("--body") + 1] == gm.COMMIT_ATTRIBUTION
+        merge_args = calls[-1]
+        assert merge_args[:3] == ["gh", "pr", "merge"]
+        assert "--squash" in merge_args
+        body = merge_args[merge_args.index("--body") + 1]
+        assert body == f"Bumps lodash from 1 to 2.\n\n{gm.COMMIT_ATTRIBUTION}"
+
+    def test_merge_pr_attribution_only_when_pr_body_empty(self, tmp_path):
+        calls = []
+        client = self._client_with_pr_body(tmp_path, "", calls)
+        success, _ = client.merge_pr(42)
+        assert success is True
+        merge_args = calls[-1]
+        assert merge_args[merge_args.index("--body") + 1] == gm.COMMIT_ATTRIBUTION
 
 
 class TestMergePrsOnGithub:
@@ -805,6 +847,44 @@ class TestMaintainMergedPrCiMonitoring:
         assert status == gm.STATUS_FAILED
         assert had_changes is False
         maintainer._handle_post_push_ci.assert_called_once_with("base123", True)
+
+
+class TestCheckAndFixPreExistingCi:
+    """A failed CI fix from a previous run must not be retried every run."""
+
+    def test_failed_ci_fix_not_retried(self, repo_path, default_config):
+        maintainer = make_maintainer(
+            repo_path, default_config, dry_run=False, push_changes=True
+        )
+        maintainer.github.get_latest_ci_conclusion = MagicMock(
+            return_value="failure"
+        )
+        maintainer.git.is_latest_commit_from_maintainer = MagicMock(
+            return_value=True
+        )
+        maintainer.git.is_latest_commit_ci_fix = MagicMock(return_value=True)
+        maintainer.fix_ci_with_retries = MagicMock()
+        should_continue, ci_was_passing = maintainer._check_and_fix_pre_existing_ci()
+        assert should_continue is True
+        assert ci_was_passing is False
+        maintainer.fix_ci_with_retries.assert_not_called()
+
+    def test_non_fix_maintainer_commit_still_fixed(self, repo_path, default_config):
+        maintainer = make_maintainer(
+            repo_path, default_config, dry_run=False, push_changes=True
+        )
+        maintainer.github.get_latest_ci_conclusion = MagicMock(
+            return_value="failure"
+        )
+        maintainer.git.is_latest_commit_from_maintainer = MagicMock(
+            return_value=True
+        )
+        maintainer.git.is_latest_commit_ci_fix = MagicMock(return_value=False)
+        maintainer.fix_ci_with_retries = MagicMock(return_value=True)
+        should_continue, ci_was_passing = maintainer._check_and_fix_pre_existing_ci()
+        assert should_continue is True
+        assert ci_was_passing is True
+        maintainer.fix_ci_with_retries.assert_called_once()
 
 
 class TestDryRunGuards:

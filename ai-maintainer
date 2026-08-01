@@ -60,6 +60,10 @@ TOOL_REPO_URL = "https://github.com/andornaut/ai-maintainer"
 # fixing CI failures it may have caused); see is_latest_commit_from_maintainer
 COMMIT_ATTRIBUTION = f"Created by ai-maintainer\n{TOOL_REPO_URL}"
 
+# Commit title for AI CI-fix commits; also recognized by is_latest_commit_ci_fix
+# so a failed fix from a previous run is not retried indefinitely
+CI_FIX_COMMIT_TITLE = "fix: CI build failure"
+
 # Workflow name prefixes to exclude from CI detection (e.g. GitHub-managed workflows)
 IGNORED_WORKFLOW_PREFIXES = ("Dependabot",)
 
@@ -584,21 +588,35 @@ class GitClient:
         """Check if directory is a git repository."""
         return (self.repo_path / ".git").exists()
 
+    def _latest_commit_message(self) -> str:
+        """Return the full message of the latest commit, or empty string."""
+        success, stdout, _ = self._run(["git", "log", "-1", "--format=%B"])
+        return stdout if success else ""
+
     def is_latest_commit_from_maintainer(self) -> bool:
         """Check if the latest commit was created by ai-maintainer.
 
-        Matches only this tool's commit-message attribution, which it writes
-        into both its own commits and the body of squash merges it performs
-        (see GitHubClient.merge_pr). Dependabot authorship is deliberately
-        not matched: the author name is spoofable, and a squash merge made by
-        a human without the attribution body is not this tool's work, so
-        authorship alone must not trigger the AI fix path.
+        Matches only the exact attribution block this tool writes into its
+        own commits and the squash merges it performs (see
+        GitHubClient.merge_pr). A mere mention of the tool's name is not
+        attribution, and authorship is not checked (author names are
+        spoofable); neither may trigger the AI fix path. Only HEAD is
+        inspected: once another commit lands on top, earlier tool-made
+        commits are no longer claimed.
         """
-        success, stdout, _ = self._run(["git", "log", "-1", "--format=%B"])
-        if not success:
-            return False
-        # Check for our attribution in the commit message
-        return TOOL_REPO_URL in stdout or "ai-maintainer" in stdout.lower()
+        return COMMIT_ATTRIBUTION in self._latest_commit_message()
+
+    def is_latest_commit_ci_fix(self) -> bool:
+        """Check if the latest commit is a CI-fix commit made by ai-maintainer.
+
+        When CI is failing and HEAD is already one of this tool's CI-fix
+        commits, a previous run's fix attempts did not resolve the failure;
+        retrying on every run would push an unbounded stream of failed fixes.
+        """
+        message = self._latest_commit_message()
+        return COMMIT_ATTRIBUTION in message and message.startswith(
+            CI_FIX_COMMIT_TITLE
+        )
 
     def is_workdir_clean(self) -> bool:
         """Check if working directory is clean."""
@@ -777,16 +795,32 @@ class GitHubClient:
             url = url[:-4]
         return url
 
+    def get_pr_body(self, pr_num: int) -> str:
+        """Return a PR's description body, or empty string on failure."""
+        success, stdout, _ = self._run(
+            ["gh", "pr", "view", str(pr_num), "--json", "body"]
+        )
+        if not success:
+            return ""
+        data = safe_json_parse(stdout, default={})
+        return (data.get("body") or "").strip()
+
     def merge_pr(self, pr_num: int) -> Tuple[bool, str]:
         """Squash-merge a PR on GitHub and delete its remote branch.
 
-        The squash-commit body is set to this tool's attribution so a later
-        run can recognize the merge as ai-maintainer's work (the default
-        body, the PR body, would be indistinguishable from a human merge).
+        The squash-commit body is the PR description with this tool's
+        attribution appended, so the PR's release notes stay in git history
+        and a later run can recognize the merge as ai-maintainer's work
+        (the default body, which varies with the repo's squash-message
+        setting, would be indistinguishable from a human merge). On branches
+        that require a merge queue, gh ignores these flags, so the merge is
+        recorded without attribution and is not recognized later.
 
         Returns (success, error) where error is gh's stderr (or stdout) on
         failure, so callers can log the root cause instead of a bare failure.
         """
+        pr_body = self.get_pr_body(pr_num)
+        body = f"{pr_body}\n\n{COMMIT_ATTRIBUTION}" if pr_body else COMMIT_ATTRIBUTION
         success, stdout, stderr = self._run(
             [
                 "gh",
@@ -796,7 +830,7 @@ class GitHubClient:
                 "--squash",
                 "--delete-branch",
                 "--body",
-                COMMIT_ATTRIBUTION,
+                body,
             ]
         )
         return success, (stderr or stdout).strip()
@@ -1068,7 +1102,7 @@ class Maintainer:
     ) -> str:
         """Build a descriptive commit message based on what was done."""
         if is_fix:
-            title = "fix: CI build failure"
+            title = CI_FIX_COMMIT_TITLE
             details = ["Fixed CI build failure with AI assistance"]
         elif had_dep_updates:
             title = "chore(deps): update direct dependencies"
@@ -1481,6 +1515,16 @@ class Maintainer:
 
         if initial_ci == "failure":
             if self.git.is_latest_commit_from_maintainer():
+                if self.git.is_latest_commit_ci_fix():
+                    # A previous run's CI fix did not resolve the failure;
+                    # retrying every run would push an unbounded stream of
+                    # failed fixes, so stop and leave this to a human.
+                    self.logger.warning(
+                        f"[{self.repo_name}] CI is failing on a previous "
+                        "ai-maintainer CI fix; not retrying (manual "
+                        "intervention required)"
+                    )
+                    return True, False
                 if self.config.dry_run:
                     self.logger.info(
                         f"[{self.repo_name}] DRY RUN: Would attempt to fix pre-existing CI failure"
