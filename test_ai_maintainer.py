@@ -5,6 +5,7 @@ import importlib.machinery
 
 # Import the module (it's an executable without .py extension)
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -487,16 +488,12 @@ class TestMergePrsOnGithub:
     """Tests for _merge_prs_on_github method."""
 
     def test_dry_run_skips_merge(self, maintainer):
-        success, merged = maintainer._merge_prs_on_github([1, 2])
-        assert success is True
-        assert merged == [1, 2]
+        assert maintainer._merge_prs_on_github([1, 2]) == [1, 2]
 
     def test_merge_success(self, repo_path, default_config):
         maintainer = make_maintainer(repo_path, default_config, dry_run=False)
         maintainer.github.merge_pr = MagicMock(return_value=(True, ""))
-        success, merged = maintainer._merge_prs_on_github([1, 2])
-        assert success is True
-        assert merged == [1, 2]
+        assert maintainer._merge_prs_on_github([1, 2]) == [1, 2]
         assert maintainer.github.merge_pr.call_count == 2
 
     def test_merge_partial_failure(self, repo_path, default_config):
@@ -504,14 +501,10 @@ class TestMergePrsOnGithub:
         maintainer.github.merge_pr = MagicMock(
             side_effect=[(True, ""), (False, "merge blocked"), (True, "")]
         )
-        success, merged = maintainer._merge_prs_on_github([1, 2, 3])
-        assert success is True
-        assert merged == [1, 3]
+        assert maintainer._merge_prs_on_github([1, 2, 3]) == [1, 3]
 
     def test_empty_list(self, maintainer):
-        success, merged = maintainer._merge_prs_on_github([])
-        assert success is True
-        assert merged == []
+        assert maintainer._merge_prs_on_github([]) == []
 
     def test_merge_conflict_triggers_rebase(self, repo_path, default_config):
         maintainer = make_maintainer(repo_path, default_config, dry_run=False)
@@ -523,9 +516,7 @@ class TestMergePrsOnGithub:
         )
         maintainer.github.get_recent_pr_comment_bodies = MagicMock(return_value=[])
         maintainer.github.comment_pr = MagicMock(return_value=(True, ""))
-        success, merged = maintainer._merge_prs_on_github([5])
-        assert success is True
-        assert merged == []
+        assert maintainer._merge_prs_on_github([5]) == []
         maintainer.github.comment_pr.assert_called_once_with(
             5, gm.DEPENDABOT_REBASE_COMMAND
         )
@@ -544,9 +535,7 @@ class TestMergePrsOnGithub:
             return_value=["please review", gm.DEPENDABOT_REBASE_COMMAND]
         )
         maintainer.github.comment_pr = MagicMock(return_value=(True, ""))
-        success, merged = maintainer._merge_prs_on_github([5])
-        assert success is True
-        assert merged == []
+        assert maintainer._merge_prs_on_github([5]) == []
         maintainer.github.comment_pr.assert_not_called()
 
     def test_already_merged_counts_as_merged(self, repo_path, default_config):
@@ -555,9 +544,7 @@ class TestMergePrsOnGithub:
             return_value=(True, "! Pull request #9 was already merged")
         )
         maintainer.github.comment_pr = MagicMock(return_value=True)
-        success, merged = maintainer._merge_prs_on_github([9])
-        assert success is True
-        assert merged == [9]
+        assert maintainer._merge_prs_on_github([9]) == [9]
         maintainer.github.comment_pr.assert_not_called()
 
     def test_non_conflict_failure_skips_without_rebase(
@@ -568,10 +555,222 @@ class TestMergePrsOnGithub:
             return_value=(False, "merge blocked by branch protection")
         )
         maintainer.github.comment_pr = MagicMock(return_value=True)
-        success, merged = maintainer._merge_prs_on_github([7])
-        assert success is True
-        assert merged == []
+        assert maintainer._merge_prs_on_github([7]) == []
         maintainer.github.comment_pr.assert_not_called()
+
+
+class TestGitHubClientCi:
+    """CI status handling must consider every workflow run for a commit."""
+
+    def _client(self, tmp_path):
+        client = gm.GitHubClient(tmp_path, MagicMock(), MagicMock())
+        client.is_authenticated = True
+        return client
+
+    def test_combine_all_success(self):
+        runs = [
+            {"status": "completed", "conclusion": "success"},
+            {"status": "completed", "conclusion": "success"},
+        ]
+        assert gm.GitHubClient._combine_run_conclusions(runs) == "success"
+
+    def test_combine_any_failure_wins(self):
+        runs = [
+            {"status": "completed", "conclusion": "success"},
+            {"status": "completed", "conclusion": "failure"},
+        ]
+        assert gm.GitHubClient._combine_run_conclusions(runs) == "failure"
+
+    def test_combine_failure_beats_in_progress(self):
+        runs = [
+            {"status": "in_progress", "conclusion": None},
+            {"status": "completed", "conclusion": "failure"},
+        ]
+        assert gm.GitHubClient._combine_run_conclusions(runs) == "failure"
+
+    def test_combine_pending_run_is_in_progress(self):
+        runs = [
+            {"status": "completed", "conclusion": "success"},
+            {"status": "in_progress", "conclusion": None},
+        ]
+        assert gm.GitHubClient._combine_run_conclusions(runs) == "in_progress"
+
+    def test_combine_non_success_conclusion_surfaces(self):
+        runs = [
+            {"status": "completed", "conclusion": "success"},
+            {"status": "completed", "conclusion": "cancelled"},
+        ]
+        assert gm.GitHubClient._combine_run_conclusions(runs) == "cancelled"
+
+    def test_latest_conclusion_ignores_older_commits(self, tmp_path):
+        client = self._client(tmp_path)
+        client._get_runs = MagicMock(
+            return_value=[
+                {"status": "completed", "conclusion": "success", "headSha": "new"},
+                {"status": "completed", "conclusion": "failure", "headSha": "new"},
+                {"status": "completed", "conclusion": "failure", "headSha": "old"},
+            ]
+        )
+        assert client.get_latest_ci_conclusion() == "failure"
+
+    def test_latest_conclusion_all_workflows_must_pass(self, tmp_path):
+        client = self._client(tmp_path)
+        client._get_runs = MagicMock(
+            return_value=[
+                {"status": "completed", "conclusion": "success", "headSha": "new"},
+                {"status": "completed", "conclusion": "success", "headSha": "new"},
+            ]
+        )
+        assert client.get_latest_ci_conclusion() == "success"
+
+    def test_wait_for_ci_fails_when_any_workflow_fails(self, tmp_path, monkeypatch):
+        client = self._client(tmp_path)
+        client._get_runs = MagicMock(
+            return_value=[
+                {"status": "completed", "conclusion": "success", "headSha": "abc"},
+                {"status": "completed", "conclusion": "failure", "headSha": "abc"},
+            ]
+        )
+        monkeypatch.setattr(gm.time, "sleep", lambda s: None)
+        assert client.wait_for_ci("abc", 1) == "failure"
+
+    def test_wait_for_ci_keeps_polling_while_a_workflow_runs(
+        self, tmp_path, monkeypatch
+    ):
+        client = self._client(tmp_path)
+        client._get_runs = MagicMock(
+            side_effect=[
+                [
+                    {"status": "completed", "conclusion": "success", "headSha": "abc"},
+                    {"status": "in_progress", "conclusion": None, "headSha": "abc"},
+                ],
+                [
+                    {"status": "completed", "conclusion": "success", "headSha": "abc"},
+                    {"status": "completed", "conclusion": "success", "headSha": "abc"},
+                ],
+            ]
+        )
+        monkeypatch.setattr(gm.time, "sleep", lambda s: None)
+        assert client.wait_for_ci("abc", 1) == "success"
+
+    def test_get_runs_over_fetches_before_filtering(self, tmp_path):
+        client = self._client(tmp_path)
+        client._git.current_branch = "main"
+        captured = {}
+
+        def fake_run(args):
+            captured["args"] = args
+            runs = [
+                {
+                    "workflowName": "Dependabot Updates",
+                    "status": "completed",
+                    "conclusion": "success",
+                },
+                {
+                    "workflowName": "CI",
+                    "status": "completed",
+                    "conclusion": "failure",
+                },
+            ]
+            return True, json.dumps(runs), ""
+
+        client._run = fake_run
+        runs = client._get_runs(1)
+        # The ignored workflow must not consume the single result slot
+        assert len(runs) == 1
+        assert runs[0]["workflowName"] == "CI"
+        limit = captured["args"][captured["args"].index("--limit") + 1]
+        assert int(limit) > 1
+
+    def test_repo_url_ssh_scheme(self, tmp_path):
+        git = MagicMock()
+        git.get_remote_url.return_value = "ssh://git@github.com/owner/repo.git"
+        client = gm.GitHubClient(tmp_path, git, MagicMock())
+        assert client.repo_url == "https://github.com/owner/repo"
+
+
+class TestUpdateDependencies:
+    """The workdir state is verified against the agent's reported outcome."""
+
+    def _maintainer(self, repo_path, default_config, decision):
+        (repo_path / "package.json").write_text("{}")
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False)
+        maintainer.agent.ask_json = MagicMock(return_value=decision)
+        maintainer.git.reset_changes = MagicMock(return_value=True)
+        return maintainer
+
+    def test_unreported_changes_are_discarded(self, repo_path, default_config):
+        maintainer = self._maintainer(
+            repo_path, default_config, {"updated": False, "reasoning": "none needed"}
+        )
+        maintainer.git.is_workdir_clean = MagicMock(return_value=False)
+        success, had_updates = maintainer.update_dependencies()
+        assert success is True
+        assert had_updates is False
+        maintainer.git.reset_changes.assert_called_once()
+
+    def test_no_updates_clean_workdir_no_reset(self, repo_path, default_config):
+        maintainer = self._maintainer(
+            repo_path, default_config, {"updated": False, "reasoning": "none needed"}
+        )
+        maintainer.git.is_workdir_clean = MagicMock(return_value=True)
+        success, had_updates = maintainer.update_dependencies()
+        assert success is True
+        assert had_updates is False
+        maintainer.git.reset_changes.assert_not_called()
+
+    def test_reported_updates_with_changes(self, repo_path, default_config):
+        maintainer = self._maintainer(
+            repo_path,
+            default_config,
+            {"updated": True, "changes_made": "bumped", "reasoning": "outdated"},
+        )
+        maintainer.git.is_workdir_clean = MagicMock(return_value=False)
+        success, had_updates = maintainer.update_dependencies()
+        assert success is True
+        assert had_updates is True
+        maintainer.git.reset_changes.assert_not_called()
+
+
+class TestMaintainMergedPrCiMonitoring:
+    """Merged dependabot PRs must be CI-monitored even when the run aborts."""
+
+    def _maintainer(self, repo_path, default_config):
+        maintainer = make_maintainer(
+            repo_path, default_config, dry_run=False, push_changes=True
+        )
+        maintainer._validate_repo = MagicMock(return_value=True)
+        maintainer._check_and_fix_pre_existing_ci = MagicMock(
+            return_value=(True, True)
+        )
+        maintainer.git.get_head_sha = MagicMock(return_value="base123")
+        maintainer.merge_dependabot_prs = MagicMock(return_value=[42])
+        maintainer.git.pull_changes = MagicMock(return_value=True)
+        maintainer.git.reset_changes = MagicMock(return_value=True)
+        maintainer._handle_post_push_ci = MagicMock(return_value=False)
+        return maintainer
+
+    def test_unfixable_test_failure_still_monitors_ci(
+        self, repo_path, default_config
+    ):
+        maintainer = self._maintainer(repo_path, default_config)
+        maintainer.update_dependencies = MagicMock(return_value=(True, False))
+        maintainer.run_tests = MagicMock(return_value=(False, "boom"))
+        maintainer.fix_test_with_retries = MagicMock(return_value=False)
+        status, had_changes = maintainer.maintain()
+        assert status == gm.STATUS_FAILED
+        assert had_changes is False
+        maintainer._handle_post_push_ci.assert_called_once_with("base123", True)
+
+    def test_failed_dependency_update_still_monitors_ci(
+        self, repo_path, default_config
+    ):
+        maintainer = self._maintainer(repo_path, default_config)
+        maintainer.update_dependencies = MagicMock(return_value=(False, False))
+        status, had_changes = maintainer.maintain()
+        assert status == gm.STATUS_FAILED
+        assert had_changes is False
+        maintainer._handle_post_push_ci.assert_called_once_with("base123", True)
 
 
 class TestDryRunGuards:
