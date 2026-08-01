@@ -36,6 +36,15 @@ MergeResult = List[int]  # merged_pr_numbers
 RepoResult = Tuple[str, bool]  # (status, had_changes); status is a STATUS_* value
 TestResult = Tuple[bool, str]  # (success, output)
 
+
+class WorkingTreeError(Exception):
+    """The working tree could not be restored to a known-good state.
+
+    Aborts the repository: the AI's edits are still in place, so continuing
+    risks committing them untested on top of whatever comes next.
+    """
+
+
 # Per-repository maintenance outcomes
 STATUS_SUCCESS = "success"
 STATUS_SKIPPED = "skipped"
@@ -45,7 +54,6 @@ STATUS_FAILED = "failed"
 DEFAULT_AGENT_COMMAND = "claude"
 DEFAULT_AGENT_FLAGS = "--dangerously-skip-permissions"
 DEFAULT_AGENT_TIMEOUT_SECONDS = 300
-DEFAULT_CI_LOG_MAX_LENGTH = 10000
 DEFAULT_CI_TIMEOUT_MINUTES = 10
 DEFAULT_DEPENDENCY_MIN_AGE_DAYS = 0
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 120
@@ -54,6 +62,21 @@ DEFAULT_MAX_FIX_ATTEMPTS = 4
 
 # Other constants
 TOOL_REPO_URL = "https://github.com/andornaut/ai-maintainer"
+
+# Canonical form every supported remote URL is normalized to
+GITHUB_URL_PREFIX = "https://github.com/"
+
+# Every github.com remote form git accepts: scp-like (git@github.com:o/r),
+# https (with or without token userinfo), ssh:// (with or without a port), and
+# git://. Anchored on the host so other forges do not match.
+GITHUB_REMOTE_RE = re.compile(
+    r"^(?:https?://|git://|ssh://)?(?:[^@/]+@)?github\.com(?::\d+)?[:/]"
+    r"(?P<owner>[^/]+)/(?P<name>[^/]+?)(?:\.git)?/?$"
+)
+
+# Cap on the CI log text handed to the AI fix path. Not a DEFAULT_ constant:
+# those are all CLI-backed, and this one is not configurable.
+CI_LOG_MAX_LENGTH = 10000
 
 # Attribution appended to commit messages and squash-merge commit bodies so a
 # later run can recognize work done by this tool (and take responsibility for
@@ -172,6 +195,16 @@ def run_git(
         quoted = " ".join(shlex.quote(arg) for arg in args)
         return run_shell_command(f"{env_runner} git {quoted}", cwd, timeout=timeout)
     return run_command(["git", *args], cwd, timeout=timeout)
+
+
+def _sanitize_trailer_value(value: str) -> str:
+    """Strip what would let an untrusted value forge a commit trailer.
+
+    Whitespace is collapsed so a newline cannot start a new trailer line, and
+    angle brackets are removed so an embedded "<addr>" cannot be read as the
+    trailer's identity in place of the real one.
+    """
+    return " ".join(value.replace("<", "").replace(">", "").split())
 
 
 def safe_json_parse(text: str, default: Any = None) -> Any:
@@ -424,6 +457,7 @@ Respond with ONLY a JSON object. No explanations, no markdown outside the JSON.
             # a full pipe buffer.
             proc = subprocess.Popen(
                 agent_cmd,
+                cwd=self.repo_path,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -579,6 +613,20 @@ class GitClient:
         success, stdout, _ = self._run(["git", "rev-parse", "HEAD"])
         return stdout.strip() if success else None
 
+    def fetch(self) -> bool:
+        """Update remote-tracking refs without touching the working tree."""
+        success, _, _ = self._run(["git", "fetch", "origin"])
+        return success
+
+    def get_upstream_sha(self) -> Optional[str]:
+        """Get the SHA of the upstream tracking branch.
+
+        This is the commit the remote actually has, which local HEAD stops
+        matching as soon as an unpushed commit lands on top.
+        """
+        success, stdout, _ = self._run(["git", "rev-parse", "@{u}"])
+        return stdout.strip() if success else None
+
     def get_remote_url(self) -> Optional[str]:
         """Get the remote origin URL."""
         success, stdout, _ = self._run(["git", "remote", "get-url", "origin"])
@@ -696,14 +744,24 @@ class GitClient:
         self._run(["git", "reset", "--merge"])
         # Reset index first to clear any unmerged entries
         self._run(["git", "reset", "HEAD"])
-        # Reset staged and unstaged changes
+        # Reset staged and unstaged changes. `checkout -- .` is the weakest
+        # step here: it fails on cases a hard reset handles (a tracked path
+        # replaced by a directory, leftover unmerged index entries), so
+        # escalate rather than give up.
         success, _, stderr = self._run(["git", "checkout", "--", "."])
         if not success:
-            self.logger.error(
-                f"[{self.repo_name}] Command failed: git checkout -- .\n{stderr}"
+            self.logger.warning(
+                f"[{self.repo_name}] git checkout -- . failed, trying "
+                f"git reset --hard\n{stderr}"
             )
-            return False
-        # Remove untracked files
+            success, _, stderr = self.reset_hard("HEAD")
+            if not success:
+                self.logger.error(
+                    f"[{self.repo_name}] Command failed: git reset --hard HEAD\n{stderr}"
+                )
+                return False
+        # Remove untracked files. -x is deliberately omitted: it would delete
+        # ignored build state (.venv, node_modules) the project needs.
         success, _, stderr = self._run(["git", "clean", "-ffd"])
         if not success:
             self.logger.error(
@@ -717,9 +775,21 @@ class GitClient:
         """Hard-reset the working tree and branch to the given commit."""
         return self._run(["git", "reset", "--hard", sha])
 
+    def get_stash_ref(self) -> Optional[str]:
+        """Return the SHA of the most recent stash entry, or None if there is none."""
+        success, stdout, _ = self._run(
+            ["git", "rev-parse", "--verify", "--quiet", "refs/stash"]
+        )
+        return stdout.strip() if success and stdout.strip() else None
+
     def stash_push(self, message: str) -> CommandResult:
-        """Stash uncommitted changes under a label."""
-        return self._run(["git", "stash", "push", "-m", message])
+        """Stash uncommitted changes under a label, including untracked files.
+
+        -u is required: untracked files (new lock files, generated configs)
+        count as a dirty working directory but are not stashed without it, and
+        reset_changes's `git clean -ffd` would then delete them irrecoverably.
+        """
+        return self._run(["git", "stash", "push", "-u", "-m", message])
 
     def stash_apply(self) -> CommandResult:
         """Re-apply the most recent stash without dropping it."""
@@ -781,19 +851,27 @@ class GitHubClient:
         return run_command(args, self.repo_path, timeout=self.command_timeout)
 
     @functools.cached_property
-    def repo_url(self) -> Optional[str]:
-        """Get the GitHub repository URL (cached)."""
+    def owner_repo(self) -> Optional[str]:
+        """The origin remote's 'owner/name', or None if it is not on github.com.
+
+        Always derived from origin, so fork clones resolve to the fork rather
+        than to whatever base repo gh would infer from the other remotes.
+        Other forges return None: 'owner/name' taken from, say, a GitLab URL
+        would otherwise be answered by the unrelated github.com repository of
+        that name.
+        """
         url = self._git.get_remote_url()
         if not url:
             return None
-        # Convert SSH URL forms to HTTPS
-        if url.startswith("git@github.com:"):
-            url = url.replace("git@github.com:", "https://github.com/")
-        elif url.startswith("ssh://git@github.com/"):
-            url = url.replace("ssh://git@github.com/", "https://github.com/")
-        if url.endswith(".git"):
-            url = url[:-4]
-        return url
+        match = GITHUB_REMOTE_RE.match(url.strip())
+        if not match:
+            return None
+        return f"{match.group('owner')}/{match.group('name')}"
+
+    @functools.cached_property
+    def repo_url(self) -> Optional[str]:
+        """Get the GitHub repository URL (cached)."""
+        return f"{GITHUB_URL_PREFIX}{self.owner_repo}" if self.owner_repo else None
 
     def get_pr_body_and_coauthors(self, pr_num: int) -> Tuple[str, List[str]]:
         """Return a PR's description and its Co-authored-by trailers.
@@ -801,7 +879,8 @@ class GitHubClient:
         The trailers credit commit authors other than the PR author,
         mirroring what GitHub's default squash message would add (the PR
         author is credited as the squash commit's author, not a co-author).
-        Returns ("", []) on failure.
+        Author names and emails are untrusted, so they are sanitized before
+        being formatted into trailers. Returns ("", []) on failure.
         """
         success, stdout, _ = self._run(
             ["gh", "pr", "view", str(pr_num), "--json", "body,commits,author"]
@@ -816,8 +895,8 @@ class GitHubClient:
         for commit in data.get("commits", []):
             for author in commit.get("authors", []):
                 login = author.get("login") or ""
-                name = author.get("name") or login
-                email = author.get("email") or ""
+                name = _sanitize_trailer_value(author.get("name") or login)
+                email = _sanitize_trailer_value(author.get("email") or "")
                 key = (name, email)
                 if login == pr_author or not email or key in seen:
                     continue
@@ -882,9 +961,9 @@ class GitHubClient:
         bodies = [c.get("body", "") for c in data.get("comments", [])]
         return bodies[-limit:]
 
-    def get_ci_failure_logs(self) -> Optional[str]:
-        """Get logs from the latest failed CI run."""
-        run_id = self.get_latest_run_id()
+    def get_ci_failure_logs(self, head_sha: Optional[str] = None) -> Optional[str]:
+        """Get logs from the latest failed CI run, preferring head_sha's run."""
+        run_id = self.get_latest_failed_run_id(head_sha)
         if not run_id:
             return None
         success, stdout, _ = self._run(
@@ -910,8 +989,8 @@ class GitHubClient:
         if not success or not stdout:
             return None
         # Truncate if too long
-        if len(stdout) > DEFAULT_CI_LOG_MAX_LENGTH:
-            return stdout[:DEFAULT_CI_LOG_MAX_LENGTH] + "\n... (truncated)"
+        if len(stdout) > CI_LOG_MAX_LENGTH:
+            return stdout[:CI_LOG_MAX_LENGTH] + "\n... (truncated)"
         return stdout
 
     def get_dependabot_prs(self) -> List[Dict[str, Any]]:
@@ -934,27 +1013,39 @@ class GitHubClient:
             return []
         return safe_json_parse(stdout, default=[])
 
-    def get_latest_ci_conclusion(self) -> Optional[str]:
-        """Get the combined conclusion of the latest commit's CI runs.
+    def get_ci_conclusion(self, head_sha: Optional[str] = None) -> Optional[str]:
+        """Get the combined conclusion of a commit's CI runs.
 
-        A push can trigger several workflows, so all runs for the newest
-        commit are considered; a passing run must not mask a failing one.
+        A push can trigger several workflows, so all runs for the commit are
+        considered; a passing run must not mask a failing one. head_sha
+        defaults to the newest commit that has runs.
+
+        When head_sha has no runs, falls back to the newest commit that does.
+        Workflows filtered by paths/paths-ignore leave most commits with no
+        runs at all, so treating that as an unknown-but-healthy baseline would
+        permanently hide a real failure on an earlier commit and make callers
+        answer for it. Returns None only when the branch has no runs at all.
         """
         if not self.is_authenticated:
             return None
         runs = self._get_runs(10, "status,conclusion,headSha")
         if not runs:
             return None
-        head_sha = runs[0].get("headSha")
-        latest = [r for r in runs if r.get("headSha") == head_sha]
-        return self._combine_run_conclusions(latest)
+        for_sha = [r for r in runs if r.get("headSha") == head_sha]
+        if not for_sha:
+            newest_sha = runs[0].get("headSha")
+            for_sha = [r for r in runs if r.get("headSha") == newest_sha]
+        return self._combine_run_conclusions(for_sha)
+
+    def get_ci_run_url(self, run_id: Optional[int]) -> Optional[str]:
+        """Get the URL for a CI run."""
+        if not self.repo_url or not run_id:
+            return None
+        return f"{self.repo_url}/actions/runs/{run_id}"
 
     def get_latest_ci_run_url(self) -> Optional[str]:
         """Get the URL for the latest CI run."""
-        if not self.repo_url:
-            return None
-        run_id = self.get_latest_run_id()
-        return f"{self.repo_url}/actions/runs/{run_id}" if run_id else None
+        return self.get_ci_run_url(self.get_latest_run_id())
 
     def get_latest_run_id(self) -> Optional[int]:
         """Get the database ID of the latest CI run."""
@@ -962,6 +1053,67 @@ class GitHubClient:
         if runs and "databaseId" in runs[0]:
             return runs[0]["databaseId"]
         return None
+
+    def get_latest_failed_run_id(self, head_sha: Optional[str] = None) -> Optional[int]:
+        """Get the database ID of the most recent failed CI run.
+
+        A push can trigger several workflows, so the most recent run is not
+        necessarily the one that failed; selecting on recency alone can hand
+        the logs of a green build to the AI fix path. Prefers a failure on
+        head_sha, falling back to the most recent failure on the branch.
+        """
+        runs = self._get_runs(10, "databaseId,status,conclusion,headSha")
+        failed = [
+            r
+            for r in runs
+            if r.get("status") == "completed" and r.get("conclusion") == "failure"
+        ]
+        if not failed:
+            return None
+        if head_sha:
+            for run in failed:
+                if run.get("headSha") == head_sha:
+                    return run.get("databaseId")
+        return failed[0].get("databaseId")
+
+    def get_write_access(self) -> Optional[bool]:
+        """Whether the authenticated user can push to this repository.
+
+        The repository is named explicitly: left to resolve a base repo from
+        the remotes, gh prefers `upstream` over `origin`, so a fork would
+        report the parent's permissions (typically READ) and be judged
+        unwritable even though pushing to origin works.
+
+        Returns None when GitHub cannot answer (non-GitHub remote, not
+        authenticated, API error, or a token that does not report a
+        permission level), leaving the caller to probe another way.
+        """
+        if not self.owner_repo or not self.is_authenticated:
+            return None
+        success, stdout, _ = self._run(
+            [
+                "gh",
+                "repo",
+                "view",
+                self.owner_repo,
+                "--json",
+                "isArchived,viewerPermission",
+            ]
+        )
+        if not success:
+            return None
+        data = safe_json_parse(stdout, default={})
+        if not isinstance(data, dict):
+            return None
+        if data.get("isArchived"):
+            self.logger.debug(
+                f"[{self.repo_path.name}] Repository is archived"
+            )
+            return False
+        permission = data.get("viewerPermission")
+        if not permission:
+            return None
+        return permission in ("ADMIN", "MAINTAIN", "WRITE")
 
     @functools.cached_property
     def is_authenticated(self) -> bool:
@@ -975,21 +1127,14 @@ class GitHubClient:
         GitHub signs dependabot commits with their GPG key. This checks
         the verification status via the GitHub API.
         """
-        # Get repo owner/name from remote URL
-        if not self.repo_url:
+        if not self.owner_repo:
             return False
-
-        # Extract owner/repo from URL like https://github.com/owner/repo
-        parts = self.repo_url.rstrip("/").split("/")
-        if len(parts) < 2:
-            return False
-        owner_repo = f"{parts[-2]}/{parts[-1]}"
 
         success, stdout, _ = self._run(
             [
                 "gh",
                 "api",
-                f"repos/{owner_repo}/commits/{commit_sha}",
+                f"repos/{self.owner_repo}/commits/{commit_sha}",
                 "--jq",
                 ".commit.verification.verified",
             ]
@@ -1015,7 +1160,7 @@ class GitHubClient:
         poll_interval = 30
         max_polls = (timeout_minutes * 60) // poll_interval
 
-        for _ in range(max_polls):
+        for poll in range(max_polls):
             # _get_runs lists recent push runs for the branch and already
             # excludes ignored workflows (e.g. Dependabot Updates). Request a
             # wider window so a push that triggers several workflows doesn't
@@ -1027,15 +1172,16 @@ class GitHubClient:
             runs_for_sha = [r for r in runs if r.get("headSha") == head_sha]
             if not runs_for_sha:
                 self.logger.debug(f"[{repo_name}] No CI run for {head_sha[:7]} yet, waiting...")
+            else:
+                conclusion = self._combine_run_conclusions(runs_for_sha)
+                if conclusion != "in_progress":
+                    return conclusion
+                self.logger.debug(f"[{repo_name}] CI status: in_progress, waiting...")
+
+            # Skip the sleep after the final poll: the budget is already spent,
+            # and sleeping through it would overrun timeout_minutes.
+            if poll < max_polls - 1:
                 time.sleep(poll_interval)
-                continue
-
-            conclusion = self._combine_run_conclusions(runs_for_sha)
-            if conclusion != "in_progress":
-                return conclusion
-
-            self.logger.debug(f"[{repo_name}] CI status: in_progress, waiting...")
-            time.sleep(poll_interval)
 
         self.logger.error(f"[{repo_name}] CI timed out after {timeout_minutes} minutes")
         return None
@@ -1047,8 +1193,11 @@ class GitHubClient:
         Returns 'failure' as soon as any completed run failed (even if others
         are still running), 'in_progress' while runs are pending, 'success'
         only when every run succeeded, or the first non-success conclusion
-        (e.g. 'cancelled') otherwise.
+        (e.g. 'cancelled') otherwise. No runs means no verdict, not 'success':
+        this gates a force push, so absence of evidence must not read as a pass.
         """
+        if not runs:
+            return None
         conclusions = [
             r.get("conclusion") for r in runs if r.get("status") == "completed"
         ]
@@ -1114,6 +1263,8 @@ class Maintainer:
             repo_path, self.git, self.logger, config.command_timeout_seconds
         )
         self.agent = AgentClient(repo_path, self.repo_name, config, self.logger)
+        # CI is monitored at most once per run; see _handle_post_push_ci
+        self._ci_monitored = False
 
     @functools.cached_property
     def project_env(self) -> ProjectEnvironment:
@@ -1134,20 +1285,21 @@ class Maintainer:
             title = "chore: automated maintenance"
             details = []
 
-        return f"{title}\n\n" + "\n".join(details + ["", COMMIT_ATTRIBUTION])
+        body = details + ["", COMMIT_ATTRIBUTION] if details else [COMMIT_ATTRIBUTION]
+        return f"{title}\n\n" + "\n".join(body)
 
     def commit_and_push(self, message: str) -> MaintainResult:
         """Commit changes and push to remote.
+
+        With push disabled the changes are still committed locally; leaving
+        them in the working tree would make the repo fail the clean-workdir
+        check on every subsequent run.
 
         Returns:
             Tuple of (success, had_changes) where:
             - success: whether the operation completed successfully
             - had_changes: whether there were changes that were committed or pushed
         """
-        if not self.config.push_changes:
-            self.logger.debug(f"[{self.repo_name}] Push disabled in config")
-            return True, False
-
         pre_commit_sha = self.git.get_head_sha()
         workdir_dirty = not self.git.is_workdir_clean()
         committed = False
@@ -1155,8 +1307,9 @@ class Maintainer:
         # Commit if there are uncommitted changes
         if workdir_dirty:
             if self.config.dry_run:
+                action = "commit and push" if self.config.push_changes else "commit"
                 self.logger.info(
-                    f"[{self.repo_name}] DRY RUN: Would commit and push changes"
+                    f"[{self.repo_name}] DRY RUN: Would {action} changes"
                 )
                 return True, True  # Would have committed
 
@@ -1189,6 +1342,15 @@ class Maintainer:
                     )
                     return False, False
                 committed = True
+
+        if not self.config.push_changes:
+            if committed:
+                self.logger.info(
+                    f"[{self.repo_name}] Committed locally (push disabled)"
+                )
+            else:
+                self.logger.debug(f"[{self.repo_name}] Push disabled in config")
+            return True, committed
 
         # Push if there are unpushed commits (from this run or previous merges)
         if not committed and not self.git.has_unpushed_commits():
@@ -1280,7 +1442,15 @@ class Maintainer:
         return None
 
     def fix_ci_failure(self, logs: str) -> bool:
-        """Ask AI to fix a CI failure, verify, commit and push. Returns True if successful."""
+        """Ask AI to fix a CI failure, verify, commit and push. Returns True if successful.
+
+        Requires a clean working tree: this path commits everything it finds,
+        so running it over changes an earlier stage could not discard would
+        push those changes untested.
+        """
+        if not self._can_commit_a_fix():
+            return False
+
         self.logger.info(f"[{self.repo_name}] Asking AI to fix CI failure...")
 
         changes = self._ask_ai_to_fix(
@@ -1291,14 +1461,14 @@ class Maintainer:
             {"ci_logs": logs},
         )
         if not changes:
-            self.git.reset_changes()
+            self._reset_changes()
             return False
 
         self.logger.info(f"[{self.repo_name}] AI fix: {changes}")
 
         if not self.run_tests()[0]:
             self.logger.error(f"[{self.repo_name}] Tests still failing after fix")
-            self.git.reset_changes()
+            self._reset_changes()
             return False
 
         if self.git.is_workdir_clean():
@@ -1311,7 +1481,7 @@ class Maintainer:
             self.build_commit_message(False, is_fix=True)
         )
         if not success:
-            self.git.reset_changes()
+            self._reset_changes()
         return success
 
     def fix_ci_with_retries(self) -> bool:
@@ -1323,10 +1493,13 @@ class Maintainer:
             )
             return False
 
+        if not self._can_commit_a_fix():
+            return False
+
         max_attempts = self.config.max_fix_attempts
 
         for attempt in range(1, max_attempts + 1):
-            logs = self.github.get_ci_failure_logs()
+            logs = self.github.get_ci_failure_logs(self.git.get_head_sha())
             if not logs:
                 self.logger.error(f"[{self.repo_name}] Could not get CI failure logs")
                 return False
@@ -1374,14 +1547,14 @@ class Maintainer:
             {"test_output": test_output},
         )
         if not changes:
-            self.git.reset_changes()
+            self._reset_changes()
             return False
 
         self.logger.info(f"[{self.repo_name}] AI fix: {changes}")
 
         if not self.run_tests()[0]:
             self.logger.error(f"[{self.repo_name}] Tests still failing after fix")
-            self.git.reset_changes()
+            self._reset_changes()
             return False
 
         self.logger.info(f"[{self.repo_name}] Tests passing after AI fix")
@@ -1400,17 +1573,32 @@ class Maintainer:
 
         # Stash uncommitted dependency updates if present
         if not self.git.is_workdir_clean():
+            stash_ref_before = self.git.get_stash_ref()
             success, _, _ = self.git.stash_push("ai-maintainer: dependency updates")
             if not success:
                 self.logger.error(
                     f"[{self.repo_name}] Failed to stash changes before fix attempts"
                 )
                 return False
+            # `git stash push` exits 0 without creating an entry when it has
+            # nothing it can save. Confirm a new entry actually appeared before
+            # claiming refs/stash: applying and dropping it otherwise would
+            # restore and then destroy a pre-existing, unrelated stash.
+            if self.git.get_stash_ref() in (None, stash_ref_before):
+                # Either no entry was created, or refs/stash could not be read.
+                # Both are unsafe to guess at, so claim nothing and say where
+                # the changes may be.
+                self.logger.error(
+                    f"[{self.repo_name}] Could not confirm a new stash entry; "
+                    "skipping fix attempts. If the stash did succeed, the "
+                    "dependency updates are in `git stash list`"
+                )
+                return False
             has_stash = True
 
-        # Guarantee the stash is dropped on every exit path - including the
-        # apply-failure return and any exception - so a failed run never leaves
-        # a dangling stash behind.
+        # Drop the stash on every exit path - including the apply-failure
+        # return and any exception - so a failed run does not leave a dangling
+        # stash behind. The one exception is WorkingTreeError, handled below.
         try:
             for attempt in range(1, max_attempts + 1):
                 self.logger.info(
@@ -1424,7 +1612,10 @@ class Maintainer:
                         self.logger.error(
                             f"[{self.repo_name}] Failed to restore dependency updates: {stderr}"
                         )
-                        self.git.reset_changes()
+                        # Keep the stash: the reset below leaves it holding the
+                        # only copy of the dependency updates
+                        has_stash = False
+                        self._reset_changes()
                         return False
 
                 if self._try_fix_tests(test_output):
@@ -1437,16 +1628,32 @@ class Maintainer:
                 # to capture fresh failure output for the next attempt.
                 if attempt < max_attempts:
                     if has_stash:
-                        self.git.stash_apply()
+                        success, _, stderr = self.git.stash_apply()
+                        if not success:
+                            # Without the updates restored, run_tests would
+                            # describe a tree the next attempt is not fixing
+                            self.logger.error(
+                                f"[{self.repo_name}] Failed to restore "
+                                f"dependency updates: {stderr}"
+                            )
+                            has_stash = False
+                            self._reset_changes()
+                            return False
                     _, test_output = self.run_tests()
                     if has_stash:
-                        self.git.reset_changes()
+                        self._reset_changes()
 
             self.logger.error(
                 f"[{self.repo_name}] Exhausted all {max_attempts} fix attempts"
             )
-            self.git.reset_changes()
+            self._reset_changes()
             return False
+        except WorkingTreeError:
+            # The tree could not be cleaned, so the stash is now the only
+            # known-good copy of the dependency updates. Keep it for the
+            # human who has to clean up.
+            has_stash = False
+            raise
         finally:
             if has_stash:
                 self.git.stash_drop()
@@ -1515,7 +1722,7 @@ class Maintainer:
             return False
 
         # Test if repository is writable (archived repos will fail)
-        if not self.git.is_writable():
+        if not self._is_writable():
             self.logger.debug(
                 f"[{self.repo_name}] Repository is not writable, skipping"
             )
@@ -1531,7 +1738,7 @@ class Maintainer:
             - should_continue: False if we should abort maintenance
             - ci_was_passing: True/False/None for CI status before our changes
         """
-        initial_ci = self.github.get_latest_ci_conclusion()
+        initial_ci = self.github.get_ci_conclusion(self.git.get_head_sha())
         if not initial_ci:
             # No CI runs found - nothing to monitor after push
             return True, None
@@ -1585,26 +1792,37 @@ class Maintainer:
         return True, True
 
     def _handle_post_push_ci(
-        self, baseline_sha: Optional[str], ci_was_passing: Optional[bool]
+        self,
+        baseline_sha: Optional[str],
+        ci_was_passing: Optional[bool],
+        head_sha: str,
     ) -> bool:
         """Monitor CI after push and fix failures if we caused them.
 
         Args:
             baseline_sha: HEAD before this run's changes, used as the rollback target
             ci_was_passing: Whether CI was passing before our changes (None if no CI)
+            head_sha: The commit CI is running on. This is not always the local
+                HEAD: a dependabot merge is monitored on its merge commit, which
+                a later local commit moves HEAD off.
 
         Returns:
             True if CI passed or was already failing, False if we broke it and couldn't fix.
         """
+        # This path can raise WorkingTreeError from the AI fix it may attempt.
+        # Record the attempt before doing anything so _maintain's handler does
+        # not re-enter here, which would spend a second full CI timeout and
+        # force push a second rollback.
+        self._ci_monitored = True
+
         if self.config.dry_run:
             return True
 
         if ci_was_passing is None:
             return True
 
-        ci_status = self._wait_for_ci(self.config.ci_timeout_minutes)
-        ci_url = self.github.get_latest_ci_run_url()
-        ci_url_suffix = f": {ci_url}" if ci_url else ""
+        ci_status = self._wait_for_ci(self.config.ci_timeout_minutes, head_sha)
+        ci_url_suffix = self._ci_url_suffix(ci_status, head_sha)
 
         if ci_status == "success":
             self.logger.debug(f"[{self.repo_name}] CI passed{ci_url_suffix}")
@@ -1624,8 +1842,7 @@ class Maintainer:
             f"[{self.repo_name}] CI failed after push{ci_url_suffix}, attempting to fix..."
         )
         if self.fix_ci_with_retries():
-            ci_url = self.github.get_latest_ci_run_url()
-            ci_url_suffix = f": {ci_url}" if ci_url else ""
+            ci_url_suffix = self._ci_url_suffix("success", head_sha)
             self.logger.info(f"[{self.repo_name}] CI failure fixed{ci_url_suffix}")
             return True
 
@@ -1649,6 +1866,14 @@ class Maintainer:
               STATUS_FAILED (maintenance was attempted but went wrong)
             - had_changes: whether there were changes that were committed
         """
+        try:
+            return self._maintain()
+        except WorkingTreeError as e:
+            self.logger.error(f"[{self.repo_name}] {e}")
+            return STATUS_FAILED, False
+
+    def _maintain(self) -> RepoResult:
+        """Run the maintenance workflow; see maintain() for the contract."""
         self.logger.debug(f"[{self.repo_name}] Starting maintenance")
 
         # Validate repository is ready for maintenance
@@ -1667,22 +1892,70 @@ class Maintainer:
 
         # Merge dependabot PRs on GitHub and pull changes
         merged_prs = self.merge_dependabot_prs()
+        remote_sha = None
         if merged_prs and not self.config.dry_run:
             if not self.git.pull_changes():
                 self.logger.error(
                     f"[{self.repo_name}] Failed to pull after merging dependabot PRs"
                 )
+                # The PRs are merged on GitHub with CI already running. Refresh
+                # the tracking ref (the pull may have failed before fetching)
+                # so the merge commit can still be monitored and rolled back.
+                self.git.fetch()
+                merged_sha = self.git.get_upstream_sha()
+                if merged_sha and merged_sha != baseline_sha:
+                    self._handle_post_push_ci(
+                        baseline_sha, ci_was_passing, merged_sha
+                    )
                 return STATUS_FAILED, False
+            # Track the remote's branch head rather than local HEAD: that is
+            # the commit CI runs on, and local HEAD moves off it as soon as
+            # this run commits (with push disabled it never returns to it).
+            remote_sha = self.git.get_upstream_sha()
+            if not remote_sha:
+                # Right after the pull, HEAD is still the merge commit, so it
+                # is a usable stand-in; it only drifts once this run commits.
+                self.logger.warning(
+                    f"[{self.repo_name}] Could not resolve the upstream ref; "
+                    "monitoring CI on HEAD instead"
+                )
+                remote_sha = self.git.get_head_sha()
 
+        try:
+            return self._maintain_after_merge(
+                baseline_sha, ci_was_passing, merged_prs, remote_sha
+            )
+        except WorkingTreeError:
+            # Merged dependabot PRs are already on the remote with CI running.
+            # Monitor them even though the tree could not be cleaned:
+            # fix_ci_failure refuses to run on a dirty tree, so this costs the
+            # fix path but keeps observation and rollback.
+            if remote_sha and not self._ci_monitored:
+                self._handle_post_push_ci(baseline_sha, ci_was_passing, remote_sha)
+            raise
+
+    def _maintain_after_merge(
+        self,
+        baseline_sha: Optional[str],
+        ci_was_passing: Optional[bool],
+        merged_prs: MergeResult,
+        remote_sha: Optional[str],
+    ) -> RepoResult:
+        """Update, test, commit and monitor CI; see maintain() for the contract.
+
+        Split out so a single handler in _maintain covers every WorkingTreeError
+        raised below, including those raised inside update_dependencies and
+        fix_test_with_retries rather than by the explicit resets here.
+        """
         # Update dependencies
         success, had_dep_updates = self.update_dependencies()
         if not success:
             self.logger.error(f"[{self.repo_name}] Failed to update dependencies")
-            self.git.reset_changes()
+            self._reset_changes()
             # Merged dependabot PRs are already on the remote and have
             # triggered CI; monitor it even though this run is aborting.
-            if merged_prs:
-                self._handle_post_push_ci(baseline_sha, ci_was_passing)
+            if remote_sha:
+                self._handle_post_push_ci(baseline_sha, ci_was_passing, remote_sha)
             return STATUS_FAILED, False
 
         # Only run tests if we made changes (merged PRs or updated dependencies).
@@ -1700,26 +1973,37 @@ class Maintainer:
                     self.logger.error(
                         f"[{self.repo_name}] Could not fix test failures, not committing changes"
                     )
-                    self.git.reset_changes()
+                    self._reset_changes()
                     # Merged dependabot PRs are already on the remote and have
                     # triggered CI; monitor it (fixing or rolling back on
                     # failure) even though local changes were discarded.
-                    if merged_prs:
-                        self._handle_post_push_ci(baseline_sha, ci_was_passing)
+                    if remote_sha:
+                        self._handle_post_push_ci(
+                            baseline_sha, ci_was_passing, remote_sha
+                        )
                     return STATUS_FAILED, False
 
         # Commit and push (only if we have changes)
         commit_msg = self.build_commit_message(had_dep_updates)
         success, committed_changes = self.commit_and_push(commit_msg)
         if not success:
-            self.git.reset_changes()
+            self._reset_changes()
+            # Merged dependabot PRs are on the remote with CI running even
+            # though this run's own commit never landed.
+            if remote_sha:
+                self._handle_post_push_ci(baseline_sha, ci_was_passing, remote_sha)
             return STATUS_FAILED, False
 
         # Monitor CI after push and fix failures if we caused them. Runs whenever
         # this run pushed a commit or merged a dependabot PR on GitHub, since a
         # merged PR triggers CI even when ai-maintainer made no local commit.
-        if committed_changes or merged_prs:
-            if not self._handle_post_push_ci(baseline_sha, ci_was_passing):
+        # A commit that was not pushed triggers no CI, so it is not monitored.
+        pushed_changes = committed_changes and self.config.push_changes
+        monitored_sha = self.git.get_head_sha() if pushed_changes else remote_sha
+        if monitored_sha:
+            if not self._handle_post_push_ci(
+                baseline_sha, ci_was_passing, monitored_sha
+            ):
                 return STATUS_FAILED, committed_changes
 
         if committed_changes:
@@ -1858,7 +2142,7 @@ class Maintainer:
                     f"[{self.repo_name}] AI reported no updates but modified files; "
                     "discarding changes"
                 )
-                self.git.reset_changes()
+                self._reset_changes()
             else:
                 self.logger.debug(f"[{self.repo_name}] No dependency updates needed")
             return True, False
@@ -1873,6 +2157,46 @@ class Maintainer:
             )
 
         return True, had_changes
+
+    def _is_writable(self) -> bool:
+        """Check that the repository accepts writes.
+
+        Prefers the GitHub API: `git push --dry-run` fires pre-push hooks in
+        every repository on every run, which is expensive where the hook runs
+        a test suite. Falls back to the push probe only when GitHub cannot
+        answer, e.g. a non-GitHub remote.
+        """
+        writable = self.github.get_write_access()
+        if writable is not None:
+            return writable
+        return self.git.is_writable()
+
+    def _can_commit_a_fix(self) -> bool:
+        """Whether an AI fix may be attempted.
+
+        The fix path stages and commits the whole working tree, so it must not
+        run over changes an earlier stage tried and failed to discard.
+        """
+        if self.git.is_workdir_clean():
+            return True
+        self.logger.error(
+            f"[{self.repo_name}] Working directory is not clean; refusing to "
+            "attempt a CI fix that would commit its contents"
+        )
+        return False
+
+    def _reset_changes(self) -> None:
+        """Discard uncommitted changes, aborting the repository if that fails.
+
+        Every caller discards changes precisely because they must not be kept.
+        If the discard fails the edits are still in the tree, where a later
+        stage would stage and commit them untested, so raise instead of
+        continuing on an unknown tree.
+        """
+        if not self.git.reset_changes():
+            raise WorkingTreeError(
+                "Could not discard uncommitted changes; manual cleanup required"
+            )
 
     def _ask_ai_to_fix(self, prompt: str, context: Dict[str, Any]) -> Optional[str]:
         """Ask AI to fix an error. Returns changes_made description or None if failed."""
@@ -1985,9 +2309,29 @@ class Maintainer:
                 f"rebase request failed, skipping{detail}"
             )
 
-    def _wait_for_ci(self, timeout_minutes: int) -> Optional[str]:
-        """Wait for CI to complete on the current HEAD commit."""
-        head_sha = self.git.get_head_sha()
+    def _ci_url_suffix(self, ci_status: Optional[str], head_sha: Optional[str]) -> str:
+        """Format ': <url>' for the run that produced ci_status, or ''.
+
+        On failure this must resolve the failed run rather than the latest
+        one, so the logged URL points at the run the message is about.
+        head_sha is the commit that was monitored, which is not always local
+        HEAD, so it cannot be re-derived here.
+        """
+        if ci_status == "failure":
+            # No fallback to the newest run: it may be a passing one, which
+            # would contradict the message the URL is attached to.
+            url = self.github.get_ci_run_url(
+                self.github.get_latest_failed_run_id(head_sha)
+            )
+        else:
+            url = self.github.get_latest_ci_run_url()
+        return f": {url}" if url else ""
+
+    def _wait_for_ci(
+        self, timeout_minutes: int, head_sha: Optional[str] = None
+    ) -> Optional[str]:
+        """Wait for CI to complete, defaulting to the current HEAD commit."""
+        head_sha = head_sha or self.git.get_head_sha()
         if not head_sha:
             self.logger.error(f"[{self.repo_name}] Could not get HEAD SHA")
             return None
