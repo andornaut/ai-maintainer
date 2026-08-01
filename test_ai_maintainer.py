@@ -594,6 +594,60 @@ class TestGitHubClientMergePr:
             "Co-authored-by: Alice <alice@example.com>"
         )
 
+    def test_merge_pr_strips_newlines_from_coauthor_fields(self, tmp_path):
+        calls = []
+        payload = {
+            "body": "Bumps lodash.",
+            "author": {"login": "dependabot"},
+            "commits": [
+                {
+                    "authors": [
+                        {
+                            "login": "mallory",
+                            "name": "Mal\nCo-authored-by: Fake <fake@example.com>",
+                            "email": "mal@example.com",
+                        }
+                    ]
+                }
+            ],
+        }
+        client = self._client_with_pr(tmp_path, payload, calls)
+        client.merge_pr(42)
+        merge_args = calls[-1]
+        body = merge_args[merge_args.index("--body") + 1]
+        # The forged trailer must be folded into the real one's line so git
+        # cannot parse it as a second trailer
+        trailer_lines = [
+            line for line in body.splitlines() if line.startswith("Co-authored-by:")
+        ]
+        assert len(trailer_lines) == 1
+        assert trailer_lines[0].endswith("<mal@example.com>")
+
+    def test_merge_pr_strips_angle_brackets_from_coauthor_name(self, tmp_path):
+        # An embedded "<addr>" would otherwise be read as the trailer identity
+        calls = []
+        payload = {
+            "body": "Bumps lodash.",
+            "author": {"login": "dependabot"},
+            "commits": [
+                {
+                    "authors": [
+                        {
+                            "login": "mallory",
+                            "name": "Bob <evil@example.com>",
+                            "email": "real@example.com",
+                        }
+                    ]
+                }
+            ],
+        }
+        client = self._client_with_pr(tmp_path, payload, calls)
+        client.merge_pr(42)
+        merge_args = calls[-1]
+        body = merge_args[merge_args.index("--body") + 1]
+        assert "evil@example.com" in body  # kept as inert text
+        assert body.endswith("Co-authored-by: Bob evil@example.com <real@example.com>")
+
 
 class TestMergePrsOnGithub:
     """Tests for _merge_prs_on_github method."""
@@ -706,6 +760,116 @@ class TestGitHubClientCi:
         ]
         assert gm.GitHubClient._combine_run_conclusions(runs) == "in_progress"
 
+    def test_conclusion_scoped_to_head_sha(self, tmp_path):
+        client = self._client(tmp_path)
+        client._get_runs = MagicMock(
+            return_value=[
+                {"status": "completed", "conclusion": "success", "headSha": "new"},
+                {"status": "completed", "conclusion": "failure", "headSha": "old"},
+            ]
+        )
+        assert client.get_ci_conclusion("old") == "failure"
+
+    def test_conclusion_falls_back_when_head_sha_has_no_runs(self, tmp_path):
+        client = self._client(tmp_path)
+        client._get_runs = MagicMock(
+            return_value=[
+                {"status": "completed", "conclusion": "success", "headSha": "other"},
+            ]
+        )
+        # Still non-None, so callers keep monitoring after their own push
+        assert client.get_ci_conclusion("mine") == "success"
+
+    def test_fallback_surfaces_a_pre_existing_failure(self, tmp_path):
+        # paths-filtered workflows leave most commits with no runs, so a real
+        # failure on an earlier commit must not read as an unknown-healthy
+        # baseline the tool would then answer for
+        client = self._client(tmp_path)
+        client._get_runs = MagicMock(
+            return_value=[
+                {"status": "completed", "conclusion": "failure", "headSha": "older"},
+            ]
+        )
+        assert client.get_ci_conclusion("mine") == "failure"
+
+    def test_fallback_uses_only_the_newest_commits_runs(self, tmp_path):
+        client = self._client(tmp_path)
+        client._get_runs = MagicMock(
+            return_value=[
+                {"status": "completed", "conclusion": "success", "headSha": "newer"},
+                {"status": "completed", "conclusion": "failure", "headSha": "older"},
+            ]
+        )
+        # An older commit's failure must not be attributed to the newest state
+        assert client.get_ci_conclusion("mine") == "success"
+
+    def test_conclusion_none_when_branch_has_no_runs(self, tmp_path):
+        client = self._client(tmp_path)
+        client._get_runs = MagicMock(return_value=[])
+        assert client.get_ci_conclusion("mine") is None
+
+    def test_wait_for_ci_does_not_sleep_after_the_final_poll(
+        self, tmp_path, monkeypatch
+    ):
+        client = self._client(tmp_path)
+        client._get_runs = MagicMock(return_value=[])
+        sleeps = []
+        monkeypatch.setattr(gm.time, "sleep", lambda s: sleeps.append(s))
+        # 1 minute at a 30s interval is 2 polls, so only 1 sleep between them
+        assert client.wait_for_ci("abc", 1) is None
+        assert len(sleeps) == 1
+
+    def test_combine_no_runs_is_not_success(self):
+        # This verdict gates a force push, so "no evidence" must not read as a pass
+        assert gm.GitHubClient._combine_run_conclusions([]) is None
+
+    def test_failed_run_id_skips_a_newer_successful_run(self, tmp_path):
+        client = self._client(tmp_path)
+        client._get_runs = MagicMock(
+            return_value=[
+                {"databaseId": 3, "status": "completed",
+                 "conclusion": "success", "headSha": "abc"},
+                {"databaseId": 2, "status": "completed",
+                 "conclusion": "failure", "headSha": "abc"},
+            ]
+        )
+        assert client.get_latest_failed_run_id("abc") == 2
+
+    def test_failed_run_id_prefers_the_run_for_head_sha(self, tmp_path):
+        client = self._client(tmp_path)
+        client._get_runs = MagicMock(
+            return_value=[
+                {"databaseId": 5, "status": "completed",
+                 "conclusion": "failure", "headSha": "old"},
+                {"databaseId": 4, "status": "completed",
+                 "conclusion": "failure", "headSha": "abc"},
+            ]
+        )
+        assert client.get_latest_failed_run_id("abc") == 4
+
+    def test_failed_run_id_none_when_nothing_failed(self, tmp_path):
+        client = self._client(tmp_path)
+        client._get_runs = MagicMock(
+            return_value=[
+                {"databaseId": 3, "status": "completed",
+                 "conclusion": "success", "headSha": "abc"},
+            ]
+        )
+        assert client.get_latest_failed_run_id("abc") is None
+
+    def test_failure_logs_come_from_the_failed_run(self, tmp_path):
+        client = self._client(tmp_path)
+        client.get_latest_failed_run_id = MagicMock(return_value=77)
+        calls = []
+
+        def fake_run(args):
+            calls.append(args)
+            return True, "boom", ""
+
+        client._run = fake_run
+        assert client.get_ci_failure_logs("abc") == "boom"
+        assert "77" in calls[0]
+
     def test_combine_non_success_conclusion_surfaces(self):
         runs = [
             {"status": "completed", "conclusion": "success"},
@@ -722,7 +886,7 @@ class TestGitHubClientCi:
                 {"status": "completed", "conclusion": "failure", "headSha": "old"},
             ]
         )
-        assert client.get_latest_ci_conclusion() == "failure"
+        assert client.get_ci_conclusion() == "failure"
 
     def test_latest_conclusion_all_workflows_must_pass(self, tmp_path):
         client = self._client(tmp_path)
@@ -732,7 +896,7 @@ class TestGitHubClientCi:
                 {"status": "completed", "conclusion": "success", "headSha": "new"},
             ]
         )
-        assert client.get_latest_ci_conclusion() == "success"
+        assert client.get_ci_conclusion() == "success"
 
     def test_wait_for_ci_fails_when_any_workflow_fails(self, tmp_path, monkeypatch):
         client = self._client(tmp_path)
@@ -793,11 +957,40 @@ class TestGitHubClientCi:
         limit = captured["args"][captured["args"].index("--limit") + 1]
         assert int(limit) > 1
 
-    def test_repo_url_ssh_scheme(self, tmp_path):
+    @pytest.mark.parametrize(
+        "remote",
+        [
+            "git@github.com:owner/repo.git",
+            "https://github.com/owner/repo",
+            "https://token@github.com/owner/repo.git",
+            "ssh://git@github.com/owner/repo.git",
+            "ssh://git@github.com:22/owner/repo",
+            "git://github.com/owner/repo",
+            "https://github.com/owner/repo/",
+        ],
+    )
+    def test_github_remote_forms_resolve(self, tmp_path, remote):
         git = MagicMock()
-        git.get_remote_url.return_value = "ssh://git@github.com/owner/repo.git"
+        git.get_remote_url.return_value = remote
         client = gm.GitHubClient(tmp_path, git, MagicMock())
+        assert client.owner_repo == "owner/repo"
         assert client.repo_url == "https://github.com/owner/repo"
+
+    @pytest.mark.parametrize(
+        "remote",
+        [
+            "https://gitlab.com/owner/repo.git",
+            "git@bitbucket.org:owner/repo.git",
+            "https://github.example.com/owner/repo",
+            "",
+        ],
+    )
+    def test_non_github_remotes_do_not_resolve(self, tmp_path, remote):
+        git = MagicMock()
+        git.get_remote_url.return_value = remote
+        client = gm.GitHubClient(tmp_path, git, MagicMock())
+        assert client.owner_repo is None
+        assert client.repo_url is None
 
 
 class TestUpdateDependencies:
@@ -855,6 +1048,7 @@ class TestMaintainMergedPrCiMonitoring:
             return_value=(True, True)
         )
         maintainer.git.get_head_sha = MagicMock(return_value="base123")
+        maintainer.git.get_upstream_sha = MagicMock(return_value="base123")
         maintainer.merge_dependabot_prs = MagicMock(return_value=[42])
         maintainer.git.pull_changes = MagicMock(return_value=True)
         maintainer.git.reset_changes = MagicMock(return_value=True)
@@ -871,7 +1065,9 @@ class TestMaintainMergedPrCiMonitoring:
         status, had_changes = maintainer.maintain()
         assert status == gm.STATUS_FAILED
         assert had_changes is False
-        maintainer._handle_post_push_ci.assert_called_once_with("base123", True)
+        maintainer._handle_post_push_ci.assert_called_once_with(
+            "base123", True, "base123"
+        )
 
     def test_failed_dependency_update_still_monitors_ci(
         self, repo_path, default_config
@@ -881,7 +1077,155 @@ class TestMaintainMergedPrCiMonitoring:
         status, had_changes = maintainer.maintain()
         assert status == gm.STATUS_FAILED
         assert had_changes is False
-        maintainer._handle_post_push_ci.assert_called_once_with("base123", True)
+        maintainer._handle_post_push_ci.assert_called_once_with(
+            "base123", True, "base123"
+        )
+
+
+    def test_ci_is_monitored_even_when_the_reset_fails(
+        self, repo_path, default_config
+    ):
+        # A tree that cannot be cleaned still leaves merged PRs on the remote
+        # with CI running, so observation and rollback must survive
+        maintainer = self._maintainer(repo_path, default_config)
+        maintainer.update_dependencies = MagicMock(return_value=(False, False))
+        maintainer.git.reset_changes = MagicMock(return_value=False)
+        status, _ = maintainer.maintain()
+        assert status == gm.STATUS_FAILED
+        maintainer._handle_post_push_ci.assert_called_once_with(
+            "base123", True, "base123"
+        )
+
+    def test_ci_is_monitored_when_update_dependencies_itself_raises(
+        self, repo_path, default_config
+    ):
+        # update_dependencies resets internally, so its WorkingTreeError is
+        # raised before _maintain_after_merge's own reset is reached
+        maintainer = self._maintainer(repo_path, default_config)
+        maintainer.update_dependencies = MagicMock(
+            side_effect=gm.WorkingTreeError("boom")
+        )
+        status, _ = maintainer.maintain()
+        assert status == gm.STATUS_FAILED
+        maintainer._handle_post_push_ci.assert_called_once_with(
+            "base123", True, "base123"
+        )
+
+    def test_ci_is_monitored_when_the_test_fix_raises(
+        self, repo_path, default_config
+    ):
+        maintainer = self._maintainer(repo_path, default_config)
+        maintainer.update_dependencies = MagicMock(return_value=(True, True))
+        maintainer.run_tests = MagicMock(return_value=(False, "boom"))
+        maintainer.fix_test_with_retries = MagicMock(
+            side_effect=gm.WorkingTreeError("boom")
+        )
+        status, _ = maintainer.maintain()
+        assert status == gm.STATUS_FAILED
+        maintainer._handle_post_push_ci.assert_called_once_with(
+            "base123", True, "base123"
+        )
+
+    def test_failed_pull_after_merge_still_monitors_ci(
+        self, repo_path, default_config
+    ):
+        # The PRs are squash-merged on GitHub with CI running even though the
+        # pull that would bring them local failed
+        maintainer = self._maintainer(repo_path, default_config)
+        maintainer.git.pull_changes = MagicMock(return_value=False)
+        maintainer.git.fetch = MagicMock(return_value=True)
+        maintainer.git.get_upstream_sha = MagicMock(return_value="merge456")
+        status, _ = maintainer.maintain()
+        assert status == gm.STATUS_FAILED
+        maintainer.git.fetch.assert_called_once()
+        maintainer._handle_post_push_ci.assert_called_once_with(
+            "base123", True, "merge456"
+        )
+
+    def test_failed_pull_does_not_monitor_the_unchanged_baseline(
+        self, repo_path, default_config
+    ):
+        # The pull failed before fetching, so the tracking ref still points at
+        # the pre-merge commit and there is nothing new to monitor
+        maintainer = self._maintainer(repo_path, default_config)
+        maintainer.git.pull_changes = MagicMock(return_value=False)
+        maintainer.git.fetch = MagicMock(return_value=False)
+        maintainer.git.get_upstream_sha = MagicMock(return_value="base123")
+        status, _ = maintainer.maintain()
+        assert status == gm.STATUS_FAILED
+        maintainer._handle_post_push_ci.assert_not_called()
+
+    def test_ci_is_not_monitored_twice_when_the_fix_path_raises(
+        self, repo_path, default_config
+    ):
+        # _handle_post_push_ci can raise via its own AI fix; re-entering it
+        # would spend a second full CI timeout and force push a second rollback
+        maintainer = self._maintainer(repo_path, default_config)
+        maintainer.update_dependencies = MagicMock(return_value=(True, True))
+        maintainer.run_tests = MagicMock(return_value=(True, ""))
+        maintainer.commit_and_push = MagicMock(return_value=(True, True))
+
+        def monitor(*args):
+            maintainer._ci_monitored = True
+            raise gm.WorkingTreeError("boom")
+
+        maintainer._handle_post_push_ci = MagicMock(side_effect=monitor)
+        status, _ = maintainer.maintain()
+        assert status == gm.STATUS_FAILED
+        assert maintainer._handle_post_push_ci.call_count == 1
+
+    def test_push_failure_still_monitors_merged_pr_ci(
+        self, repo_path, default_config
+    ):
+        maintainer = self._maintainer(repo_path, default_config)
+        maintainer.update_dependencies = MagicMock(return_value=(True, True))
+        maintainer.run_tests = MagicMock(return_value=(True, ""))
+        maintainer.commit_and_push = MagicMock(return_value=(False, False))
+        status, _ = maintainer.maintain()
+        assert status == gm.STATUS_FAILED
+        maintainer._handle_post_push_ci.assert_called_once_with(
+            "base123", True, "base123"
+        )
+
+    def test_unresolvable_upstream_falls_back_to_head(
+        self, repo_path, default_config
+    ):
+        # Merged PRs are on the remote; losing monitoring entirely is worse
+        # than monitoring HEAD, which is the merge commit at this point
+        maintainer = self._maintainer(repo_path, default_config)
+        maintainer.git.get_upstream_sha = MagicMock(return_value=None)
+        maintainer.update_dependencies = MagicMock(return_value=(False, False))
+        maintainer.maintain()
+        maintainer._handle_post_push_ci.assert_called_once_with(
+            "base123", True, "base123"
+        )
+
+    def test_merge_commit_is_monitored_when_push_is_disabled(
+        self, repo_path, default_config
+    ):
+        # --no-push commits locally, moving HEAD off the merge commit. CI runs
+        # on the merge commit, so monitoring HEAD would poll a SHA that has no
+        # runs until the CI timeout expires.
+        maintainer = make_maintainer(
+            repo_path, default_config, dry_run=False, push_changes=False
+        )
+        maintainer._validate_repo = MagicMock(return_value=True)
+        maintainer._check_and_fix_pre_existing_ci = MagicMock(
+            return_value=(True, True)
+        )
+        maintainer.merge_dependabot_prs = MagicMock(return_value=[42])
+        maintainer.git.pull_changes = MagicMock(return_value=True)
+        maintainer.git.get_head_sha = MagicMock(return_value="local789")
+        maintainer.git.get_upstream_sha = MagicMock(return_value="merge456")
+        maintainer.update_dependencies = MagicMock(return_value=(True, True))
+        maintainer.run_tests = MagicMock(return_value=(True, ""))
+        maintainer.commit_and_push = MagicMock(return_value=(True, True))
+        maintainer._handle_post_push_ci = MagicMock(return_value=True)
+        maintainer.maintain()
+        # The upstream SHA, not local HEAD ("local789"), is what CI runs on
+        maintainer._handle_post_push_ci.assert_called_once_with(
+            "local789", True, "merge456"
+        )
 
 
 class TestCheckAndFixPreExistingCi:
@@ -891,7 +1235,7 @@ class TestCheckAndFixPreExistingCi:
         maintainer = make_maintainer(
             repo_path, default_config, dry_run=False, push_changes=True
         )
-        maintainer.github.get_latest_ci_conclusion = MagicMock(
+        maintainer.github.get_ci_conclusion = MagicMock(
             return_value="failure"
         )
         maintainer.git.is_latest_commit_from_maintainer = MagicMock(
@@ -908,7 +1252,7 @@ class TestCheckAndFixPreExistingCi:
         maintainer = make_maintainer(
             repo_path, default_config, dry_run=False, push_changes=True
         )
-        maintainer.github.get_latest_ci_conclusion = MagicMock(
+        maintainer.github.get_ci_conclusion = MagicMock(
             return_value="failure"
         )
         maintainer.git.is_latest_commit_from_maintainer = MagicMock(
@@ -931,7 +1275,7 @@ class TestDryRunGuards:
         maintainer.agent.ask.assert_not_called()
 
     def test_pre_existing_ci_failure_not_fixed_in_dry_run(self, maintainer):
-        maintainer.github.get_latest_ci_conclusion = MagicMock(return_value="failure")
+        maintainer.github.get_ci_conclusion = MagicMock(return_value="failure")
         maintainer.git.is_latest_commit_from_maintainer = MagicMock(return_value=True)
         maintainer.fix_ci_with_retries = MagicMock()
         should_continue, _ = maintainer._check_and_fix_pre_existing_ci()
@@ -951,13 +1295,351 @@ class TestDryRunGuards:
         # push_changes=False: a pre-existing failure the tool cannot fix
         # must not fail the repo; maintenance continues without a fix attempt
         maintainer = make_maintainer(repo_path, default_config, dry_run=False)
-        maintainer.github.get_latest_ci_conclusion = MagicMock(return_value="failure")
+        maintainer.github.get_ci_conclusion = MagicMock(return_value="failure")
         maintainer.git.is_latest_commit_from_maintainer = MagicMock(return_value=True)
         maintainer.fix_ci_with_retries = MagicMock()
         should_continue, ci_was_passing = maintainer._check_and_fix_pre_existing_ci()
         assert should_continue is True
         assert ci_was_passing is False
         maintainer.fix_ci_with_retries.assert_not_called()
+
+
+class TestResetChangesEscalation:
+    """A failed checkout must escalate to a hard reset before giving up."""
+
+    def _git(self, repo_path, checkout_ok, hard_ok=True):
+        git = gm.GitClient(repo_path, MagicMock())
+        calls = []
+
+        def fake_run(args):
+            calls.append(args)
+            if args[:3] == ["git", "checkout", "--"]:
+                return checkout_ok, "", "boom"
+            if args[:3] == ["git", "reset", "--hard"]:
+                return hard_ok, "", "boom"
+            return True, "", ""
+
+        git._run = fake_run
+        return git, calls
+
+    def test_hard_reset_recovers_a_failed_checkout(self, repo_path):
+        git, calls = self._git(repo_path, checkout_ok=False)
+        assert git.reset_changes() is True
+        assert ["git", "reset", "--hard", "HEAD"] in calls
+        assert ["git", "clean", "-ffd"] in calls
+
+    def test_gives_up_when_the_hard_reset_also_fails(self, repo_path):
+        git, calls = self._git(repo_path, checkout_ok=False, hard_ok=False)
+        assert git.reset_changes() is False
+        assert ["git", "clean", "-ffd"] not in calls
+
+    def test_no_hard_reset_when_checkout_succeeds(self, repo_path):
+        git, calls = self._git(repo_path, checkout_ok=True)
+        assert git.reset_changes() is True
+        assert ["git", "reset", "--hard", "HEAD"] not in calls
+
+    def test_clean_keeps_ignored_build_state(self, repo_path):
+        # -x would delete .venv / node_modules the project needs
+        git, calls = self._git(repo_path, checkout_ok=True)
+        git.reset_changes()
+        assert not any("-ffdx" in arg for call in calls for arg in call)
+
+
+class TestFixRefusesDirtyTree:
+    """The CI fix path commits the whole tree, so it must not run over one
+    that an earlier stage failed to discard."""
+
+    def _maintainer(self, repo_path, default_config):
+        maintainer = make_maintainer(
+            repo_path, default_config, dry_run=False, push_changes=True
+        )
+        maintainer.git.is_workdir_clean = MagicMock(return_value=False)
+        return maintainer
+
+    def test_fix_ci_failure_refuses(self, repo_path, default_config):
+        maintainer = self._maintainer(repo_path, default_config)
+        maintainer._ask_ai_to_fix = MagicMock()
+        assert maintainer.fix_ci_failure("boom") is False
+        maintainer._ask_ai_to_fix.assert_not_called()
+
+    def test_fix_ci_with_retries_refuses_before_fetching_logs(
+        self, repo_path, default_config
+    ):
+        maintainer = self._maintainer(repo_path, default_config)
+        maintainer.github.get_ci_failure_logs = MagicMock()
+        assert maintainer.fix_ci_with_retries() is False
+        maintainer.github.get_ci_failure_logs.assert_not_called()
+
+    def test_clean_tree_is_allowed(self, repo_path, default_config):
+        maintainer = self._maintainer(repo_path, default_config)
+        maintainer.git.is_workdir_clean = MagicMock(return_value=True)
+        maintainer._ask_ai_to_fix = MagicMock(return_value=None)
+        maintainer.git.reset_changes = MagicMock(return_value=True)
+        assert maintainer.fix_ci_failure("boom") is False
+        maintainer._ask_ai_to_fix.assert_called_once()
+
+
+class TestGitClientRollback:
+    """rollback_to force pushes, so it must not run on a failed reset."""
+
+    def test_rollback_resets_then_force_pushes(self, repo_path, monkeypatch):
+        git = gm.GitClient(repo_path, MagicMock())
+        git.reset_hard = MagicMock(return_value=(True, "", ""))
+        pushed = []
+        monkeypatch.setattr(
+            gm,
+            "run_git",
+            lambda args, cwd, env_runner=None, timeout=None: (
+                pushed.append(args) or (True, "", "")
+            ),
+        )
+        assert git.rollback_to("deadbeefcafe") is True
+        git.reset_hard.assert_called_once_with("deadbeefcafe")
+        assert pushed == [["push", "--force"]]
+
+    def test_rollback_does_not_push_when_reset_fails(self, repo_path, monkeypatch):
+        git = gm.GitClient(repo_path, MagicMock())
+        git.reset_hard = MagicMock(return_value=(False, "", "no such commit"))
+        pushed = []
+        monkeypatch.setattr(
+            gm,
+            "run_git",
+            lambda *a, **k: pushed.append(a) or (True, "", ""),
+        )
+        assert git.rollback_to("deadbeefcafe") is False
+        assert pushed == []
+
+
+class TestWritability:
+    """Writability comes from the API, with the push probe as a fallback."""
+
+    def _client(self, tmp_path, result, remote="git@github.com:owner/repo.git"):
+        git = MagicMock()
+        git.get_remote_url.return_value = remote
+        client = gm.GitHubClient(tmp_path, git, MagicMock())
+        client.is_authenticated = True
+        client._run = MagicMock(return_value=result)
+        return client
+
+    def _view(self, **fields):
+        return True, json.dumps(fields), ""
+
+    def test_non_github_remote_is_undetermined(self, tmp_path):
+        # "owner/name" from a GitLab URL would otherwise be answered by the
+        # unrelated github.com repository of that name
+        client = self._client(
+            tmp_path,
+            self._view(isArchived=False, viewerPermission="WRITE"),
+            remote="https://gitlab.com/owner/repo.git",
+        )
+        assert client.get_write_access() is None
+        client._run.assert_not_called()
+
+    def test_repo_is_named_explicitly(self, tmp_path):
+        # gh prefers an `upstream` remote when resolving a base repo, so a
+        # fork would otherwise report the parent's READ permission
+        client = self._client(
+            tmp_path, self._view(isArchived=False, viewerPermission="WRITE")
+        )
+        client.get_write_access()
+        assert "owner/repo" in client._run.call_args[0][0]
+
+    def test_write_permission_grants_access(self, tmp_path):
+        client = self._client(
+            tmp_path, self._view(isArchived=False, viewerPermission="WRITE")
+        )
+        assert client.get_write_access() is True
+
+    def test_archived_repo_is_not_writable(self, tmp_path):
+        client = self._client(
+            tmp_path, self._view(isArchived=True, viewerPermission="ADMIN")
+        )
+        assert client.get_write_access() is False
+
+    def test_read_permission_is_not_writable(self, tmp_path):
+        client = self._client(
+            tmp_path, self._view(isArchived=False, viewerPermission="READ")
+        )
+        assert client.get_write_access() is False
+
+    def test_api_failure_is_undetermined(self, tmp_path):
+        client = self._client(tmp_path, (False, "", "boom"))
+        assert client.get_write_access() is None
+
+    def test_missing_permission_is_undetermined(self, tmp_path):
+        client = self._client(tmp_path, self._view(isArchived=False))
+        assert client.get_write_access() is None
+
+    def test_falls_back_to_push_probe_when_undetermined(
+        self, repo_path, default_config
+    ):
+        maintainer = make_maintainer(repo_path, default_config)
+        maintainer.github.get_write_access = MagicMock(return_value=None)
+        maintainer.git.is_writable = MagicMock(return_value=True)
+        assert maintainer._is_writable() is True
+        maintainer.git.is_writable.assert_called_once()
+
+    def test_api_answer_skips_the_push_probe(self, repo_path, default_config):
+        # The push probe fires pre-push hooks, so it must not run needlessly
+        maintainer = make_maintainer(repo_path, default_config)
+        maintainer.github.get_write_access = MagicMock(return_value=False)
+        maintainer.git.is_writable = MagicMock(return_value=True)
+        assert maintainer._is_writable() is False
+        maintainer.git.is_writable.assert_not_called()
+
+
+class TestFailedResetAborts:
+    """A working tree that cannot be cleaned must abort the repository."""
+
+    def test_reset_failure_raises(self, repo_path, default_config):
+        maintainer = make_maintainer(repo_path, default_config)
+        maintainer.git.reset_changes = MagicMock(return_value=False)
+        with pytest.raises(gm.WorkingTreeError):
+            maintainer._reset_changes()
+
+    def test_unreported_changes_that_cannot_be_reset_abort(
+        self, repo_path, default_config
+    ):
+        (repo_path / "package.json").write_text("{}")
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False)
+        maintainer.agent.ask_json = MagicMock(
+            return_value={"updated": False, "reasoning": "none needed"}
+        )
+        maintainer.git.is_workdir_clean = MagicMock(return_value=False)
+        maintainer.git.reset_changes = MagicMock(return_value=False)
+        with pytest.raises(gm.WorkingTreeError):
+            maintainer.update_dependencies()
+
+    def test_maintain_reports_failure_instead_of_raising(
+        self, repo_path, default_config
+    ):
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False)
+        maintainer._validate_repo = MagicMock(return_value=True)
+        maintainer._check_and_fix_pre_existing_ci = MagicMock(
+            return_value=(True, True)
+        )
+        maintainer.merge_dependabot_prs = MagicMock(return_value=[])
+        maintainer.update_dependencies = MagicMock(
+            side_effect=gm.WorkingTreeError("boom")
+        )
+        assert maintainer.maintain() == (gm.STATUS_FAILED, False)
+
+    def test_stash_is_kept_when_the_tree_cannot_be_cleaned(
+        self, repo_path, default_config
+    ):
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False)
+        maintainer.git.is_workdir_clean = MagicMock(return_value=False)
+        maintainer.git.get_stash_ref = MagicMock(side_effect=[None, "ours"])
+        maintainer.git.stash_push = MagicMock(return_value=(True, "", ""))
+        maintainer.git.stash_apply = MagicMock(return_value=(True, "", ""))
+        maintainer.git.stash_drop = MagicMock(return_value=(True, "", ""))
+        maintainer.git.reset_changes = MagicMock(return_value=False)
+        maintainer._try_fix_tests = MagicMock(return_value=False)
+        with pytest.raises(gm.WorkingTreeError):
+            maintainer.fix_test_with_retries("boom")
+        # The stash holds the only clean copy of the dependency updates left
+        maintainer.git.stash_drop.assert_not_called()
+
+
+class TestAgentClientAsk:
+    """The agent subprocess must run inside the repository it is maintaining."""
+
+    class _FakeProc:
+        pid = 1234
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            return '{"ok": true}', ""
+
+    def test_ask_runs_agent_in_the_repo(self, default_config, monkeypatch, tmp_path):
+        client = gm.AgentClient(tmp_path, "test-repo", default_config, MagicMock())
+        captured = {}
+
+        def fake_popen(cmd, **kwargs):
+            captured["kwargs"] = kwargs
+            return self._FakeProc()
+
+        monkeypatch.setattr(gm.subprocess, "Popen", fake_popen)
+        assert client.ask("do something") == '{"ok": true}'
+        assert captured["kwargs"]["cwd"] == tmp_path
+
+
+class TestFixTestWithRetriesStash:
+    """Dependency updates must survive fix attempts without touching other stashes."""
+
+    def _maintainer(self, repo_path, default_config):
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False)
+        maintainer.git.is_workdir_clean = MagicMock(return_value=False)
+        maintainer.git.stash_push = MagicMock(return_value=(True, "", ""))
+        maintainer.git.stash_apply = MagicMock(return_value=(True, "", ""))
+        maintainer.git.stash_drop = MagicMock(return_value=(True, "", ""))
+        maintainer.git.reset_changes = MagicMock(return_value=True)
+        return maintainer
+
+    def test_stash_push_includes_untracked_files(self, repo_path):
+        git = gm.GitClient(repo_path, MagicMock())
+        git._run = MagicMock(return_value=(True, "", ""))
+        git.stash_push("msg")
+        assert "-u" in git._run.call_args[0][0]
+
+    def test_aborts_when_no_stash_entry_was_created(self, repo_path, default_config):
+        maintainer = self._maintainer(repo_path, default_config)
+        # `git stash push` exits 0 without creating an entry when it has
+        # nothing to save; refs/stash still points at an unrelated stash
+        maintainer.git.get_stash_ref = MagicMock(return_value="preexisting")
+        maintainer._try_fix_tests = MagicMock(return_value=True)
+        assert maintainer.fix_test_with_retries("boom") is False
+        maintainer.git.stash_apply.assert_not_called()
+        maintainer.git.stash_drop.assert_not_called()
+        maintainer._try_fix_tests.assert_not_called()
+
+    def test_mid_loop_apply_failure_stops_instead_of_testing_wrong_tree(
+        self, repo_path, default_config
+    ):
+        # An unrestored tree would make run_tests describe a state the next
+        # attempt is not fixing, and stash apply -u aborts on existing paths
+        maintainer = self._maintainer(repo_path, default_config)
+        maintainer.git.get_stash_ref = MagicMock(side_effect=[None, "ours"])
+        maintainer.git.stash_apply = MagicMock(
+            side_effect=[(True, "", ""), (False, "", "exists")]
+        )
+        maintainer._try_fix_tests = MagicMock(return_value=False)
+        maintainer.run_tests = MagicMock()
+        assert maintainer.fix_test_with_retries("boom") is False
+        maintainer.run_tests.assert_not_called()
+        # The reset leaves the stash holding the only copy of the updates
+        maintainer.git.stash_drop.assert_not_called()
+
+    def test_applies_and_drops_only_its_own_stash(self, repo_path, default_config):
+        maintainer = self._maintainer(repo_path, default_config)
+        maintainer.git.get_stash_ref = MagicMock(side_effect=["preexisting", "ours"])
+        maintainer._try_fix_tests = MagicMock(return_value=True)
+        assert maintainer.fix_test_with_retries("boom") is True
+        maintainer.git.stash_apply.assert_called_once()
+        maintainer.git.stash_drop.assert_called_once()
+
+
+class TestCommitAndPushWithoutPush:
+    """--no-push still commits: uncommitted changes skip the repo on later runs."""
+
+    def test_commits_locally_without_pushing(
+        self, repo_path, default_config, monkeypatch
+    ):
+        maintainer = make_maintainer(
+            repo_path, default_config, dry_run=False, push_changes=False
+        )
+        maintainer.git.is_workdir_clean = MagicMock(return_value=False)
+        maintainer.git.stage_all = MagicMock(return_value=(True, "", ""))
+        maintainer.git.has_staged_changes = MagicMock(return_value=True)
+        ran = []
+
+        def fake_run_git(args, cwd, env_runner=None, timeout=None):
+            ran.append(args)
+            return True, "", ""
+
+        monkeypatch.setattr(gm, "run_git", fake_run_git)
+        assert maintainer.commit_and_push("msg") == (True, True)
+        assert ran == [["commit", "-m", "msg"]]
 
 
 class TestBuildCommitMessage:
@@ -970,6 +1652,7 @@ class TestBuildCommitMessage:
     def test_commit_message_no_changes(self, maintainer):
         msg = maintainer.build_commit_message(had_dep_updates=False)
         assert "chore: automated maintenance" in msg
+        assert "\n\n\n" not in msg
 
     def test_commit_message_fix(self, maintainer):
         msg = maintainer.build_commit_message(had_dep_updates=False, is_fix=True)
