@@ -270,6 +270,20 @@ class TestGitClient:
         )
         assert client.has_unpushed_commits() is False
 
+    def test_latest_commit_from_maintainer_squash_merge_attribution(self):
+        # A squash merge performed by this tool carries the attribution body
+        client = gm.GitClient(Path("/path/to/my-repo"), MagicMock())
+        message = f"chore(deps): bump lodash (#12)\n\n{gm.COMMIT_ATTRIBUTION}\n"
+        client._run = MagicMock(return_value=(True, message, ""))
+        assert client.is_latest_commit_from_maintainer() is True
+
+    def test_latest_commit_not_from_maintainer_without_attribution(self):
+        # A human squash merge of a dependabot PR has no attribution body
+        client = gm.GitClient(Path("/path/to/my-repo"), MagicMock())
+        message = "chore(deps): bump lodash from 1.0.0 to 1.0.1 (#12)\n"
+        client._run = MagicMock(return_value=(True, message, ""))
+        assert client.is_latest_commit_from_maintainer() is False
+
 
 class TestFindRepos:
     """Tests for find_repos function."""
@@ -482,6 +496,26 @@ class TestRunGit:
         monkeypatch.setattr(gm, "run_shell_command", fake_run_shell_command)
         assert client.pull_changes() is True
         assert shell == ["nvm use && git pull"]
+
+
+class TestGitHubClientMergePr:
+    """merge_pr stamps the squash commit so later runs can recognize it."""
+
+    def test_merge_pr_sets_attribution_body(self, tmp_path):
+        client = gm.GitHubClient(tmp_path, MagicMock(), MagicMock())
+        captured = {}
+
+        def fake_run(args):
+            captured["args"] = args
+            return True, "", ""
+
+        client._run = fake_run
+        success, error = client.merge_pr(42)
+        assert success is True
+        assert error == ""
+        args = captured["args"]
+        assert "--squash" in args
+        assert args[args.index("--body") + 1] == gm.COMMIT_ATTRIBUTION
 
 
 class TestMergePrsOnGithub:
