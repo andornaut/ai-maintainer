@@ -240,23 +240,37 @@ class ProjectEnvironment:
 
     def _detect(self):
         """Detect project type and configure environment."""
+        toolchain = self._detect_toolchain_runner()
+        venv = self._detect_venv_runner()
+        # One repo can need both (maturin ships a Cargo.toml beside a venv; a
+        # Go repo may keep one for pre-commit), so the two compose rather than
+        # one displacing the other. Only a prefix ending in `&&` can be chained
+        # onto: `pipenv run`/`poetry run` prepend a command instead, and they
+        # manage their own virtualenv, so there is nothing to compose there.
+        if toolchain and venv and toolchain.endswith("&&"):
+            self._env_runner = f"{toolchain} {venv}"
+        else:
+            self._env_runner = toolchain or venv
+
+    def _detect_toolchain_runner(self) -> Optional[str]:
+        """Detect the version manager or toolchain PATH for the project type."""
+        p = self.repo_path
         # Node.js projects (.nvmrc)
-        if (self.repo_path / ".nvmrc").exists():
-            self._env_runner = self._detect_node_runner()
+        if (p / ".nvmrc").exists():
+            return self._detect_node_runner()
         # Ruby projects (Gemfile or .ruby-version)
-        elif (self.repo_path / "Gemfile").exists() or (
-            self.repo_path / ".ruby-version"
-        ).exists():
-            self._env_runner = self._detect_ruby_runner()
-        # Python projects (pipenv, poetry, or an in-repo virtualenv)
-        elif self._is_python_project():
-            self._env_runner = self._detect_python_runner()
+        if (p / "Gemfile").exists() or (p / ".ruby-version").exists():
+            return self._detect_ruby_runner()
+        # Python projects (pipenv or poetry)
+        if (p / "Pipfile").exists() or (p / "poetry.lock").exists():
+            return self._detect_python_runner()
         # Go projects (go.mod)
-        elif (self.repo_path / "go.mod").exists():
-            self._env_runner = self._detect_go_runner()
+        if (p / "go.mod").exists():
+            return self._detect_go_runner()
         # Rust projects (Cargo.toml)
-        elif (self.repo_path / "Cargo.toml").exists():
-            self._env_runner = self._detect_cargo_runner()
+        if (p / "Cargo.toml").exists():
+            return self._detect_cargo_runner()
+        return None
 
     def _detect_node_runner(self) -> Optional[str]:
         """Detect Node.js version manager (nvm or fnm)."""
@@ -273,26 +287,16 @@ class ProjectEnvironment:
         for nvm_path in nvm_paths:
             expanded_path = Path(nvm_path).expanduser()
             if expanded_path.exists():
-                return f"source {expanded_path} && nvm use &&"
+                return f"source {shlex.quote(str(expanded_path))} && nvm use &&"
 
         return None
 
-    def _is_python_project(self) -> bool:
-        """Whether _detect_python_runner has something to activate.
-
-        Must cover everything that method looks for. Gating only on
-        Pipfile/poetry.lock made its virtualenv branch unreachable, leaving
-        venv-only projects running against the ambient interpreter.
-        """
-        p = self.repo_path
-        if (p / "Pipfile").exists() or (p / "poetry.lock").exists():
-            return True
-        return any(
-            (p / venv_dir / "bin" / "activate").exists() for venv_dir in VENV_DIRS
-        )
-
     def _detect_python_runner(self) -> Optional[str]:
-        """Detect Python environment runner (pipenv, poetry, or venv)."""
+        """Detect the Python dependency manager (pipenv or poetry).
+
+        A bare virtualenv is handled by _detect's fall-through, not here, so
+        pipenv and poetry (which manage their own virtualenv) take precedence.
+        """
         p = self.repo_path
 
         # Pipenv
@@ -303,9 +307,12 @@ class ProjectEnvironment:
         if (p / "poetry.lock").exists():
             return "poetry run"
 
-        # Virtual environment
+        return None
+
+    def _detect_venv_runner(self) -> Optional[str]:
+        """Activate a project-local virtualenv, if the project has one."""
         for venv_dir in VENV_DIRS:
-            activate = p / venv_dir / "bin" / "activate"
+            activate = self.repo_path / venv_dir / "bin" / "activate"
             if activate.exists():
                 return f"source {venv_dir}/bin/activate &&"
 
@@ -342,7 +349,7 @@ class ProjectEnvironment:
         # rustup writes an env script that puts cargo on PATH
         cargo_env = Path("~/.cargo/env").expanduser()
         if cargo_env.exists():
-            return f"source {cargo_env} &&"
+            return f"source {shlex.quote(str(cargo_env))} &&"
 
         cargo_bin = Path("~/.cargo/bin").expanduser()
         if (cargo_bin / "cargo").exists():
@@ -357,7 +364,9 @@ class ProjectEnvironment:
             return None
 
         try:
-            ruby_version = ruby_version_file.read_text().strip()
+            # Repo content interpolated into a shell command, so it must be
+            # quoted: an unquoted `3.2.0; curl ... | sh` would execute.
+            ruby_version = shlex.quote(ruby_version_file.read_text().strip())
         except (OSError, UnicodeDecodeError):
             return None
 
@@ -371,10 +380,12 @@ class ProjectEnvironment:
         for chruby_path in chruby_paths:
             expanded_path = Path(chruby_path).expanduser()
             if expanded_path.exists():
+                chruby_sh = shlex.quote(str(expanded_path))
                 auto_path = expanded_path.parent / "auto.sh"
                 if auto_path.exists():
-                    return f"source {expanded_path} && source {auto_path} && chruby {ruby_version} &&"
-                return f"source {expanded_path} && chruby {ruby_version} &&"
+                    auto_sh = shlex.quote(str(auto_path))
+                    return f"source {chruby_sh} && source {auto_sh} && chruby {ruby_version} &&"
+                return f"source {chruby_sh} && chruby {ruby_version} &&"
 
         # Try rbenv
         if shutil.which("rbenv"):
@@ -1624,11 +1635,12 @@ class Maintainer:
                 if has_stash:
                     success, _, stderr = self.git.stash_apply()
                     if not success:
-                        self.logger.error(
-                            f"[{self.repo_name}] Failed to restore dependency updates: {stderr}"
-                        )
                         # Keep the stash: the reset below leaves it holding the
-                        # only copy of the dependency updates
+                        # only copy of the dependency updates, so say where it is
+                        self.logger.error(
+                            f"[{self.repo_name}] Failed to restore dependency "
+                            f"updates: {stderr}. They are kept in `git stash list`"
+                        )
                         has_stash = False
                         self._reset_changes()
                         return False
@@ -1646,10 +1658,12 @@ class Maintainer:
                         success, _, stderr = self.git.stash_apply()
                         if not success:
                             # Without the updates restored, run_tests would
-                            # describe a tree the next attempt is not fixing
+                            # describe a tree the next attempt is not fixing.
+                            # Keep the stash, and say where it is.
                             self.logger.error(
                                 f"[{self.repo_name}] Failed to restore "
-                                f"dependency updates: {stderr}"
+                                f"dependency updates: {stderr}. They are kept "
+                                "in `git stash list`"
                             )
                             has_stash = False
                             self._reset_changes()
@@ -1837,14 +1851,19 @@ class Maintainer:
             return True
 
         ci_status = self._wait_for_ci(self.config.ci_timeout_minutes, head_sha)
-        ci_url_suffix = self._ci_url_suffix(ci_status, head_sha)
 
+        # Resolved per branch rather than once up front: each call costs a
+        # `gh run list`, and the branches below that return early never use it.
         if ci_status == "success":
-            self.logger.debug(f"[{self.repo_name}] CI passed{ci_url_suffix}")
+            if self.logger.isEnabledFor(logging.DEBUG):
+                suffix = self._ci_url_suffix(ci_status, head_sha)
+                self.logger.debug(f"[{self.repo_name}] CI passed{suffix}")
             return True
 
         if ci_status != "failure":
             return True  # Unknown status, don't fail
+
+        ci_url_suffix = self._ci_url_suffix(ci_status, head_sha)
 
         if not ci_was_passing:
             self.logger.warning(
@@ -2294,6 +2313,10 @@ class Maintainer:
                         f"[{self.repo_name}] PR #{pr_num} merged on GitHub"
                     )
                 merged_prs.append(pr_num)
+            # gh's reason line reads "the merge commit cannot be cleanly
+            # created"; the "merge conflicts" text comes from the resolution
+            # hint it prints, which it emits only for a conflicted PR (not for
+            # one that is merely blocked or behind).
             elif "merge conflict" in error.lower():
                 self._rebase_conflicted_pr(pr_num)
             else:
