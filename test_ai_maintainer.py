@@ -135,6 +135,8 @@ class TestProjectEnvironment:
         )
 
     def test_pipenv_takes_precedence_over_venv(self, tmp_path):
+        # `pipenv run` prepends a command rather than ending in `&&`, so it
+        # cannot be composed with a venv prefix; it manages its own anyway
         (tmp_path / "Pipfile").write_text("[packages]")
         self._make_venv(tmp_path)
         assert gm.ProjectEnvironment(tmp_path).env_runner == "pipenv run"
@@ -142,6 +144,53 @@ class TestProjectEnvironment:
     def test_no_venv_and_no_manager_is_undetected(self, tmp_path):
         (tmp_path / "pyproject.toml").write_text("[project]\nname = 'x'\n")
         assert gm.ProjectEnvironment(tmp_path).env_runner is None
+
+    def test_toolchain_and_venv_compose(self, tmp_path, monkeypatch):
+        # A Go repo that also keeps a venv (e.g. for pre-commit) needs both
+        # activated, so neither prefix may displace the other
+        (tmp_path / "go.mod").write_text("module example.com/foo\n")
+        self._make_venv(tmp_path)
+        monkeypatch.setattr(gm.shutil, "which", lambda name: None)
+        real_exists = Path.exists
+        monkeypatch.setattr(
+            Path,
+            "exists",
+            lambda self: str(self).endswith("/usr/local/go/bin/go")
+            or real_exists(self),
+        )
+        assert gm.ProjectEnvironment(tmp_path).env_runner == (
+            'export PATH="/usr/local/go/bin:$HOME/go/bin:$PATH" && '
+            "source .venv/bin/activate &&"
+        )
+
+    def test_venv_is_used_when_the_toolchain_needs_no_activation(
+        self, tmp_path, monkeypatch
+    ):
+        # A maturin-style repo: Cargo.toml plus a venv the Python tests need.
+        # cargo is already on PATH, so _detect_cargo_runner has nothing to
+        # activate and the venv must not be skipped on its account.
+        (tmp_path / "Cargo.toml").write_text("[package]\nname = 'x'\n")
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'x'\n")
+        self._make_venv(tmp_path)
+        monkeypatch.setattr(gm.shutil, "which", lambda name: f"/usr/bin/{name}")
+        assert (
+            gm.ProjectEnvironment(tmp_path).env_runner
+            == "source .venv/bin/activate &&"
+        )
+
+    def test_ruby_version_is_shell_quoted(self, tmp_path, monkeypatch):
+        # .ruby-version is repo content interpolated into a shell command
+        (tmp_path / ".ruby-version").write_text("3.2.0; touch /tmp/pwned\n")
+        real_exists = Path.exists
+        monkeypatch.setattr(
+            Path,
+            "exists",
+            lambda self: str(self) == "/usr/local/share/chruby/chruby.sh"
+            or real_exists(self),
+        )
+        env_runner = gm.ProjectEnvironment(tmp_path).env_runner
+        assert env_runner.startswith("source /usr/local/share/chruby/chruby.sh &&")
+        assert env_runner.endswith("chruby '3.2.0; touch /tmp/pwned' &&")
 
     def test_go_detection_no_crash(self, tmp_path):
         (tmp_path / "go.mod").write_text("module example.com/foo\n")
@@ -696,6 +745,25 @@ class TestGitHubClientMergePr:
 class TestMergePrsOnGithub:
     """Tests for _merge_prs_on_github method."""
 
+    # gh's stderr for a PR whose mergeStateStatus is DIRTY. The conflict hint
+    # is what carries the "merge conflicts" text the rebase path keys on; gh
+    # prints it only for DIRTY, so a blocked or behind PR looks like the
+    # GH_BLOCKED_STDERR below and must not be sent a rebase request.
+    GH_CONFLICT_STDERR = (
+        "X Pull request #5 is not mergeable: the merge commit cannot be "
+        "cleanly created.\n"
+        "To have the pull request merged after all the requirements have "
+        "been met, add the `--auto` flag.\n"
+        "Run the following to resolve the merge conflicts locally:\n"
+        "  gh pr checkout 5 && git fetch origin main && git merge origin/main"
+    )
+    GH_BLOCKED_STDERR = (
+        "X Pull request #7 is not mergeable: the base branch policy prohibits "
+        "the merge.\n"
+        "To have the pull request merged after all the requirements have "
+        "been met, add the `--auto` flag."
+    )
+
     def test_dry_run_skips_merge(self, maintainer):
         assert maintainer._merge_prs_on_github([1, 2]) == [1, 2]
 
@@ -718,10 +786,7 @@ class TestMergePrsOnGithub:
     def test_merge_conflict_triggers_rebase(self, repo_path, default_config):
         maintainer = make_maintainer(repo_path, default_config, dry_run=False)
         maintainer.github.merge_pr = MagicMock(
-            return_value=(
-                False,
-                "GraphQL: Pull Request has merge conflicts (mergePullRequest)",
-            )
+            return_value=(False, self.GH_CONFLICT_STDERR)
         )
         maintainer.github.get_recent_pr_comment_bodies = MagicMock(return_value=[])
         maintainer.github.comment_pr = MagicMock(return_value=(True, ""))
@@ -735,10 +800,7 @@ class TestMergePrsOnGithub:
     ):
         maintainer = make_maintainer(repo_path, default_config, dry_run=False)
         maintainer.github.merge_pr = MagicMock(
-            return_value=(
-                False,
-                "GraphQL: Pull Request has merge conflicts (mergePullRequest)",
-            )
+            return_value=(False, self.GH_CONFLICT_STDERR)
         )
         maintainer.github.get_recent_pr_comment_bodies = MagicMock(
             return_value=["please review", gm.DEPENDABOT_REBASE_COMMAND]
@@ -761,7 +823,7 @@ class TestMergePrsOnGithub:
     ):
         maintainer = make_maintainer(repo_path, default_config, dry_run=False)
         maintainer.github.merge_pr = MagicMock(
-            return_value=(False, "merge blocked by branch protection")
+            return_value=(False, self.GH_BLOCKED_STDERR)
         )
         maintainer.github.comment_pr = MagicMock(return_value=True)
         assert maintainer._merge_prs_on_github([7]) == []
@@ -1210,6 +1272,18 @@ class TestMaintainMergedPrCiMonitoring:
         maintainer._ci_url_suffix = MagicMock(return_value="")
         assert maintainer._handle_post_push_ci("base", True, "sha") is True
         assert maintainer._ci_monitored is True
+
+    def test_unknown_ci_status_does_not_resolve_a_run_url(
+        self, repo_path, default_config
+    ):
+        # Resolving the URL costs a `gh run list`, and this path never logs it
+        maintainer = make_maintainer(
+            repo_path, default_config, dry_run=False, push_changes=True
+        )
+        maintainer._wait_for_ci = MagicMock(return_value=None)
+        maintainer._ci_url_suffix = MagicMock(return_value="")
+        assert maintainer._handle_post_push_ci("base", True, "sha") is True
+        maintainer._ci_url_suffix.assert_not_called()
 
     def test_ci_is_not_monitored_twice_when_the_fix_path_raises(
         self, repo_path, default_config
