@@ -3058,6 +3058,19 @@ class TestEveryFailureVerdictIsActionable:
         )
         assert client.get_ci_failure_logs("abc") == "boom"
 
+    @pytest.mark.parametrize("conclusion", gm.FAILING_CHECK_CONCLUSIONS)
+    def test_every_conclusion_the_verdict_calls_a_failure(
+        self, tmp_path, conclusion
+    ):
+        # A run selected here has to match what _combine_check_runs treats as
+        # a failure, or a verdict is acted on with no log to act on it with
+        client = self._client(
+            tmp_path,
+            [{"databaseId": 1, "status": "completed",
+              "conclusion": conclusion, "headSha": "abc"}],
+        )
+        assert client.get_ci_failure_logs("abc") == "boom"
+
     def test_a_workflow_that_failed_before_running_a_job(self, tmp_path):
         # No job means no log, so the fault has to be described instead
         client = self._client(
