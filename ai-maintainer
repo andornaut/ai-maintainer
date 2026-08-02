@@ -1303,12 +1303,19 @@ class GitHubClient:
         A push can trigger several workflows, so the most recent run is not
         necessarily the one that failed; selecting on recency alone can hand
         the logs of a green build to the AI fix path.
+
+        A run counts as failed on the same conclusions a check does
+        (FAILING_CHECK_CONCLUSIONS). Narrowing it here would leave a verdict
+        the fix path cannot act on: a run that concluded 'timed_out' makes
+        _combine_check_runs report a failure, and its log exists and is worth
+        reading, so it must be selectable.
         """
         runs = self._get_runs(10, "databaseId,status,conclusion,headSha")
         failed = [
             r
             for r in runs
-            if r.get("status") == "completed" and r.get("conclusion") == "failure"
+            if r.get("status") == "completed"
+            and r.get("conclusion") in FAILING_CHECK_CONCLUSIONS
         ]
         if not failed:
             return None
