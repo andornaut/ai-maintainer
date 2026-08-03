@@ -6,6 +6,7 @@ import importlib.machinery
 # Import the module (it's an executable without .py extension)
 import importlib.util
 import json
+import logging
 import shlex
 import sys
 from pathlib import Path
@@ -481,12 +482,15 @@ class TestGetDefaultBranch:
     """origin/HEAD names the default branch, but it can be stale and the name
     it carries can contain slashes."""
 
-    def _git(self, repo_path, symbolic_ref, *branches):
+    def _git(self, repo_path, symbolic_ref, *branches, refs_readable=True):
         git = gm.GitClient(repo_path, MagicMock())
+        git.logger = logging.getLogger("ai_maintainer")
         listing = "".join(f"refs/remotes/origin/{b}\n" for b in branches)
 
         def fake_run(args):
             if args[:2] == ["git", "for-each-ref"]:
+                if not refs_readable:
+                    return False, "", "Command timed out after 120s"
                 return True, listing, ""
             if args[:2] == ["git", "symbolic-ref"]:
                 return (True, symbolic_ref, "") if symbolic_ref else (False, "", "")
@@ -525,6 +529,29 @@ class TestGetDefaultBranch:
         # _validate_repo skips the repository rather than guessing
         git = self._git(repo_path, None)
         assert git.get_default_branch() is None
+
+    def test_a_listing_that_could_not_be_read_is_not_an_empty_one(
+        self, repo_path, caplog
+    ):
+        # origin/HEAD names a real branch here, so the only thing that can
+        # reject it is the listing being read as empty rather than as unread
+        git = self._git(
+            repo_path, "refs/remotes/origin/main\n", "main", refs_readable=False
+        )
+        with caplog.at_level("WARNING"):
+            assert git.get_default_branch() is None
+        # Both outcomes skip the repository, so the reason is all the operator
+        # has to tell a failing git command from a repository without a main
+        assert "Could not read the remote's refs" in caplog.text
+        assert "timed out" in caplog.text
+
+    def test_a_repository_without_main_or_master_says_so_quietly(
+        self, repo_path, caplog
+    ):
+        git = self._git(repo_path, None, "trunk")
+        with caplog.at_level("WARNING"):
+            assert git.get_default_branch() is None
+        assert "Could not read the remote's refs" not in caplog.text
 
     def test_the_listing_is_read_with_plumbing(self, repo_path):
         # `git branch -r` is porcelain: a user's column.ui reflows it into
