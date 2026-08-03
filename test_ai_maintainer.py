@@ -122,13 +122,15 @@ class TestProjectEnvironment:
         """
         real_exists = Path.exists
         wanted = {str(p) for p in paths}
-        repo = f"{repo_path}/"
+        repo, root = f"{repo_path}/", str(repo_path)
+        # **kwargs so a detector that passes follow_symlinks (3.12+) misses a
+        # path rather than raising, and the root itself counts as in-repo
         monkeypatch.setattr(
             Path,
             "exists",
-            lambda self: (
-                real_exists(self)
-                if str(self).startswith(repo)
+            lambda self, **kwargs: (
+                real_exists(self, **kwargs)
+                if str(self) == root or str(self).startswith(repo)
                 else str(self) in wanted
             ),
         )
@@ -205,8 +207,8 @@ class TestProjectEnvironment:
         monkeypatch.setattr(
             Path,
             "exists",
-            lambda self: str(self).endswith("/usr/local/go/bin/go")
-            or real_exists(self),
+            lambda self, **kwargs: str(self).endswith("/usr/local/go/bin/go")
+            or real_exists(self, **kwargs),
         )
         assert gm.ProjectEnvironment(tmp_path).env_runner == (
             'export PATH="/usr/local/go/bin:$HOME/go/bin:$PATH" && '
@@ -233,8 +235,8 @@ class TestProjectEnvironment:
         monkeypatch.setattr(
             Path,
             "exists",
-            lambda self: str(self) == "/usr/local/share/chruby/chruby.sh"
-            or real_exists(self),
+            lambda self, **kwargs: str(self) == "/usr/local/share/chruby/chruby.sh"
+            or real_exists(self, **kwargs),
         )
 
     def test_a_plain_ruby_version_activates_chruby(self, tmp_path, monkeypatch):
@@ -302,8 +304,8 @@ class TestProjectEnvironment:
         monkeypatch.setattr(
             Path,
             "exists",
-            lambda self: str(self).endswith("/usr/local/go/bin/go")
-            or real_exists(self),
+            lambda self, **kwargs: str(self).endswith("/usr/local/go/bin/go")
+            or real_exists(self, **kwargs),
         )
         env = gm.ProjectEnvironment(tmp_path)
         assert (
@@ -3098,6 +3100,11 @@ class TestNoPassWithoutEvidence:
             ([completed("success")], "success"),
             ([completed("success"), completed("skipped", "b")], "success"),
             ([completed("success"), completed("neutral", "b")], "success"),
+            # An `if:`-skipped job is commonly the first check on a commit,
+            # so a verdict that reads position rather than the whole set
+            # would answer "skipped" for a build that passed
+            ([completed("skipped"), completed("success", "b")], "success"),
+            ([completed("neutral"), completed("success", "b")], "success"),
             ([completed("success"), pending("b")], "in_progress"),
             ([completed("success"), pending("b", status="queued")], "in_progress"),
             ([completed("success"), completed("failure", "b")], "failure"),
