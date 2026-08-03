@@ -746,9 +746,17 @@ class GitClient:
         Updates origin/HEAD from remote, then reads the symbolic-ref.
         Falls back to checking for common branch names.
         """
-        # Get list of remote branches for validation
+        # Remote branches as a set of exact names. Membership must not be a
+        # substring test against the raw listing: `origin/rel` would then be
+        # satisfied by `origin/release`, and `origin/main` by `origin/main-old`,
+        # naming a branch that does not exist. The `origin/HEAD -> origin/main`
+        # line is a symref rather than a branch and drops out on its own.
         success, stdout, _ = self._run(["git", "branch", "-r"])
-        remote_branches = stdout.strip() if success else ""
+        remote_branches = (
+            {line.strip() for line in stdout.splitlines() if line.strip()}
+            if success
+            else set()
+        )
 
         # Try to update origin/HEAD from remote (requires network)
         self._run(["git", "remote", "set-head", "origin", "--auto"])

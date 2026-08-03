@@ -497,6 +497,27 @@ class TestGetDefaultBranch:
         git = self._git(repo_path, "refs/remotes/origin/gone\n", "  origin/main\n")
         assert git.get_default_branch() == "main"
 
+    def test_a_longer_branch_name_does_not_satisfy_the_stale_ref_guard(
+        self, repo_path
+    ):
+        # origin/rel is not origin/release, and the guard exists precisely to
+        # reject a branch the remote does not have
+        git = self._git(repo_path, "refs/remotes/origin/rel\n", "  origin/release\n")
+        assert git.get_default_branch() is None
+
+    def test_a_longer_branch_name_does_not_satisfy_the_fallback(self, repo_path):
+        # Neither main nor master is here, only a name that starts like one
+        git = self._git(repo_path, None, "  origin/develop\n  origin/main-old\n")
+        assert git.get_default_branch() is None
+
+    def test_the_origin_head_line_is_not_itself_a_branch(self, repo_path):
+        # `git branch -r` prints "origin/HEAD -> origin/main"; the arrow line
+        # is a symref, so it cannot stand in for the branch it points at
+        git = self._git(
+            repo_path, None, "  origin/HEAD -> origin/main\n  origin/trunk\n"
+        )
+        assert git.get_default_branch() is None
+
     def test_main_is_preferred_over_master(self, repo_path):
         git = self._git(repo_path, None, "  origin/main\n  origin/master\n")
         assert git.get_default_branch() == "main"
