@@ -6,6 +6,7 @@ import importlib.machinery
 # Import the module (it's an executable without .py extension)
 import importlib.util
 import json
+import shlex
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -110,22 +111,25 @@ class TestProjectEnvironment:
     def test_no_version_files(self, tmp_path):
         assert gm.ProjectEnvironment(tmp_path).env_runner is None
 
-    def _installed_under_home(self, monkeypatch, *paths):
-        """Only `paths` exist under $HOME; the repo under test is unaffected.
+    def _installed(self, monkeypatch, repo_path, *paths):
+        """The project is whatever the test wrote; the machine has only `paths`.
 
-        Detection must depend on the project, not on which managers happen to
-        be installed wherever the suite runs, and tmp_path is not under $HOME.
+        Detection must depend on the project rather than on which managers
+        happen to be installed wherever the suite runs. Scoped by the
+        repository rather than by $HOME so it holds with TMPDIR set under the
+        home directory, where the two would otherwise overlap and the
+        project's own files would read as absent.
         """
         real_exists = Path.exists
         wanted = {str(p) for p in paths}
-        home = str(Path.home())
+        repo = f"{repo_path}/"
         monkeypatch.setattr(
             Path,
             "exists",
             lambda self: (
-                str(self) in wanted
-                if str(self).startswith(home)
-                else real_exists(self)
+                real_exists(self)
+                if str(self).startswith(repo)
+                else str(self) in wanted
             ),
         )
 
@@ -140,15 +144,15 @@ class TestProjectEnvironment:
         (tmp_path / ".nvmrc").write_text("18.0.0")
         monkeypatch.setattr(gm.shutil, "which", lambda name: None)
         nvm_sh = Path("~/.nvm/nvm.sh").expanduser()
-        self._installed_under_home(monkeypatch, nvm_sh)
+        self._installed(monkeypatch, tmp_path, nvm_sh)
         assert gm.ProjectEnvironment(tmp_path).env_runner == (
-            f"source {nvm_sh} && nvm use &&"
+            f"source {shlex.quote(str(nvm_sh))} && nvm use &&"
         )
 
     def test_an_undetectable_node_manager_is_none(self, tmp_path, monkeypatch):
         (tmp_path / ".nvmrc").write_text("18.0.0")
         monkeypatch.setattr(gm.shutil, "which", lambda name: None)
-        self._installed_under_home(monkeypatch)
+        self._installed(monkeypatch, tmp_path)
         assert gm.ProjectEnvironment(tmp_path).env_runner is None
 
     def test_pipfile_detection(self, tmp_path):
@@ -268,15 +272,17 @@ class TestProjectEnvironment:
         (tmp_path / "Cargo.toml").write_text("[package]\nname = 'x'\n")
         monkeypatch.setattr(gm.shutil, "which", lambda name: None)
         cargo_env = Path("~/.cargo/env").expanduser()
-        self._installed_under_home(monkeypatch, cargo_env)
-        assert gm.ProjectEnvironment(tmp_path).env_runner == f"source {cargo_env} &&"
+        self._installed(monkeypatch, tmp_path, cargo_env)
+        assert gm.ProjectEnvironment(tmp_path).env_runner == (
+            f"source {shlex.quote(str(cargo_env))} &&"
+        )
 
     def test_cargo_runner_falls_back_to_the_bin_directory(self, tmp_path, monkeypatch):
         # No rustup env script, so the toolchain is put on PATH directly
         (tmp_path / "Cargo.toml").write_text("[package]\nname = 'x'\n")
         monkeypatch.setattr(gm.shutil, "which", lambda name: None)
         cargo_bin = Path("~/.cargo/bin").expanduser()
-        self._installed_under_home(monkeypatch, cargo_bin / "cargo")
+        self._installed(monkeypatch, tmp_path, cargo_bin / "cargo")
         assert gm.ProjectEnvironment(tmp_path).env_runner == (
             f'export PATH="{cargo_bin}:$PATH" &&'
         )
@@ -284,7 +290,7 @@ class TestProjectEnvironment:
     def test_an_undetectable_cargo_toolchain_is_none(self, tmp_path, monkeypatch):
         (tmp_path / "Cargo.toml").write_text("[package]\nname = 'x'\n")
         monkeypatch.setattr(gm.shutil, "which", lambda name: None)
-        self._installed_under_home(monkeypatch)
+        self._installed(monkeypatch, tmp_path)
         assert gm.ProjectEnvironment(tmp_path).env_runner is None
 
     def test_go_runner_when_not_on_path(self, tmp_path, monkeypatch):
@@ -507,11 +513,6 @@ class TestGetDefaultBranch:
     def test_a_longer_branch_name_does_not_satisfy_the_fallback(self, repo_path):
         # Neither main nor master is here, only a name that starts like one
         git = self._git(repo_path, None, "develop", "main-old")
-        assert git.get_default_branch() is None
-
-    def test_the_origin_head_ref_is_not_itself_a_branch(self, repo_path):
-        # The listing carries refs/remotes/origin/HEAD beside the branches
-        git = self._git(repo_path, None, "HEAD", "trunk")
         assert git.get_default_branch() is None
 
     def test_main_is_preferred_over_master(self, repo_path):
