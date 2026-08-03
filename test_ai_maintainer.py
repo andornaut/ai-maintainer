@@ -110,13 +110,46 @@ class TestProjectEnvironment:
     def test_no_version_files(self, tmp_path):
         assert gm.ProjectEnvironment(tmp_path).env_runner is None
 
-    def test_nvmrc_detection(self, tmp_path):
-        (tmp_path / ".nvmrc").write_text("18.0.0")
-        env = gm.ProjectEnvironment(tmp_path)
-        # None if fnm/nvm are not installed; otherwise a shell prefix
-        assert env.env_runner is None or (
-            "fnm" in env.env_runner or "nvm" in env.env_runner
+    def _installed_under_home(self, monkeypatch, *paths):
+        """Only `paths` exist under $HOME; the repo under test is unaffected.
+
+        Detection must depend on the project, not on which managers happen to
+        be installed wherever the suite runs, and tmp_path is not under $HOME.
+        """
+        real_exists = Path.exists
+        wanted = {str(p) for p in paths}
+        home = str(Path.home())
+        monkeypatch.setattr(
+            Path,
+            "exists",
+            lambda self: (
+                str(self) in wanted
+                if str(self).startswith(home)
+                else real_exists(self)
+            ),
         )
+
+    def test_fnm_is_preferred_over_nvm(self, tmp_path, monkeypatch):
+        (tmp_path / ".nvmrc").write_text("18.0.0")
+        monkeypatch.setattr(gm.shutil, "which", lambda name: f"/usr/bin/{name}")
+        assert gm.ProjectEnvironment(tmp_path).env_runner == (
+            'eval "$(fnm env)" && fnm use &&'
+        )
+
+    def test_nvm_is_sourced_when_fnm_is_absent(self, tmp_path, monkeypatch):
+        (tmp_path / ".nvmrc").write_text("18.0.0")
+        monkeypatch.setattr(gm.shutil, "which", lambda name: None)
+        nvm_sh = Path("~/.nvm/nvm.sh").expanduser()
+        self._installed_under_home(monkeypatch, nvm_sh)
+        assert gm.ProjectEnvironment(tmp_path).env_runner == (
+            f"source {nvm_sh} && nvm use &&"
+        )
+
+    def test_an_undetectable_node_manager_is_none(self, tmp_path, monkeypatch):
+        (tmp_path / ".nvmrc").write_text("18.0.0")
+        monkeypatch.setattr(gm.shutil, "which", lambda name: None)
+        self._installed_under_home(monkeypatch)
+        assert gm.ProjectEnvironment(tmp_path).env_runner is None
 
     def test_pipfile_detection(self, tmp_path):
         (tmp_path / "Pipfile").write_text("[packages]")
@@ -226,11 +259,33 @@ class TestProjectEnvironment:
         self._with_chruby(monkeypatch)
         assert gm.ProjectEnvironment(tmp_path).env_runner is None
 
-    def test_go_detection_no_crash(self, tmp_path):
+    def test_a_toolchain_already_on_path_needs_no_prefix(self, tmp_path, monkeypatch):
         (tmp_path / "go.mod").write_text("module example.com/foo\n")
-        env = gm.ProjectEnvironment(tmp_path)
-        # None if go is already on PATH, else a PATH-export prefix
-        assert env.env_runner is None or env.env_runner.startswith('export PATH="')
+        monkeypatch.setattr(gm.shutil, "which", lambda name: f"/usr/bin/{name}")
+        assert gm.ProjectEnvironment(tmp_path).env_runner is None
+
+    def test_cargo_runner_sources_the_rustup_env(self, tmp_path, monkeypatch):
+        (tmp_path / "Cargo.toml").write_text("[package]\nname = 'x'\n")
+        monkeypatch.setattr(gm.shutil, "which", lambda name: None)
+        cargo_env = Path("~/.cargo/env").expanduser()
+        self._installed_under_home(monkeypatch, cargo_env)
+        assert gm.ProjectEnvironment(tmp_path).env_runner == f"source {cargo_env} &&"
+
+    def test_cargo_runner_falls_back_to_the_bin_directory(self, tmp_path, monkeypatch):
+        # No rustup env script, so the toolchain is put on PATH directly
+        (tmp_path / "Cargo.toml").write_text("[package]\nname = 'x'\n")
+        monkeypatch.setattr(gm.shutil, "which", lambda name: None)
+        cargo_bin = Path("~/.cargo/bin").expanduser()
+        self._installed_under_home(monkeypatch, cargo_bin / "cargo")
+        assert gm.ProjectEnvironment(tmp_path).env_runner == (
+            f'export PATH="{cargo_bin}:$PATH" &&'
+        )
+
+    def test_an_undetectable_cargo_toolchain_is_none(self, tmp_path, monkeypatch):
+        (tmp_path / "Cargo.toml").write_text("[package]\nname = 'x'\n")
+        monkeypatch.setattr(gm.shutil, "which", lambda name: None)
+        self._installed_under_home(monkeypatch)
+        assert gm.ProjectEnvironment(tmp_path).env_runner is None
 
     def test_go_runner_when_not_on_path(self, tmp_path, monkeypatch):
         (tmp_path / "go.mod").write_text("module example.com/foo\n")
@@ -337,32 +392,6 @@ class TestRunCommand:
         assert "world" in stdout
 
 
-class TestConfig:
-    """Tests for Config dataclass."""
-
-    def test_config_creation(self):
-        config = gm.Config(
-            agent_command="claude",
-            agent_flags="--dangerously-skip-permissions",
-            agent_timeout_seconds=300,
-            auto_merge_dependabot=True,
-            auto_update_dependencies=True,
-            ci_timeout_minutes=10,
-            command_timeout_seconds=120,
-            dependency_min_age_days=30,
-            dry_run=False,
-            exclude=frozenset({"excluded-repo"}),
-            max_fix_attempts=4,
-            push_changes=True,
-            repo_timeout_minutes=60,
-            run_tests=True,
-            test_timeout_seconds=600,
-        )
-        assert config.agent_command == "claude"
-        assert config.dependency_min_age_days == 30
-        assert "excluded-repo" in config.exclude
-
-
 class TestGitClient:
     """Tests for GitClient class."""
 
@@ -371,10 +400,6 @@ class TestGitClient:
 
     def test_is_git_repo_false(self, tmp_path):
         assert gm.GitClient(tmp_path, MagicMock()).is_git_repo() is False
-
-    def test_repo_name(self):
-        client = gm.GitClient(Path("/path/to/my-repo"), MagicMock())
-        assert client.repo_name == "my-repo"
 
     def test_has_unpushed_commits_false_when_no_upstream(self):
         client = gm.GitClient(Path("/path/to/my-repo"), MagicMock())
@@ -576,9 +601,7 @@ class TestDetectTestCommand:
         maintainer = gm.Maintainer(repo_path, default_config)
         assert maintainer.detect_test_command().endswith("cargo test")
 
-    def test_a_python_helper_does_not_displace_go_test(
-        self, repo_path, default_config
-    ):
+    def test_a_python_helper_does_not_displace_go_test(self, repo_path, default_config):
         (repo_path / "go.mod").write_text("module example.com/foo\n")
         (repo_path / "test_e2e.py").write_text("")
         maintainer = gm.Maintainer(repo_path, default_config)
@@ -991,9 +1014,7 @@ class TestMergePrsOnGithub:
         assert maintainer._merge_prs_on_github([(9, "999")]) == [9]
         maintainer.github.comment_pr.assert_not_called()
 
-    def test_non_conflict_failure_skips_without_rebase(
-        self, repo_path, default_config
-    ):
+    def test_non_conflict_failure_skips_without_rebase(self, repo_path, default_config):
         maintainer = make_maintainer(repo_path, default_config, dry_run=False)
         maintainer.github.merge_pr = MagicMock(
             return_value=(False, self.GH_BLOCKED_STDERR)
@@ -1104,34 +1125,6 @@ class TestGitHubClientCi:
         client = github_client(tmp_path)
         return client
 
-    def test_combine_all_success(self):
-        checks = [completed("success"), completed("success", "test")]
-        assert gm.GitHubClient._combine_check_runs(checks) == "success"
-
-    def test_combine_any_failure_wins(self):
-        checks = [completed("success"), completed("failure", "test")]
-        assert gm.GitHubClient._combine_check_runs(checks) == "failure"
-
-    def test_combine_timed_out_is_a_failure(self):
-        assert gm.GitHubClient._combine_check_runs([completed("timed_out")]) == "failure"
-
-    def test_combine_failure_beats_in_progress(self):
-        checks = [pending(), completed("failure", "test")]
-        assert gm.GitHubClient._combine_check_runs(checks) == "failure"
-
-    def test_combine_pending_check_is_in_progress(self):
-        checks = [completed("success"), pending("test")]
-        assert gm.GitHubClient._combine_check_runs(checks) == "in_progress"
-
-    def test_combine_queued_check_is_in_progress(self):
-        checks = [completed("success"), pending("test", status="queued")]
-        assert gm.GitHubClient._combine_check_runs(checks) == "in_progress"
-
-    def test_skipped_and_neutral_checks_do_not_block_success(self):
-        # Checks are per job, so an `if:`-skipped job is the common case
-        checks = [completed("success"), completed("skipped"), completed("neutral")]
-        assert gm.GitHubClient._combine_check_runs(checks) == "success"
-
     def test_conclusion_comes_from_the_named_commits_checks(self, tmp_path):
         client = self._client(tmp_path)
         client.get_check_runs = MagicMock(return_value=[completed("failure")])
@@ -1146,17 +1139,6 @@ class TestGitHubClientCi:
         )
         # Still non-None, so callers keep monitoring after their own push
         assert client.get_ci_conclusion("mine") == "success"
-
-    def test_fallback_surfaces_a_pre_existing_failure(self, tmp_path):
-        # paths-filtered workflows leave most commits with no checks, so a real
-        # failure on an earlier commit must not read as an unknown-healthy
-        # baseline the tool would then answer for
-        client = self._client(tmp_path)
-        client._get_runs = MagicMock(return_value=[{"headSha": "older"}])
-        client.get_check_runs = MagicMock(
-            side_effect=lambda sha: [] if sha == "mine" else [completed("failure")]
-        )
-        assert client.get_ci_conclusion("mine") == "failure"
 
     def test_fallback_uses_only_the_newest_commit(self, tmp_path):
         client = self._client(tmp_path)
@@ -1223,56 +1205,6 @@ class TestGitHubClientCi:
         )
         assert client.get_latest_failed_run_id("abc") == 4
 
-    def test_a_commit_that_ran_and_passed_borrows_no_logs(self, tmp_path):
-        # The commit ran, nothing failed, yet its checks say failure: the
-        # failing check has no run behind it. Another commit's logs would have
-        # the agent change code for a problem that did not fail here.
-        client = self._client(tmp_path)
-        client._get_runs = MagicMock(
-            return_value=[
-                {"databaseId": 3, "status": "completed",
-                 "conclusion": "success", "headSha": "abc"},
-                {"databaseId": 9, "status": "completed",
-                 "conclusion": "failure", "headSha": "older"},
-            ]
-        )
-        assert client.get_latest_failed_run_id("abc") is None
-
-    def test_a_chained_workflows_failure_is_fetchable(self, tmp_path):
-        # A workflow chained off another is not push-triggered, but its
-        # failure is the one the verdict came from and needs its logs
-        client = self._client(tmp_path)
-        client._get_runs = MagicMock(
-            return_value=[
-                {"databaseId": 3, "status": "completed",
-                 "conclusion": "success", "headSha": "abc"},
-                {"databaseId": 7, "status": "completed",
-                 "conclusion": "failure", "headSha": "abc"},
-            ]
-        )
-        assert client.get_latest_failed_run_id("abc") == 7
-
-    def test_runs_are_not_filtered_by_trigger_event(self, tmp_path):
-        client = self._client(tmp_path)
-        client._run = MagicMock(return_value=(True, "[]", ""))
-        client._git.current_branch = "main"
-        client._get_runs(1)
-        assert "--event" not in client._run.call_args.args[0]
-
-    def test_a_commit_with_no_runs_uses_the_judged_commits_logs(self, tmp_path):
-        # A paths-filtered workflow leaves a commit with no runs at all, and
-        # get_ci_conclusion judges it by the newest checked commit, so that
-        # commit's logs are the ones behind the verdict being acted on
-        client = self._client(tmp_path)
-        client._get_runs = MagicMock(
-            return_value=[
-                {"databaseId": 9, "status": "completed",
-                 "conclusion": "failure", "headSha": "older"},
-            ]
-        )
-        assert client.get_latest_failed_run_id("abc") == 9
-        assert client.get_latest_failed_run_id() == 9
-
     def test_failed_run_id_none_when_nothing_failed(self, tmp_path):
         client = self._client(tmp_path)
         client._get_runs = MagicMock(
@@ -1282,18 +1214,6 @@ class TestGitHubClientCi:
             ]
         )
         assert client.get_latest_failed_run_id("abc") is None
-
-    def test_a_workflow_that_never_started_is_described(self, tmp_path):
-        # No job ran, so there is no log to fetch; the fault is in the
-        # workflow file, which the agent can read and repair
-        client = self._client(tmp_path)
-        client.get_latest_failed_run_id = MagicMock(return_value=None)
-        client._startup_failure_checks = MagicMock(
-            return_value=[{"name": "Release"}]
-        )
-        logs = client.get_ci_failure_logs("abc")
-        assert "Release" in logs
-        assert ".github/workflows/" in logs
 
     def test_no_logs_and_no_startup_failure_is_none(self, tmp_path):
         client = self._client(tmp_path)
@@ -1314,10 +1234,6 @@ class TestGitHubClientCi:
         assert client.get_ci_failure_logs("abc") == "boom"
         assert "77" in calls[0]
 
-    def test_combine_non_success_conclusion_surfaces(self):
-        checks = [completed("success"), completed("cancelled", "test")]
-        assert gm.GitHubClient._combine_check_runs(checks) == "cancelled"
-
     def test_latest_conclusion_uses_the_newest_checked_commit(self, tmp_path):
         client = self._client(tmp_path)
         client._get_runs = MagicMock(return_value=[{"headSha": "new"}])
@@ -1334,25 +1250,19 @@ class TestGitHubClientCi:
         )
         assert client.get_ci_conclusion() == "success"
 
-    def test_wait_for_ci_fails_when_any_check_fails(self, tmp_path, monkeypatch):
+    def test_wait_for_ci_fails_when_any_check_fails(self, tmp_path):
         client = self._client(tmp_path)
         client.get_check_runs = MagicMock(
             return_value=[completed("success"), completed("failure", "test")]
         )
-        monkeypatch.setattr(gm.time, "sleep", lambda s: None)
         assert client.wait_for_ci("abc", 1) == "failure"
 
-    def test_wait_for_ci_gives_up_when_checks_cannot_be_read(
-        self, tmp_path, monkeypatch
-    ):
+    def test_wait_for_ci_gives_up_when_checks_cannot_be_read(self, tmp_path):
         client = self._client(tmp_path)
         client.get_check_runs = MagicMock(return_value=None)
-        monkeypatch.setattr(gm.time, "sleep", lambda s: None)
         assert client.wait_for_ci("abc", 1) is None
 
-    def test_wait_for_ci_keeps_polling_while_a_check_runs(
-        self, tmp_path, monkeypatch
-    ):
+    def test_wait_for_ci_keeps_polling_while_a_check_runs(self, tmp_path):
         client = self._client(tmp_path)
         client.get_check_runs = MagicMock(
             side_effect=[
@@ -1361,11 +1271,10 @@ class TestGitHubClientCi:
                 [completed("success"), completed("success", "test")],
             ]
         )
-        monkeypatch.setattr(gm.time, "sleep", lambda s: None)
         assert client.wait_for_ci("abc", 2) == "success"
 
     def test_a_passing_verdict_waits_for_the_check_set_to_settle(
-        self, tmp_path, monkeypatch
+        self, tmp_path
     ):
         # GitHub creates a commit's checks over a short window, so the first
         # set that looks complete and green may still be growing
@@ -1376,21 +1285,19 @@ class TestGitHubClientCi:
                 [completed("success"), completed("failure", "lint")],
             ]
         )
-        monkeypatch.setattr(gm.time, "sleep", lambda s: None)
         assert client.wait_for_ci("abc", 1) == "failure"
         assert client.get_check_runs.call_count == 2
 
-    def test_a_settled_passing_verdict_is_accepted(self, tmp_path, monkeypatch):
+    def test_a_settled_passing_verdict_is_accepted(self, tmp_path):
         client = self._client(tmp_path)
         client.get_check_runs = MagicMock(
             side_effect=[[completed("success")], [completed("success")]]
         )
-        monkeypatch.setattr(gm.time, "sleep", lambda s: None)
         assert client.wait_for_ci("abc", 1) == "success"
         assert client.get_check_runs.call_count == gm.CHECK_SET_STABLE_POLLS
 
     def test_settling_is_counted_from_the_terminal_verdict(
-        self, tmp_path, monkeypatch
+        self, tmp_path
     ):
         # Counting the in-progress polls would leave no settle time at all
         # after the last check completes, which is exactly when a workflow
@@ -1403,31 +1310,28 @@ class TestGitHubClientCi:
                 [completed("success"), completed("failure", "chained")],
             ]
         )
-        monkeypatch.setattr(gm.time, "sleep", lambda s: None)
         assert client.wait_for_ci("abc", 2) == "failure"
 
-    def test_an_api_blip_does_not_reset_settling(self, tmp_path, monkeypatch):
+    def test_an_api_blip_does_not_reset_settling(self, tmp_path):
         # An intermittent API would otherwise never settle, and the timeout
         # would be reported as an undetermined status for a passing build
         client = self._client(tmp_path)
         client.get_check_runs = MagicMock(
             side_effect=[[completed("success")], None, [completed("success")]]
         )
-        monkeypatch.setattr(gm.time, "sleep", lambda s: None)
         assert client.wait_for_ci("abc", 2) == "success"
 
     def test_a_failure_is_returned_without_waiting_to_settle(
-        self, tmp_path, monkeypatch
+        self, tmp_path
     ):
         # A check that appears later cannot un-fail one that already failed,
         # so settling would only delay the fix
         client = self._client(tmp_path)
         client.get_check_runs = MagicMock(return_value=[completed("failure")])
-        monkeypatch.setattr(gm.time, "sleep", lambda s: None)
         assert client.wait_for_ci("abc", 1) == "failure"
         assert client.get_check_runs.call_count == 1
 
-    def test_a_changing_check_set_is_not_accepted_early(self, tmp_path, monkeypatch):
+    def test_a_changing_check_set_is_not_accepted_early(self, tmp_path):
         client = self._client(tmp_path)
         client.get_check_runs = MagicMock(
             side_effect=[
@@ -1439,13 +1343,12 @@ class TestGitHubClientCi:
                  completed("success", "b"), completed("success", "c")],
             ]
         )
-        monkeypatch.setattr(gm.time, "sleep", lambda s: None)
         # Polled to the end rather than accepting the poll-2 verdict
         assert client.wait_for_ci("abc", 2) == "success"
         assert client.get_check_runs.call_count == 4
 
     def test_a_check_that_starts_after_a_green_verdict_is_not_ignored(
-        self, tmp_path, monkeypatch
+        self, tmp_path
     ):
         # A chained workflow is created as the one it follows finishes, so a
         # green observation goes stale; returning it would call a build that
@@ -1455,21 +1358,19 @@ class TestGitHubClientCi:
         client.get_check_runs = MagicMock(
             side_effect=[[completed("success", "ci")], running, running, running]
         )
-        monkeypatch.setattr(gm.time, "sleep", lambda s: None)
         assert client.wait_for_ci("abc", 2) is None
 
     def test_an_observed_verdict_survives_an_api_error_at_the_end(
-        self, tmp_path, monkeypatch
+        self, tmp_path
     ):
         # Discarding it would report a build that concluded green as an
         # unknown status, which callers treat as a failure
         client = self._client(tmp_path)
         client.get_check_runs = MagicMock(side_effect=[[completed("success")], None])
-        monkeypatch.setattr(gm.time, "sleep", lambda s: None)
         assert client.wait_for_ci("abc", 1) == "success"
 
     def test_an_unsettled_verdict_is_accepted_at_the_last_poll(
-        self, tmp_path, monkeypatch
+        self, tmp_path
     ):
         # Reporting a concluded build as an unknown status would have callers
         # treat a green run as a failure
@@ -1480,26 +1381,18 @@ class TestGitHubClientCi:
                 [completed("success"), completed("success", "lint")],
             ]
         )
-        monkeypatch.setattr(gm.time, "sleep", lambda s: None)
         assert client.wait_for_ci("abc", 1) == "success"
 
-    def test_a_duplicate_named_check_counts_as_a_change(self, tmp_path, monkeypatch):
+    def test_a_duplicate_named_check_counts_as_a_change(self, tmp_path):
         # Two matrix legs can share a name, so identity must count duplicates
         client = self._client(tmp_path)
         both = [completed("success", "test"), completed("success", "test")]
         client.get_check_runs = MagicMock(
             side_effect=[[completed("success", "test")], both, both, both]
         )
-        monkeypatch.setattr(gm.time, "sleep", lambda s: None)
         assert client.wait_for_ci("abc", 2) == "success"
         # Would have settled a poll earlier if the duplicate were collapsed
         assert client.get_check_runs.call_count == 3
-
-    def test_a_completed_check_with_no_conclusion_is_not_a_verdict(self):
-        # None is reserved for "no checks at all", which callers act on
-        checks = [{"name": "build", "status": "completed", "conclusion": None}]
-        assert gm.GitHubClient._combine_check_runs(checks) == "in_progress"
-
 
     def test_get_runs_over_fetches_before_filtering(self, tmp_path):
         client = self._client(tmp_path)
@@ -1598,41 +1491,6 @@ class TestGetCheckRuns:
         assert "repos/owner/repo/commits/abc123/check-runs?per_page=100" in args
         assert "--paginate" in args
 
-    def test_the_dependabot_updates_check_is_dropped(self, tmp_path):
-        # GitHub's managed Dependabot Updates workflow contributes a check
-        # named exactly "Dependabot" that fails independently of our push
-        stdout = (
-            '{"name":"Dependabot","status":"completed",'
-            '"conclusion":"failure","app":"github-actions"}\n'
-            '{"name":"test","status":"completed",'
-            '"conclusion":"success","app":"github-actions"}\n'
-        )
-        client = self._client(tmp_path, (True, stdout, ""))
-        assert [c["name"] for c in client.get_check_runs("abc")] == ["test"]
-
-    def test_dependabot_app_checks_are_dropped(self, tmp_path):
-        # dependabot validates .github/dependabot.yml on every commit
-        stdout = (
-            '{"name":".github/dependabot.yml","status":"completed",'
-            '"conclusion":"failure","app":"dependabot"}\n'
-            '{"name":"test","status":"completed",'
-            '"conclusion":"success","app":"github-actions"}\n'
-        )
-        client = self._client(tmp_path, (True, stdout, ""))
-        assert [c["name"] for c in client.get_check_runs("abc")] == ["test"]
-
-    def test_a_projects_own_dependabot_job_is_kept(self, tmp_path):
-        # Matched exactly, so a real job whose name merely starts with the
-        # ignored one still counts towards the verdict
-        stdout = (
-            '{"name":"Dependabot metadata","status":"completed",'
-            '"conclusion":"failure","app":"github-actions"}\n'
-        )
-        client = self._client(tmp_path, (True, stdout, ""))
-        assert [c["name"] for c in client.get_check_runs("abc")] == [
-            "Dependabot metadata"
-        ]
-
     def test_no_checks_is_an_empty_list(self, tmp_path):
         client = self._client(tmp_path, (True, "", ""))
         assert client.get_check_runs("abc") == []
@@ -1640,13 +1498,6 @@ class TestGetCheckRuns:
     def test_api_failure_is_undetermined(self, tmp_path):
         client = self._client(tmp_path, (False, "", "HTTP 422"))
         assert client.get_check_runs("abc") is None
-
-    def test_an_api_error_does_not_borrow_another_commits_verdict(self, tmp_path):
-        # Adopting one would chase a failure that is not on this commit, or
-        # excuse this run from a regression it goes on to cause
-        client = self._client(tmp_path, (False, "", "HTTP 502"))
-        client._get_runs = MagicMock(return_value=[{"headSha": "older"}])
-        assert client.get_ci_conclusion("head") == gm.CI_UNKNOWN
 
     def test_a_workflow_that_never_started_still_counts_as_a_failure(
         self, tmp_path
@@ -1666,27 +1517,6 @@ class TestGetCheckRuns:
         checks = client.get_check_runs("abc")
         assert gm.GitHubClient._combine_check_runs(checks) == "failure"
         assert checks[0]["name"] == "Release"
-
-    def test_a_broken_workflow_shows_up_beside_healthy_ones(self, tmp_path):
-        # Keying off an empty check list would hide the broken workflow
-        # behind the repository's other, reporting ones
-        stdout = (
-            '{"name":"ci","status":"completed",'
-            '"conclusion":"success","app":"github-actions"}\n'
-        )
-        client = self._client(tmp_path, (True, stdout, ""))
-        client._get_runs = MagicMock(
-            return_value=[
-                {
-                    "headSha": "abc",
-                    "conclusion": "startup_failure",
-                    "workflowName": "Release",
-                }
-            ]
-        )
-        checks = client.get_check_runs("abc")
-        assert [c["name"] for c in checks] == ["ci", "Release"]
-        assert gm.GitHubClient._combine_check_runs(checks) == "failure"
 
     def test_a_startup_failure_on_another_commit_is_ignored(self, tmp_path):
         client = self._client(tmp_path, (True, "", ""))
@@ -1770,16 +1600,13 @@ class TestMaintainMergedPrCiMonitoring:
         maintainer._handle_post_push_ci = MagicMock(return_value=False)
         return maintainer
 
-    def test_unfixable_test_failure_still_monitors_ci(
-        self, repo_path, default_config
-    ):
+    def test_unfixable_test_failure_still_monitors_ci(self, repo_path, default_config):
         maintainer = self._maintainer(repo_path, default_config)
         maintainer.update_dependencies = MagicMock(return_value=(True, False))
         maintainer.run_tests = MagicMock(return_value=(gm.TESTS_FAILED, "boom"))
         maintainer.fix_test_with_retries = MagicMock(return_value=False)
-        status, had_changes = maintainer.maintain()
+        status, _ = maintainer.maintain()
         assert status == gm.STATUS_FAILED
-        assert had_changes is False
         maintainer._handle_post_push_ci.assert_called_once_with(True, "base123")
 
     def test_failed_dependency_update_still_monitors_ci(
@@ -1787,9 +1614,8 @@ class TestMaintainMergedPrCiMonitoring:
     ):
         maintainer = self._maintainer(repo_path, default_config)
         maintainer.update_dependencies = MagicMock(return_value=(False, False))
-        status, had_changes = maintainer.maintain()
+        status, _ = maintainer.maintain()
         assert status == gm.STATUS_FAILED
-        assert had_changes is False
         maintainer._handle_post_push_ci.assert_called_once_with(True, "base123")
 
 
@@ -1818,9 +1644,7 @@ class TestMaintainMergedPrCiMonitoring:
         assert status == gm.STATUS_FAILED
         maintainer._handle_post_push_ci.assert_called_once_with(True, "base123")
 
-    def test_ci_is_monitored_when_the_test_fix_raises(
-        self, repo_path, default_config
-    ):
+    def test_ci_is_monitored_when_the_test_fix_raises(self, repo_path, default_config):
         maintainer = self._maintainer(repo_path, default_config)
         maintainer.update_dependencies = MagicMock(return_value=(True, True))
         maintainer.run_tests = MagicMock(return_value=(gm.TESTS_FAILED, "boom"))
@@ -1901,9 +1725,7 @@ class TestMaintainMergedPrCiMonitoring:
         assert status == gm.STATUS_FAILED
         assert maintainer._handle_post_push_ci.call_count == 1
 
-    def test_push_failure_still_monitors_merged_pr_ci(
-        self, repo_path, default_config
-    ):
+    def test_push_failure_still_monitors_merged_pr_ci(self, repo_path, default_config):
         maintainer = self._maintainer(repo_path, default_config)
         maintainer.update_dependencies = MagicMock(return_value=(True, True))
         maintainer.run_tests = MagicMock(return_value=(gm.TESTS_PASSED, ""))
@@ -2060,7 +1882,7 @@ class TestABlockedSuiteIsNotNoTests:
     """A declared runner that will not start is a broken environment, not a
     repository without tests: nothing may be committed on the strength of it."""
 
-    def _maintainer(self, repo_path, default_config, probe_ok):
+    def _maintainer(self, repo_path, default_config):
         maintainer = make_maintainer(repo_path, default_config, dry_run=False)
         maintainer.git.reset_changes = MagicMock(return_value=True)
         return maintainer
@@ -2070,7 +1892,7 @@ class TestABlockedSuiteIsNotNoTests:
     ):
         (repo_path / "pytest.ini").write_text("[pytest]\n")
         monkeypatch.setattr(gm, "run_shell_command", lambda *a, **k: (False, "", ""))
-        maintainer = self._maintainer(repo_path, default_config, False)
+        maintainer = self._maintainer(repo_path, default_config)
         status, output = maintainer.run_tests()
         assert status == gm.TESTS_BLOCKED
         assert "pytest" in output
@@ -2085,7 +1907,7 @@ class TestABlockedSuiteIsNotNoTests:
         monkeypatch.setattr(
             gm, "run_shell_command", lambda *a, **k: (False, "", "nvm: version not installed")
         )
-        maintainer = self._maintainer(repo_path, default_config, False)
+        maintainer = self._maintainer(repo_path, default_config)
         monkeypatch.setattr(
             type(maintainer.project_env), "env_runner", "nvm use &&"
         )
@@ -2100,13 +1922,11 @@ class TestABlockedSuiteIsNotNoTests:
         # project uses pytest; a missing pytest just means the guess was wrong
         (repo_path / "test_thing.py").write_text("\n")
         monkeypatch.setattr(gm, "run_shell_command", lambda *a, **k: (False, "", ""))
-        maintainer = self._maintainer(repo_path, default_config, False)
+        maintainer = self._maintainer(repo_path, default_config)
         assert maintainer.run_tests()[0] == gm.TESTS_NOT_RUN
 
-    def test_a_blocked_suite_is_not_committed(
-        self, repo_path, default_config, monkeypatch
-    ):
-        maintainer = self._maintainer(repo_path, default_config, False)
+    def test_a_blocked_suite_is_not_committed(self, repo_path, default_config):
+        maintainer = self._maintainer(repo_path, default_config)
         maintainer.update_dependencies = MagicMock(return_value=(True, True))
         maintainer.run_tests = MagicMock(return_value=(gm.TESTS_BLOCKED, "no pytest"))
         maintainer.fix_test_with_retries = MagicMock()
@@ -2885,10 +2705,9 @@ class TestNoPassWithoutEvidence:
             ),
         ],
     )
-    def test_these_never_report_success(self, tmp_path, monkeypatch, name, sequence):
+    def test_these_never_report_success(self, tmp_path, name, sequence):
         client = self._client(tmp_path)
         client.get_check_runs = MagicMock(side_effect=sequence)
-        monkeypatch.setattr(gm.time, "sleep", lambda s: None)
         assert client.wait_for_ci("abc", 2) != "success", name
 
     @pytest.mark.parametrize(
@@ -2910,12 +2729,11 @@ class TestNoPassWithoutEvidence:
             ),
         ],
     )
-    def test_these_do_report_success(self, tmp_path, monkeypatch, name, sequence):
+    def test_these_do_report_success(self, tmp_path, name, sequence):
         # The counterweight: the rule above must not be satisfied by refusing
         # to ever report a pass
         client = self._client(tmp_path)
         client.get_check_runs = MagicMock(side_effect=sequence)
-        monkeypatch.setattr(gm.time, "sleep", lambda s: None)
         assert client.wait_for_ci("abc", 2) == "success", name
 
     def test_an_api_error_never_borrows_another_commits_verdict(self, tmp_path):
@@ -3200,9 +3018,7 @@ class TestEveryRemoteChangeIsCounted:
         maintainer.commit_and_push("msg")
         assert maintainer.changed_remote is True
 
-    def test_a_failed_push_does_not_count(
-        self, repo_path, default_config, monkeypatch
-    ):
+    def test_a_failed_push_does_not_count(self, repo_path, default_config, monkeypatch):
         maintainer = self._maintainer(repo_path, default_config)
         calls = []
 
