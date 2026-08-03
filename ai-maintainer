@@ -746,13 +746,20 @@ class GitClient:
         Updates origin/HEAD from remote, then reads the symbolic-ref.
         Falls back to checking for common branch names.
         """
-        # Remote branches as a set of exact names. Membership must not be a
-        # substring test against the raw listing: `origin/rel` would then be
-        # satisfied by `origin/release`, and `origin/main` by `origin/main-old`,
-        # naming a branch that does not exist. The `origin/HEAD -> origin/main`
-        # line is a symref rather than a branch and drops out on its own.
-        success, stdout, _ = self._run(["git", "branch", "-r"])
-        remote_branches = (
+        # The remote's refs, as a set of exact names.
+        #
+        # Read with for-each-ref rather than `git branch -r`, which is
+        # porcelain: a user's column.ui setting reflows it into columns and
+        # color.branch wraps each name in ANSI escapes, neither of which
+        # survives being parsed one name per line.
+        #
+        # Membership is then exact rather than a substring test, which would
+        # let refs/remotes/origin/rel be satisfied by .../release, and main by
+        # main-old, naming a branch that does not exist.
+        success, stdout, _ = self._run(
+            ["git", "for-each-ref", "--format=%(refname)", "refs/remotes/origin/"]
+        )
+        remote_refs = (
             {line.strip() for line in stdout.splitlines() if line.strip()}
             if success
             else set()
@@ -771,13 +778,13 @@ class GitClient:
             # (e.g. release/1.0) survive intact.
             branch = stdout.strip().removeprefix("refs/remotes/origin/")
             # Verify the branch actually exists (origin/HEAD may be stale)
-            if f"origin/{branch}" in remote_branches:
+            if f"refs/remotes/origin/{branch}" in remote_refs:
                 return branch
 
         # Fallback: check for common branch names (prefer main over master)
-        if "origin/main" in remote_branches:
+        if "refs/remotes/origin/main" in remote_refs:
             return "main"
-        elif "origin/master" in remote_branches:
+        elif "refs/remotes/origin/master" in remote_refs:
             return "master"
         return None
 

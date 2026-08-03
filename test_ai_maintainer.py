@@ -473,12 +473,13 @@ class TestGetDefaultBranch:
     """origin/HEAD names the default branch, but it can be stale and the name
     it carries can contain slashes."""
 
-    def _git(self, repo_path, symbolic_ref, remote_branches):
+    def _git(self, repo_path, symbolic_ref, *branches):
         git = gm.GitClient(repo_path, MagicMock())
+        listing = "".join(f"refs/remotes/origin/{b}\n" for b in branches)
 
         def fake_run(args):
-            if args[:2] == ["git", "branch"] and "-r" in args:
-                return True, remote_branches, ""
+            if args[:2] == ["git", "for-each-ref"]:
+                return True, listing, ""
             if args[:2] == ["git", "symbolic-ref"]:
                 return (True, symbolic_ref, "") if symbolic_ref else (False, "", "")
             return True, "", ""
@@ -487,14 +488,12 @@ class TestGetDefaultBranch:
         return git
 
     def test_a_branch_name_containing_a_slash_survives(self, repo_path):
-        git = self._git(
-            repo_path, "refs/remotes/origin/release/1.0\n", "  origin/release/1.0\n"
-        )
+        git = self._git(repo_path, "refs/remotes/origin/release/1.0\n", "release/1.0")
         assert git.get_default_branch() == "release/1.0"
 
     def test_a_stale_origin_head_is_not_trusted(self, repo_path):
         # origin/HEAD still names a branch the remote no longer has
-        git = self._git(repo_path, "refs/remotes/origin/gone\n", "  origin/main\n")
+        git = self._git(repo_path, "refs/remotes/origin/gone\n", "main")
         assert git.get_default_branch() == "main"
 
     def test_a_longer_branch_name_does_not_satisfy_the_stale_ref_guard(
@@ -502,30 +501,39 @@ class TestGetDefaultBranch:
     ):
         # origin/rel is not origin/release, and the guard exists precisely to
         # reject a branch the remote does not have
-        git = self._git(repo_path, "refs/remotes/origin/rel\n", "  origin/release\n")
+        git = self._git(repo_path, "refs/remotes/origin/rel\n", "release")
         assert git.get_default_branch() is None
 
     def test_a_longer_branch_name_does_not_satisfy_the_fallback(self, repo_path):
         # Neither main nor master is here, only a name that starts like one
-        git = self._git(repo_path, None, "  origin/develop\n  origin/main-old\n")
+        git = self._git(repo_path, None, "develop", "main-old")
         assert git.get_default_branch() is None
 
-    def test_the_origin_head_line_is_not_itself_a_branch(self, repo_path):
-        # `git branch -r` prints "origin/HEAD -> origin/main"; the arrow line
-        # is a symref, so it cannot stand in for the branch it points at
-        git = self._git(
-            repo_path, None, "  origin/HEAD -> origin/main\n  origin/trunk\n"
-        )
+    def test_the_origin_head_ref_is_not_itself_a_branch(self, repo_path):
+        # The listing carries refs/remotes/origin/HEAD beside the branches
+        git = self._git(repo_path, None, "HEAD", "trunk")
         assert git.get_default_branch() is None
 
     def test_main_is_preferred_over_master(self, repo_path):
-        git = self._git(repo_path, None, "  origin/main\n  origin/master\n")
+        git = self._git(repo_path, None, "main", "master")
         assert git.get_default_branch() == "main"
 
     def test_no_remote_branches_is_undetermined(self, repo_path):
         # _validate_repo skips the repository rather than guessing
-        git = self._git(repo_path, None, "")
+        git = self._git(repo_path, None)
         assert git.get_default_branch() is None
+
+    def test_the_listing_is_read_with_plumbing(self, repo_path):
+        # `git branch -r` is porcelain: a user's column.ui reflows it into
+        # columns and color.branch wraps each name in ANSI escapes, so no
+        # line equals a branch name and every repository is skipped
+        git = self._git(repo_path, None, "main")
+        calls = []
+        inner = git._run
+        git._run = lambda args: (calls.append(args), inner(args))[1]
+        assert git.get_default_branch() == "main"
+        assert not any(a[:2] == ["git", "branch"] for a in calls)
+        assert ["git", "for-each-ref"] in [a[:2] for a in calls]
 
 
 class TestFindRepos:
