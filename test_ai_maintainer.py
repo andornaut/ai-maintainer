@@ -585,11 +585,15 @@ class TestValidateRepo:
         assert maintainer._validate_repo() is False
 
     def test_an_undetermined_default_branch_is_skipped(
-        self, repo_path, default_config
+        self, repo_path, default_config, caplog
     ):
+        # The branch comparison below refuses it too, so the reason is the
+        # only thing that separates this gate from that one
         maintainer = self._maintainer(repo_path, default_config)
         maintainer.git.get_default_branch.return_value = None
-        assert maintainer._validate_repo() is False
+        with caplog.at_level("WARNING"):
+            assert maintainer._validate_repo() is False
+        assert "Could not determine default branch" in caplog.text
 
     def test_work_in_progress_on_another_branch_is_left_alone(
         self, repo_path, default_config
@@ -2915,9 +2919,10 @@ class TestStagedFileLogging:
         with caplog.at_level("INFO"):
             maintainer._log_staged_files(files)
         assert "and 5 more" in caplog.text
-        # The count is not a substitute for the cap: both have to hold
-        assert files[-1] not in caplog.text
+        # The count is not a substitute for the cap, and the cut has to land
+        # on the cap rather than merely somewhere near it
         assert files[gm.MAX_LOGGED_STAGED_FILES - 1] in caplog.text
+        assert files[gm.MAX_LOGGED_STAGED_FILES] not in caplog.text
 
 
 class TestBuildCommitMessage:
@@ -3322,6 +3327,9 @@ class TestEveryRemoteChangeIsCounted:
         # leave the branch ahead of the remote, and the next run pushes it
         # without ever running the suite that would have judged it
         maintainer = self._maintainer(repo_path, default_config)
+        # Distinct SHAs either side of the commit: resetting to the one HEAD
+        # already points at would leave the commit exactly where it is
+        maintainer.git.get_head_sha = MagicMock(side_effect=["before", "after"])
         monkeypatch.setattr(
             gm,
             "run_git",
@@ -3331,7 +3339,7 @@ class TestEveryRemoteChangeIsCounted:
         )
         maintainer.git.reset_hard = MagicMock(return_value=(True, "", ""))
         assert maintainer.commit_and_push("msg") == (False, False)
-        maintainer.git.reset_hard.assert_called_once_with("head123")
+        maintainer.git.reset_hard.assert_called_once_with("before")
 
 
 class TestHookFiringGitOpsGetTheTestBudget:
