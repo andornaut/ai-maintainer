@@ -3675,14 +3675,45 @@ class TestARunReportsWhatItLogged:
     def test_an_unexpected_exception_is_reported_for_the_repo(
         self, repo_path, monkeypatch, caplog
     ):
-        # maintain() never returned, so the summary line has to be built by main()
+        # maintain() never returned, so the summary line has to be built by
+        # main(), and it names the tally the repository was counted in
         def maintain():
             raise RuntimeError("boom")
 
         with caplog.at_level(logging.INFO):
             assert self._run_main(monkeypatch, repo_path, maintain) == 1
         warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
-        assert f"[{repo_path.name}] Result: failed (1 error)" in warnings
+        assert f"[{repo_path.name}] Result: error (1 error)" in warnings
+        assert "Errors: 1" in caplog.text
+        assert "Failed: 0" in caplog.text
+
+    def test_a_warning_from_the_constructor_belongs_to_the_repo(
+        self, repo_path, monkeypatch, caplog
+    ):
+        # Maintainer.__init__ detects the toolchain, which warns about what it
+        # refuses; attributing that to no repository would drop the Result line
+        def build_maintainer(path, cfg):
+            logging.getLogger(gm.__name__).warning(
+                f"[{path.name}] Ignoring .ruby-version: not a plain version string"
+            )
+            maintainer = MagicMock()
+            maintainer.changed_remote = False
+            maintainer.maintain = lambda: (gm.STATUS_SUCCESS, False)
+            return maintainer
+
+        monkeypatch.setattr(gm, "check_prerequisites", lambda cmd: [])
+        monkeypatch.setattr(gm, "check_github_auth", lambda: (True, "", ""))
+        monkeypatch.setattr(gm, "find_repos", lambda base, log: [repo_path])
+        monkeypatch.setattr(gm, "Maintainer", build_maintainer)
+        monkeypatch.setattr(
+            sys, "argv", ["ai-maintainer", "--base-dir", str(repo_path)]
+        )
+        with caplog.at_level(logging.INFO):
+            gm.main()
+        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert f"[{repo_path.name}] Result: success (1 warning)" in warnings
+        assert f"  {repo_path.name}: 1 warning" in warnings
+        assert "outside any repository" not in caplog.text
 
 
 if __name__ == "__main__":

@@ -3417,17 +3417,19 @@ def main():
                 )
                 break
 
-            maintainer = Maintainer(repo_path, config)
+            # Set before the constructor, which detects the toolchain and warns
+            # about what it refuses; those records belong to this repository.
             issues.repo = repo_path.name
+            maintainer = Maintainer(repo_path, config)
             try:
-                status, had_changes = maintainer.maintain()
+                outcome, had_changes = maintainer.maintain()
                 # Counted whatever the outcome: a repository this run
                 # changed stays changed, so --limit has to bound those.
                 if had_changes:
                     repos_with_changes += 1
-                if status == STATUS_SUCCESS:
+                if outcome == STATUS_SUCCESS:
                     success_count += 1
-                elif status == STATUS_SKIPPED:
+                elif outcome == STATUS_SKIPPED:
                     skip_count += 1
                 else:
                     fail_count += 1
@@ -3438,7 +3440,9 @@ def main():
                 error_count += 1
                 # maintain() never returned, so its accounting was lost. The
                 # remote was still changed if a merge or push got that far.
-                status, had_changes = STATUS_FAILED, maintainer.changed_remote
+                # Reported as an error rather than as a failure so the
+                # repository names the tally it was counted in.
+                outcome, had_changes = "error", maintainer.changed_remote
                 if maintainer.changed_remote:
                     repos_with_changes += 1
             finally:
@@ -3451,7 +3455,7 @@ def main():
             if repo_issues:
                 changes = " with changes" if had_changes else ""
                 logger.warning(
-                    f"[{repo_path.name}] Result: {status}{changes} "
+                    f"[{repo_path.name}] Result: {outcome}{changes} "
                     f"({format_issue_counts(repo_issues)})",
                     extra=SUMMARY_EXTRA,
                 )
