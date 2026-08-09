@@ -3521,5 +3521,169 @@ class TestDefaultsLeaveRoomForAFix:
         )
 
 
+class TestIssueTracker:
+    """Warnings and errors are counted per repository so the run can report
+    what it logged."""
+
+    def _logger(self, tracker, name):
+        logger = logging.getLogger(name)
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+        logger.handlers = [tracker]
+        return logger
+
+    def test_records_are_attributed_to_the_current_repo(self):
+        tracker = gm.IssueTracker()
+        logger = self._logger(tracker, "issue-tracker-attribution")
+        tracker.repo = "alpha"
+        logger.warning("dirty tree")
+        logger.error("ci timed out")
+        tracker.repo = "beta"
+        logger.warning("no test command")
+        tracker.repo = None
+        logger.error("auth failed")
+        assert dict(tracker.counts["alpha"]) == {"warning": 1, "error": 1}
+        assert dict(tracker.counts["beta"]) == {"warning": 1}
+        assert dict(tracker.counts[None]) == {"error": 1}
+        assert tracker.total == 4
+        assert dict(tracker.totals()) == {"warning": 2, "error": 2}
+
+    def test_info_and_debug_are_not_counted(self):
+        tracker = gm.IssueTracker()
+        logger = self._logger(tracker, "issue-tracker-levels")
+        logger.debug("looking")
+        logger.info("done")
+        assert tracker.counts == {}
+        assert tracker.total == 0
+
+    def test_summary_records_do_not_count_themselves(self):
+        # The summary reports the counts, so counting it would make the totals
+        # depend on whether they had been reported yet
+        tracker = gm.IssueTracker()
+        logger = self._logger(tracker, "issue-tracker-summary")
+        logger.warning("real problem")
+        logger.warning("Errors: 0", extra=gm.SUMMARY_EXTRA)
+        assert tracker.total == 1
+
+    def test_counts_are_rendered_with_the_error_first(self):
+        counts = gm.Counter({"warning": 2, "error": 1})
+        assert gm.format_issue_counts(counts) == "1 error, 2 warnings"
+        assert gm.format_issue_counts(gm.Counter({"warning": 1})) == "1 warning"
+        assert gm.format_issue_counts(gm.Counter()) == ""
+
+    def test_setup_logging_does_not_stack_trackers(self):
+        root = logging.getLogger()
+        before = list(root.handlers)
+        try:
+            gm.setup_logging(verbose=False, quiet=False)
+            gm.setup_logging(verbose=False, quiet=False)
+            trackers = [h for h in root.handlers if isinstance(h, gm.IssueTracker)]
+            assert len(trackers) == 1
+        finally:
+            root.handlers = before
+
+
+class TestARunReportsWhatItLogged:
+    """A quiet run prints only warnings and errors. Without a summary at that
+    level, the log says what went wrong but never whether it was resolved."""
+
+    def _run_main(self, monkeypatch, repo_path, maintain, argv=()):
+        maintainer = MagicMock()
+        maintainer.changed_remote = False
+        maintainer.maintain = maintain
+        monkeypatch.setattr(gm, "check_prerequisites", lambda cmd: [])
+        monkeypatch.setattr(gm, "check_github_auth", lambda: (True, "", ""))
+        monkeypatch.setattr(gm, "find_repos", lambda base, log: [repo_path])
+        monkeypatch.setattr(gm, "Maintainer", lambda path, cfg: maintainer)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["ai-maintainer", "--base-dir", str(repo_path), *argv],
+        )
+        return gm.main()
+
+    def _warned_maintain(self, status, had_changes):
+        def maintain():
+            logging.getLogger(gm.__name__).warning(
+                "Changes not verified: No test command detected"
+            )
+            return status, had_changes
+
+        return maintain
+
+    def test_a_warned_repo_reports_its_outcome_at_warning(
+        self, repo_path, monkeypatch, caplog
+    ):
+        with caplog.at_level(logging.INFO):
+            self._run_main(
+                monkeypatch,
+                repo_path,
+                self._warned_maintain(gm.STATUS_SUCCESS, True),
+            )
+        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            f"[{repo_path.name}] Result: success with changes (1 warning)" == m
+            for m in warnings
+        )
+
+    def test_the_final_summary_is_elevated_when_anything_was_logged(
+        self, repo_path, monkeypatch, caplog
+    ):
+        with caplog.at_level(logging.INFO):
+            self._run_main(
+                monkeypatch,
+                repo_path,
+                self._warned_maintain(gm.STATUS_SUCCESS, False),
+            )
+        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert "Maintenance complete" in warnings
+        assert "Logged: 1 warning" in warnings
+        assert f"  {repo_path.name}: 1 warning" in warnings
+
+    def test_a_failing_repo_is_named_in_the_summary(
+        self, repo_path, monkeypatch, caplog
+    ):
+        def maintain():
+            logging.getLogger(gm.__name__).error("CI timed out after 10 minutes")
+            logging.getLogger(gm.__name__).warning("CI outcome not confirmed")
+            return gm.STATUS_FAILED, True
+
+        with caplog.at_level(logging.INFO):
+            assert self._run_main(monkeypatch, repo_path, maintain) == 1
+        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert (
+            f"[{repo_path.name}] Result: failed with changes (1 error, 1 warning)"
+            in warnings
+        )
+        assert f"  {repo_path.name}: 1 error, 1 warning" in warnings
+
+    def test_a_clean_run_says_nothing_at_warning(
+        self, repo_path, monkeypatch, caplog
+    ):
+        with caplog.at_level(logging.INFO):
+            assert (
+                self._run_main(
+                    monkeypatch,
+                    repo_path,
+                    lambda: (gm.STATUS_SUCCESS, False),
+                )
+                == 0
+            )
+        assert [r.message for r in caplog.records if r.levelno >= logging.WARNING] == []
+        assert "Maintenance complete" in caplog.text
+
+    def test_an_unexpected_exception_is_reported_for_the_repo(
+        self, repo_path, monkeypatch, caplog
+    ):
+        # maintain() never returned, so the summary line has to be built by main()
+        def maintain():
+            raise RuntimeError("boom")
+
+        with caplog.at_level(logging.INFO):
+            assert self._run_main(monkeypatch, repo_path, maintain) == 1
+        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert f"[{repo_path.name}] Result: failed (1 error)" in warnings
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -22,6 +22,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -45,6 +46,11 @@ class WorkingTreeError(Exception):
     risks committing them untested on top of whatever comes next.
     """
 
+
+# Marks a record as summary output, which IssueTracker does not count: the
+# summary reports the warnings and errors of the run, so counting it would
+# make the totals depend on whether they had been reported yet.
+SUMMARY_EXTRA = {"is_summary": True}
 
 # Per-repository maintenance outcomes
 STATUS_SUCCESS = "success"
@@ -3025,8 +3031,58 @@ def find_repos(base_dir: Path, logger: logging.Logger) -> List[Path]:
     return repos
 
 
-def setup_logging(verbose: bool, quiet: bool) -> logging.Logger:
-    """Setup logging configuration."""
+class IssueTracker(logging.Handler):
+    """Counts warning and error records so a run can summarize its own problems.
+
+    Records are attributed to whichever repository is being processed when they
+    are logged; the caller sets `repo` around each repository. Records logged
+    outside that window (startup checks, the summary itself) bucket under None.
+    Summary output carries SUMMARY_EXTRA so reporting the counts does not
+    change them.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.repo: Optional[str] = None
+        self.counts: Dict[Optional[str], Counter] = {}
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if getattr(record, "is_summary", False):
+            return
+        kind = "error" if record.levelno >= logging.ERROR else "warning"
+        self.counts.setdefault(self.repo, Counter())[kind] += 1
+
+    @property
+    def total(self) -> int:
+        """How many warning and error records the run has logged."""
+        return sum(sum(counts.values()) for counts in self.counts.values())
+
+    def totals(self) -> Counter:
+        """Warning and error counts across every repository."""
+        combined: Counter = Counter()
+        for counts in self.counts.values():
+            combined.update(counts)
+        return combined
+
+
+def format_issue_counts(counts: Counter) -> str:
+    """Render issue counts as e.g. "2 errors, 1 warning"."""
+    parts = []
+    for kind in ("error", "warning"):
+        count = counts.get(kind, 0)
+        if count:
+            parts.append(f"{count} {kind}" + ("s" if count != 1 else ""))
+    return ", ".join(parts)
+
+
+def setup_logging(
+    verbose: bool, quiet: bool
+) -> Tuple[logging.Logger, IssueTracker]:
+    """Setup logging configuration.
+
+    Returns the logger and the IssueTracker attached to the root logger, which
+    records every warning and error for the end-of-run summary.
+    """
     if quiet:
         level = logging.WARNING
     elif verbose:
@@ -3039,7 +3095,16 @@ def setup_logging(verbose: bool, quiet: bool) -> logging.Logger:
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
 
-    return logging.getLogger(__name__)
+    # Drop a tracker from an earlier call so repeated setup does not leave
+    # handlers counting into a summary that nothing will report.
+    root = logging.getLogger()
+    for handler in [h for h in root.handlers if isinstance(h, IssueTracker)]:
+        root.removeHandler(handler)
+
+    tracker = IssueTracker()
+    root.addHandler(tracker)
+
+    return logging.getLogger(__name__), tracker
 
 
 def check_github_auth() -> CommandResult:
@@ -3263,7 +3328,7 @@ def main():
     args = parse_args()
 
     # Setup logging
-    logger = setup_logging(args.verbose, args.quiet)
+    logger, issues = setup_logging(args.verbose, args.quiet)
 
     # Check prerequisites
     missing_tools = check_prerequisites(args.agent_command)
@@ -3353,6 +3418,7 @@ def main():
                 break
 
             maintainer = Maintainer(repo_path, config)
+            issues.repo = repo_path.name
             try:
                 status, had_changes = maintainer.maintain()
                 # Counted whatever the outcome: a repository this run
@@ -3372,21 +3438,48 @@ def main():
                 error_count += 1
                 # maintain() never returned, so its accounting was lost. The
                 # remote was still changed if a merge or push got that far.
+                status, had_changes = STATUS_FAILED, maintainer.changed_remote
                 if maintainer.changed_remote:
                     repos_with_changes += 1
+            finally:
+                issues.repo = None
+
+            # A repository that logged a warning or an error reports its
+            # outcome at WARNING, so a quiet run says how the repository whose
+            # warnings it just printed ended up.
+            repo_issues = issues.counts.get(repo_path.name)
+            if repo_issues:
+                changes = " with changes" if had_changes else ""
+                logger.warning(
+                    f"[{repo_path.name}] Result: {status}{changes} "
+                    f"({format_issue_counts(repo_issues)})",
+                    extra=SUMMARY_EXTRA,
+                )
     except KeyboardInterrupt:
         logger.warning("Interrupted by user")
         interrupted = True
 
-    # Summary
-    logger.info("=" * 80)
-    logger.info("Maintenance complete" + (" (interrupted)" if interrupted else ""))
-    logger.info(f"Successful: {success_count}")
-    logger.info(f"With changes: {repos_with_changes}")
-    logger.info(f"Skipped: {skip_count}")
-    logger.info(f"Failed: {fail_count}")
-    logger.info(f"Errors: {error_count}")
-    logger.info("=" * 80)
+    # Summary. Reported at WARNING when the run logged anything at that level
+    # or above, so a quiet run that printed warnings also says how it ended.
+    totals = issues.totals()
+    level = logging.WARNING if issues.total else logging.INFO
+
+    def report(message: str) -> None:
+        logger.log(level, message, extra=SUMMARY_EXTRA)
+
+    report("=" * 80)
+    report("Maintenance complete" + (" (interrupted)" if interrupted else ""))
+    report(f"Successful: {success_count}")
+    report(f"With changes: {repos_with_changes}")
+    report(f"Skipped: {skip_count}")
+    report(f"Failed: {fail_count}")
+    report(f"Errors: {error_count}")
+    if issues.total:
+        report(f"Logged: {format_issue_counts(totals)}")
+        for repo_name, counts in issues.counts.items():
+            label = repo_name if repo_name else "(outside any repository)"
+            report(f"  {label}: {format_issue_counts(counts)}")
+    report("=" * 80)
 
     return 1 if interrupted or fail_count > 0 or error_count > 0 else 0
 
