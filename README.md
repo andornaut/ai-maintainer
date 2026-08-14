@@ -1,5 +1,8 @@
 # AI Maintainer
 
+[![CI](https://github.com/andornaut/ai-maintainer/actions/workflows/release.yml/badge.svg)](https://github.com/andornaut/ai-maintainer/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 Automated GitHub repository maintenance with AI-powered dependency updates, test fixing, and CI monitoring.
 
 Merges dependabot PRs (GPG-verified), updates direct dependencies (with age constraints), fixes test failures, and monitors CI builds across multiple repos. Supports Python (pipenv/poetry), Node.js (nvm/fnm), Ruby (chruby/rbenv), Rust, and Go.
