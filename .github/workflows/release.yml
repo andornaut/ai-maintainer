@@ -38,6 +38,19 @@ jobs:
     if: github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main')
     uses: ./.github/workflows/ai-attributions.yml
 
+  # Publishing waits on the same suite that guards main, rather than on the
+  # build alone: something that packages cleanly still ships whatever the tests
+  # would have caught. Called only where a release can follow, since the Test
+  # workflow already runs on every push and pull request of its own accord, and
+  # the jobs below are gated the same way.
+  test:
+    if: github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main')
+    uses: ./.github/workflows/test.yml
+
+  # There is nothing to compile: the artifact is the script as checked out. It
+  # is uploaded here rather than attached from the release job so that what
+  # ships is the tree one job read, not a second checkout of a ref that may
+  # have moved.
   build:
     name: Build
     runs-on: ubuntu-latest
@@ -46,17 +59,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
 
-      - name: Set up Python
-        uses: actions/setup-python@v7.0.0
-        with:
-          python-version: "3.12"
-
-      - name: Install pytest
-        run: pip install pytest
-
-      - name: Run tests
-        run: python -m pytest test_ai_maintainer.py -v
-
       - name: Upload build artifact
         uses: actions/upload-artifact@v7.0.1
         with:
@@ -64,7 +66,7 @@ jobs:
           path: ai-maintainer
 
   release:
-    needs: [build, attributions]
+    needs: [build, test, attributions]
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     # The one job that writes: it creates and deletes releases and tags.
