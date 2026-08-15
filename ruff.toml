@@ -1,0 +1,7 @@
+# Matches keylight, the other Python repository here. The sources were written
+# wider than ruff's 88-column default, and reflowing them buys nothing.
+line-length = 120
+
+# The floor the README states. Without it ruff rewrites `Optional[X]` to
+# `X | None`, which is evaluated at import on 3.9 and raises there.
+target-version = "py39"
