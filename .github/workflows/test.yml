@@ -53,3 +53,29 @@ jobs:
 
       - name: Run tests
         run: python -m pytest test_ai_maintainer.py -v
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.12"
+
+      # Pinned in a manifest rather than installed by name, so Dependabot can
+      # see the version and a ruff release cannot turn this red on a commit
+      # that did not touch the sources.
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      # `ai-maintainer` carries no extension, so a bare `.` walks past it.
+      - name: Run ruff check
+        run: ruff check . ai-maintainer
+
+      - name: Run ruff format check
+        run: ruff format --check . ai-maintainer
