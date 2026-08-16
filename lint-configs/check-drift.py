@@ -132,11 +132,23 @@ def compare_bytes(canon_text, repo_text):
 def shellcheck_step(text):
     """The ShellCheck step out of a workflow, as a dict, or None when absent."""
     document = yaml.safe_load(text)
+    if not isinstance(document, dict):
+        return None
     for job in (document.get("jobs") or {}).values():
         for step in job.get("steps") or []:
             if "action-shellcheck" in str(step.get("uses", "")):
                 return step
     return None
+
+
+def workflow_names(repo):
+    """Every workflow file name, so a step is found wherever it was put.
+
+    Named files rather than test.yml alone: a step that moves is otherwise
+    skipped silently, which reads the same as having no drift.
+    """
+    out = gh("api", f"repos/andornaut/{repo}/contents/.github/workflows", "--jq", ".[].name")
+    return [n for n in (out or "").split() if n.endswith((".yml", ".yaml"))]
 
 
 def check(repo):
@@ -163,25 +175,28 @@ def check(repo):
         if diff:
             found.append(("eslint.config.base.mjs", diff))
 
-    content = fetch(repo, ".github/workflows/test.yml")
-    if content is not None:
+    for name in workflow_names(repo):
+        content = fetch(repo, f".github/workflows/{name}")
+        if content is None:
+            continue
         theirs = shellcheck_step(decode(content))
-        if theirs is not None:
-            canon_step = yaml.safe_load((CANON / "shell" / "shellcheck-step.yml").read_text())[0]
-            for key in SHELL_LOCAL:
-                (canon_step.get("with") or {}).pop(key, None)
-                (theirs.get("with") or {}).pop(key, None)
-            if canon_step != theirs:
-                diff = "\n".join(
-                    difflib.unified_diff(
-                        yaml.dump(canon_step, sort_keys=True).splitlines(),
-                        yaml.dump(theirs, sort_keys=True).splitlines(),
-                        "canon",
-                        "repository",
-                        lineterm="",
-                    )
+        if theirs is None:
+            continue
+        canon_step = yaml.safe_load((CANON / "shell" / "shellcheck-step.yml").read_text())[0]
+        for key in SHELL_LOCAL:
+            (canon_step.get("with") or {}).pop(key, None)
+            (theirs.get("with") or {}).pop(key, None)
+        if canon_step != theirs:
+            diff = "\n".join(
+                difflib.unified_diff(
+                    yaml.dump(canon_step, sort_keys=True).splitlines(),
+                    yaml.dump(theirs, sort_keys=True).splitlines(),
+                    "canon",
+                    "repository",
+                    lineterm="",
                 )
-                found.append(("ShellCheck step", diff))
+            )
+            found.append((f"ShellCheck step ({name})", diff))
 
     return found
 
