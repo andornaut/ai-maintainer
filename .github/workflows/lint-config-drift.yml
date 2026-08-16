@@ -46,7 +46,9 @@ jobs:
         run: pip install -r requirements-dev.txt
 
       # Reads every repository's copy through the API rather than cloning them.
-      # The default token cannot see them, so this uses the one that can.
+      # The default token reaches them because they are all public, and the
+      # script lists them through the anonymous endpoint for the same reason: a
+      # workflow token is not a user, so `user/repos` returns nothing for it.
       - name: Check for drift
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
