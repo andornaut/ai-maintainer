@@ -25,6 +25,12 @@ Where the copies are meant to differ, they differ in named places:
 
 The sweep skips those and compares the rest.
 
+A repository GitHub reports as holding Shell is also expected to carry the
+ShellCheck step at all, not merely to match it where it exists: a gate that was
+never added otherwise reads exactly like one that passed. `SHELL_EXEMPT` in
+`check-drift.py` names the repositories that lint shell some other way, each
+with the reason.
+
 ## Running it
 
     python3 lint-configs/check-drift.py            # report, exit 1 on drift

@@ -40,6 +40,19 @@ PYTHON_LOCAL = (
 )
 SHELL_LOCAL = ("scandir", "ignore_paths")
 
+# Repositories that hold shell and are meant to have no canonical ShellCheck
+# step. Everything else GitHub reports as Shell is expected to carry one: the
+# comparison below finds the step and skips a repository that has none, so a
+# gate that was never added reads exactly like a gate that passed.
+SHELL_EXEMPT = {
+    # tests/lint.sh runs ShellCheck itself. It renders Jinja templates to a
+    # temporary copy before checking them, which the action cannot do.
+    "ansible-ctrl",
+    # The only shell here is under fixtures/, which the suite feeds to the
+    # program under test rather than running.
+    "filectrl",
+}
+
 
 def gh(*args):
     """Run gh and return stdout, or None when it fails (a missing file, usually)."""
@@ -141,6 +154,20 @@ def shellcheck_step(text):
     return None
 
 
+def holds_shell(repo):
+    """Whether GitHub detects shell in the repository.
+
+    The languages endpoint rather than a sweep for *.sh: most of these scripts
+    carry no extension, and linguist reads the shebang.
+
+    One name per line, compared after splitting on lines: a name can hold a
+    space, and gh ends its output with a newline that would otherwise ride along
+    on the last name and stop it matching.
+    """
+    out = gh("api", f"repos/andornaut/{repo}/languages", "--jq", "keys[]")
+    return "Shell" in (out or "").splitlines()
+
+
 def workflow_names(repo):
     """Every workflow file name, so a step is found wherever it was put.
 
@@ -175,6 +202,7 @@ def check(repo):
         if diff:
             found.append(("eslint.config.base.mjs", diff))
 
+    stepped = False
     for name in workflow_names(repo):
         content = fetch(repo, f".github/workflows/{name}")
         if content is None:
@@ -182,6 +210,7 @@ def check(repo):
         theirs = shellcheck_step(decode(content))
         if theirs is None:
             continue
+        stepped = True
         canon_step = yaml.safe_load((CANON / "shell" / "shellcheck-step.yml").read_text())[0]
         for key in SHELL_LOCAL:
             (canon_step.get("with") or {}).pop(key, None)
@@ -197,6 +226,13 @@ def check(repo):
                 )
             )
             found.append((f"ShellCheck step ({name})", diff))
+
+    # Reported rather than skipped. Comparing a step only where one exists says
+    # nothing about a repository that holds shell and never added the step, and
+    # that repository is the one worth hearing about. SHELL_EXEMPT names the
+    # ones that lint shell some other way or deliberately do not.
+    if not stepped and repo not in SHELL_EXEMPT and holds_shell(repo):
+        found.append(("ShellCheck step", "no ShellCheck step in any workflow, and the repository holds shell"))
 
     return found
 
