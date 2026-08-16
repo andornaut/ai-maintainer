@@ -1248,8 +1248,7 @@ class TestGitHubClientCi:
     """CI status comes from a commit's checks, not from a branch run list."""
 
     def _client(self, tmp_path):
-        client = github_client(tmp_path)
-        return client
+        return github_client(tmp_path)
 
     def test_conclusion_comes_from_the_named_commits_checks(self, tmp_path):
         client = self._client(tmp_path)
@@ -1289,7 +1288,7 @@ class TestGitHubClientCi:
         client = self._client(tmp_path)
         client.get_check_runs = MagicMock(return_value=[])
         sleeps = []
-        monkeypatch.setattr(gm.time, "sleep", lambda s: sleeps.append(s))
+        monkeypatch.setattr(gm.time, "sleep", sleeps.append)
         # 1 minute at a 30s interval is 2 polls, so only 1 sleep between them
         assert client.wait_for_ci("abc", 1) is None
         assert len(sleeps) == 1
@@ -1923,7 +1922,8 @@ class TestABlockedSuiteIsNotNoTests:
         monkeypatch.setattr(type(maintainer.project_env), "env_runner", "nvm use &&")
         status, output = maintainer.run_tests()
         assert status == gm.TESTS_BLOCKED
-        assert "nvm use" in output and "nvm: version not installed" in output
+        assert "nvm use" in output
+        assert "nvm: version not installed" in output
 
     def test_a_guessed_runner_that_is_missing_does_not_block(self, repo_path, default_config, monkeypatch):
         # Test modules with no declared config are only a guess that the
@@ -2549,7 +2549,8 @@ class TestKillAgent:
         gm.AgentClient._kill_agent(proc)
         assert signals == [gm.signal.SIGTERM, gm.signal.SIGKILL]
         # Every drain was bounded, and the child was still reaped
-        assert proc.drains and all(t is not None for t in proc.drains)
+        assert proc.drains
+        assert all(t is not None for t in proc.drains)
         assert proc.waits == [5]
 
     def test_a_cooperative_agent_is_not_escalated(self, monkeypatch):
@@ -2684,7 +2685,7 @@ class TestNoPassWithoutEvidence:
         return github_client(tmp_path)
 
     @pytest.mark.parametrize(
-        "name,sequence",
+        ("name", "sequence"),
         [
             ("the API never answers", [None, None, None, None]),
             ("the commit never gets checks", [[], [], [], []]),
@@ -2715,7 +2716,7 @@ class TestNoPassWithoutEvidence:
         assert client.wait_for_ci("abc", 2) != "success", name
 
     @pytest.mark.parametrize(
-        "name,sequence",
+        ("name", "sequence"),
         [
             ("settled green", [[completed("success")]] * 4),
             (
@@ -2763,7 +2764,7 @@ class TestNoPassWithoutEvidence:
         git.get_remote_url.return_value = "git@gitlab.com:owner/repo.git"
         client = github_client(tmp_path, git)
         polls = []
-        monkeypatch.setattr(gm.time, "sleep", lambda s: polls.append(s))
+        monkeypatch.setattr(gm.time, "sleep", polls.append)
         assert client.get_ci_conclusion("abc") is None
         assert client.wait_for_ci("abc", 10) is None
         # Not merely fast because sleep is stubbed: it must not poll at all
@@ -2778,7 +2779,7 @@ class TestNoPassWithoutEvidence:
         assert client.get_ci_conclusion("head") == "failure"
 
     @pytest.mark.parametrize(
-        "checks,expected",
+        ("checks", "expected"),
         [
             ([completed("success")], "success"),
             ([completed("success"), completed("skipped", "b")], "success"),
@@ -2898,7 +2899,9 @@ class TestEveryFailureVerdictIsActionable:
             stdout="",
         )
         logs = client.get_ci_failure_logs("abc")
-        assert logs and "Release" in logs and ".github/workflows/" in logs
+        assert logs
+        assert "Release" in logs
+        assert ".github/workflows/" in logs
 
     def test_a_broken_workflow_beside_a_healthy_one(self, tmp_path):
         # The repository's other workflows still report, so a broken one that
@@ -2978,7 +2981,7 @@ class TestRunnerGuardCoversEveryProjectType:
             else:
                 (repo_path / name).write_text(content)
 
-    @pytest.mark.parametrize("name,files", SHAPES, ids=[s[0] for s in SHAPES])
+    @pytest.mark.parametrize(("name", "files"), SHAPES, ids=[s[0] for s in SHAPES])
     def test_a_missing_runner_yields_no_command(self, repo_path, default_config, monkeypatch, name, files):
         self._build(repo_path, files)
         # The Makefile branch probes its target with run_command
@@ -2987,7 +2990,7 @@ class TestRunnerGuardCoversEveryProjectType:
         maintainer = gm.Maintainer(repo_path, default_config)
         assert maintainer.detect_test_command() is None, name
 
-    @pytest.mark.parametrize("name,files", SHAPES, ids=[s[0] for s in SHAPES])
+    @pytest.mark.parametrize(("name", "files"), SHAPES, ids=[s[0] for s in SHAPES])
     def test_an_installed_runner_yields_a_command(self, repo_path, default_config, monkeypatch, name, files):
         # Without this the test above would pass for a shape that simply is
         # not detected, which would hide the very branch it means to cover
@@ -3312,7 +3315,7 @@ class TestARunReportsWhatItLogged:
         # Maintainer.__init__ detects the toolchain, which warns about what it
         # refuses; attributing that to no repository would drop the Result line
         def build_maintainer(path, cfg):
-            logging.getLogger(gm.__name__).warning(f"[{path.name}] Ignoring .ruby-version: not a plain version string")
+            logging.getLogger(gm.__name__).warning("[%s] Ignoring .ruby-version: not a plain version string", path.name)
             maintainer = MagicMock()
             maintainer.changed_remote = False
             maintainer.maintain = lambda: (gm.STATUS_SUCCESS, False)
