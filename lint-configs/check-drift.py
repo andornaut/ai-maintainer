@@ -18,9 +18,9 @@ import base64
 import difflib
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
-import tomllib
 import yaml
 
 CANON = Path(__file__).parent

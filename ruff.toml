@@ -8,9 +8,11 @@ line-length = 120
 # files locally as the gate does.
 extend-include = ["ai-maintainer"]
 
-# The floor the README states. Without it ruff rewrites `Optional[X]` to
-# `X | None`, which is evaluated at import on 3.9 and raises there.
-target-version = "py39"
+# The floor the README states, and the version .python-version pins, which is
+# the only one the gate runs. A floor below that is a claim nothing checks:
+# ruff holds the syntax it knows about to the target, but a stdlib call added
+# after it still imports clean here and raises on the older interpreter.
+target-version = "py312"
 
 [lint]
 # Every rule ruff has, then what is given up and why. The version is pinned in
