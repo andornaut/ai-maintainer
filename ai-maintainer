@@ -15,6 +15,7 @@ Manages GitHub repositories by:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import functools
 import json
 import logging
@@ -531,10 +532,8 @@ class AgentClient:
         repository's agent.
         """
         for sig in (signal.SIGTERM, signal.SIGKILL):
-            try:
+            with contextlib.suppress(OSError):
                 os.killpg(proc.pid, sig)
-            except OSError:
-                pass
             try:
                 proc.communicate(timeout=5)
                 return
@@ -542,10 +541,8 @@ class AgentClient:
                 continue
         # The agent is dead but something outlived it holding the pipes open.
         # Reap the child and leave the fds to be closed with the Popen object.
-        try:
+        with contextlib.suppress(subprocess.TimeoutExpired):
             proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
 
     def ask(self, prompt: str, context: dict[str, Any] | None = None) -> str | None:
         """Ask the AI agent for a decision.
@@ -791,7 +788,7 @@ class GitClient:
         # Fallback: check for common branch names (prefer main over master)
         if "refs/remotes/origin/main" in remote_refs:
             return "main"
-        elif "refs/remotes/origin/master" in remote_refs:
+        if "refs/remotes/origin/master" in remote_refs:
             return "master"
         return None
 
@@ -1596,7 +1593,7 @@ class Maintainer:
             title = "chore: automated maintenance"
             details = []
 
-        body = details + ["", COMMIT_ATTRIBUTION] if details else [COMMIT_ATTRIBUTION]
+        body = [*details, "", COMMIT_ATTRIBUTION] if details else [COMMIT_ATTRIBUTION]
         return f"{title}\n\n" + "\n".join(body)
 
     def commit_and_push(self, message: str) -> MaintainResult:
@@ -2074,7 +2071,8 @@ class Maintainer:
 
         if current_branch != default_branch:
             self.logger.info(
-                f"[{self.repo_name}] Not on default branch (current: {current_branch}, default: {default_branch}), skipping"
+                f"[{self.repo_name}] Not on default branch "
+                f"(current: {current_branch}, default: {default_branch}), skipping"
             )
             return False
 
@@ -2149,14 +2147,12 @@ class Maintainer:
                 if self.fix_ci_with_retries():
                     self.logger.info(f"[{self.repo_name}] Previous CI failure fixed")
                     return True, True
-                else:
-                    self.logger.error(f"[{self.repo_name}] Could not fix previous CI failure, skipping repo")
-                    return False, False
-            else:
-                self.logger.warning(
-                    f"[{self.repo_name}] CI is already failing (not from ai-maintainer), will not attempt fixes"
-                )
-                return True, False
+                self.logger.error(f"[{self.repo_name}] Could not fix previous CI failure, skipping repo")
+                return False, False
+            self.logger.warning(
+                f"[{self.repo_name}] CI is already failing (not from ai-maintainer), will not attempt fixes"
+            )
+            return True, False
 
         # "success", "in_progress", or any other non-failure status. Treat an
         # in-progress (or otherwise unknown) baseline as healthy so that if our
@@ -2641,11 +2637,11 @@ class Maintainer:
                 merged_prs.append(pr_num)
                 continue
 
-            head_sha = self._reverify_head(pr_num, head_sha)
-            if not head_sha:
+            verified_sha = self._reverify_head(pr_num, head_sha)
+            if not verified_sha:
                 continue
 
-            success, error = self.github.merge_pr(pr_num, head_sha)
+            success, error = self.github.merge_pr(pr_num, verified_sha)
             if success:
                 # gh exits 0 with an "already merged" notice when the PR was
                 # merged out of band; its changes are on the base branch, so
@@ -2899,9 +2895,7 @@ def check_prerequisites(agent_command: str) -> list[str]:
         # Malformed agent_command, add default
         required_tools.append("claude")
 
-    for tool in required_tools:
-        if not shutil.which(tool):
-            missing.append(tool)
+    missing.extend(tool for tool in required_tools if not shutil.which(tool))
 
     return missing
 
@@ -3229,7 +3223,7 @@ def main():
     if issues.total:
         report(f"Logged: {format_issue_counts(totals)}")
         for repo_name, counts in issues.counts.items():
-            label = repo_name if repo_name else "(outside any repository)"
+            label = repo_name or "(outside any repository)"
             report(f"  {label}: {format_issue_counts(counts)}")
     report("=" * 80)
 

@@ -75,7 +75,7 @@ jobs:
 
       # `ai-maintainer` carries no extension, so a bare `.` walks past it.
       - name: Run ruff check
-        run: ruff check . ai-maintainer
+        run: ruff check .
 
       - name: Run ruff format check
-        run: ruff format --check . ai-maintainer
+        run: ruff format --check .

@@ -3,6 +3,11 @@
 # reflowing them buys nothing.
 line-length = 120
 
+# The CLI itself carries no .py extension, and ruff finds files by extension.
+# Named here rather than on the command line, so `ruff check .` covers the same
+# files locally as the gate does.
+extend-include = ["ai-maintainer"]
+
 # The floor the README states. Without it ruff rewrites `Optional[X]` to
 # `X | None`, which is evaluated at import on 3.9 and raises there.
 target-version = "py39"
@@ -44,6 +49,14 @@ ignore = [
     # type flowing through these scripts, and none of them has a test that would
     # catch a bad rewrite.
     "PTH",
+    # Every logging call here formats its own message, and there are 163 of
+    # them. The lazy-formatting this asks for buys nothing in a tool that logs
+    # to a terminal at a level the user chose, and rewriting each one to
+    # %-style arguments is 163 chances to mismatch a placeholder.
+    "G004",
+    # Wants a traceback logged for every handled error. The conditions caught
+    # here are expected ones an operator reads as a line, not as a stack.
+    "TRY400",
 ]
 
 [lint.per-file-ignores]
@@ -52,3 +65,6 @@ ignore = [
 # fixture data rather than writing to them.
 "**/test_*.py" = ["ARG", "S101", "S108", "SLF001"]
 "**/*_test.py" = ["ARG", "S101", "S108", "SLF001"]
+
+# Running a subprocess is what this tool does: it drives git and an agent.
+"ai-maintainer" = ["S603"]
