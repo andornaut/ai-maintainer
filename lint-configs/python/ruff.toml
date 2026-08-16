@@ -51,16 +51,3 @@ ignore = [
     "PTH",
 ]
 
-[lint.per-file-ignores]
-# A test asserts, reaches into the unit it covers, writes stubs whose arguments
-# exist to match a signature rather than to be read, and names /tmp paths as
-# fixture data rather than writing to them.
-"**/test_*.py" = ["ARG", "S101", "S108", "SLF001"]
-"**/*_test.py" = ["ARG", "S101", "S108", "SLF001"]
-
-# Scoped to the CLI rather than the whole repository: running a subprocess is
-# what this tool does; its 163 logging calls format their own message, where the
-# lazy formatting G004 asks for buys nothing and rewriting each to %-style
-# arguments is 163 chances to mismatch a placeholder; and the errors it handles
-# are expected conditions an operator reads as a line, not as a stack.
-"ai-maintainer" = ["G004", "S603", "TRY400"]

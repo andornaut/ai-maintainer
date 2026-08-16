@@ -1,0 +1,53 @@
+name: Lint config drift
+
+# Weekly, and on a change to the canonical configs themselves, because editing
+# canon is the moment every copy of it becomes stale.
+#
+# Reports rather than repairs: a repository can be behind canon or ahead of it,
+# having reached a stricter position on its own, and only a reader can tell
+# which. A failed run is the notification; the log holds the diff.
+on:
+  schedule:
+    # Mondays, early enough that the week's first look at CI includes it.
+    - cron: "0 7 * * 1"
+  push:
+    branches: [main]
+    paths:
+      - lint-configs/**
+      - .github/workflows/lint-config-drift.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One at a time. A scheduled run and a push that lands while it is going would
+# otherwise report the same drift twice.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  drift:
+    name: Drift
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.12"
+
+      # Pinned in a manifest rather than installed by name, so a release cannot
+      # turn this red on a commit that did not touch it.
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      # Reads every repository's copy through the API rather than cloning them.
+      # The default token cannot see them, so this uses the one that can.
+      - name: Check for drift
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 lint-configs/check-drift.py

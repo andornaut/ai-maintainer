@@ -1,2 +1,5 @@
 pytest==9.1.1
 ruff==0.16.3
+# The drift sweep parses each repository's lint config to compare the shared
+# part, and reads the ShellCheck step out of a workflow.
+PyYAML==6.0.3
