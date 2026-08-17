@@ -17,11 +17,12 @@ the diff before deciding which side moves.
 Where the copies are meant to differ, they differ in named places:
 
 | Language | Per-repository, by design |
-|---|---|
+| --- | --- |
 | Go | the `gci` import prefix, the `gosec` suppression list, exclusion rules a repository states are local |
 | Python | `per-file-ignores`, `extend-include`, `extend-exclude`, and `target-version` where a repository states a floor |
 | JavaScript | nothing: `eslint.config.base.mjs` is byte-identical everywhere, and each repository's own `eslint.config.mjs` applies it to its paths |
 | Shell | `scandir` and `ignore_paths`, which name a repository's own vendored trees |
+| Markdown | `ignores`, where a repository adds its own test data to the shared entries |
 
 The sweep skips those and compares the rest.
 
@@ -30,6 +31,11 @@ ShellCheck step at all, not merely to match it where it exists: a gate that was
 never added otherwise reads exactly like one that passed. `SHELL_EXEMPT` in
 `check-drift.py` names the repositories that lint shell some other way, each
 with the reason.
+
+Markdown is checked for presence the same way, and has no exemption list: every
+repository here carries at least a `README.md`, so both `.markdownlint-cli2.yaml`
+and the step are expected everywhere. The Go and Python configs are the ones
+skipped where the language is absent.
 
 ## Running it
 

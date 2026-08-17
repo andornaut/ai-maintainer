@@ -39,6 +39,9 @@ PYTHON_LOCAL = (
     ("builtins",),
 )
 SHELL_LOCAL = ("scandir", "ignore_paths")
+# The Markdown ignore list names a repository's own test data, which is meant to
+# differ. The step takes no per-repository input, so it is compared whole.
+MARKDOWN_LOCAL = (("ignores",),)
 
 # Repositories that hold shell and are meant to have no canonical ShellCheck
 # step. Everything else GitHub reports as Shell is expected to carry one: the
@@ -116,13 +119,8 @@ def local_rules(tree):
     return tree
 
 
-def compare_structured(name, canon_text, repo_text, loader, locals_):
-    canon = strip(loader(canon_text), locals_)
-    theirs = strip(loader(repo_text), locals_)
-    if name == "go":
-        canon, theirs = local_rules(canon), local_rules(theirs)
-    if canon == theirs:
-        return None
+def diff_trees(canon, theirs):
+    """A unified diff of two parsed configs, rendered through yaml for reading."""
     return "\n".join(
         difflib.unified_diff(
             yaml.dump(canon, sort_keys=True).splitlines(),
@@ -134,6 +132,16 @@ def compare_structured(name, canon_text, repo_text, loader, locals_):
     )
 
 
+def compare_structured(name, canon_text, repo_text, loader, locals_):
+    canon = strip(loader(canon_text), locals_)
+    theirs = strip(loader(repo_text), locals_)
+    if name == "go":
+        canon, theirs = local_rules(canon), local_rules(theirs)
+    if canon == theirs:
+        return None
+    return diff_trees(canon, theirs)
+
+
 def compare_bytes(canon_text, repo_text):
     if canon_text == repo_text:
         return None
@@ -142,14 +150,14 @@ def compare_bytes(canon_text, repo_text):
     )
 
 
-def shellcheck_step(text):
-    """The ShellCheck step out of a workflow, as a dict, or None when absent."""
+def workflow_step(text, action):
+    """The step running `action` out of a workflow, as a dict, or None when absent."""
     document = yaml.safe_load(text)
     if not isinstance(document, dict):
         return None
     for job in (document.get("jobs") or {}).values():
         for step in job.get("steps") or []:
-            if "action-shellcheck" in str(step.get("uses", "")):
+            if action in str(step.get("uses", "")):
                 return step
     return None
 
@@ -182,18 +190,27 @@ def check(repo):
     """Every drifted artifact in one repository, as (label, diff) pairs."""
     found = []
 
-    for label, path, loader, locals_ in (
-        ("go", ".golangci.yml", yaml.safe_load, GO_LOCAL),
-        ("python", "ruff.toml", tomllib.loads, PYTHON_LOCAL),
+    present = set()
+    for label, path, canon_name, loader, locals_ in (
+        ("go", ".golangci.yml", "golangci.yml", yaml.safe_load, GO_LOCAL),
+        ("python", "ruff.toml", "ruff.toml", tomllib.loads, PYTHON_LOCAL),
+        ("markdown", ".markdownlint-cli2.yaml", "markdownlint-cli2.yaml", yaml.safe_load, MARKDOWN_LOCAL),
     ):
         content = fetch(repo, path)
         if content is None:
             continue
-        canon_name = "golangci.yml" if label == "go" else "ruff.toml"
+        present.add(label)
         canon_text = (CANON / label / canon_name).read_text()
         diff = compare_structured(label, canon_text, decode(content), loader, locals_)
         if diff:
             found.append((path, diff))
+
+    # Reported rather than skipped, on the same reasoning as the ShellCheck step
+    # below. Go and Python configs are skipped where the language is absent, but
+    # every repository here holds at least a README.md, so a missing Markdown
+    # config is a gate nobody added rather than one that does not apply.
+    if "markdown" not in present:
+        found.append((".markdownlint-cli2.yaml", "no markdownlint config, and every repository here holds Markdown"))
 
     content = fetch(repo, "eslint.config.base.mjs")
     if content is not None:
@@ -203,29 +220,29 @@ def check(repo):
             found.append(("eslint.config.base.mjs", diff))
 
     stepped = False
+    md_stepped = False
     for name in workflow_names(repo):
         content = fetch(repo, f".github/workflows/{name}")
         if content is None:
             continue
-        theirs = shellcheck_step(decode(content))
-        if theirs is None:
-            continue
-        stepped = True
-        canon_step = yaml.safe_load((CANON / "shell" / "shellcheck-step.yml").read_text())[0]
-        for key in SHELL_LOCAL:
-            (canon_step.get("with") or {}).pop(key, None)
-            (theirs.get("with") or {}).pop(key, None)
-        if canon_step != theirs:
-            diff = "\n".join(
-                difflib.unified_diff(
-                    yaml.dump(canon_step, sort_keys=True).splitlines(),
-                    yaml.dump(theirs, sort_keys=True).splitlines(),
-                    "canon",
-                    "repository",
-                    lineterm="",
-                )
-            )
-            found.append((f"ShellCheck step ({name})", diff))
+        text = decode(content)
+
+        theirs = workflow_step(text, "action-shellcheck")
+        if theirs is not None:
+            stepped = True
+            canon_step = yaml.safe_load((CANON / "shell" / "shellcheck-step.yml").read_text())[0]
+            for key in SHELL_LOCAL:
+                (canon_step.get("with") or {}).pop(key, None)
+                (theirs.get("with") or {}).pop(key, None)
+            if canon_step != theirs:
+                found.append((f"ShellCheck step ({name})", diff_trees(canon_step, theirs)))
+
+        theirs = workflow_step(text, "markdownlint-cli2-action")
+        if theirs is not None:
+            md_stepped = True
+            canon_step = yaml.safe_load((CANON / "markdown" / "markdownlint-step.yml").read_text())[0]
+            if canon_step != theirs:
+                found.append((f"markdownlint step ({name})", diff_trees(canon_step, theirs)))
 
     # Reported rather than skipped. Comparing a step only where one exists says
     # nothing about a repository that holds shell and never added the step, and
@@ -233,6 +250,11 @@ def check(repo):
     # ones that lint shell some other way or deliberately do not.
     if not stepped and repo not in SHELL_EXEMPT and holds_shell(repo):
         found.append(("ShellCheck step", "no ShellCheck step in any workflow, and the repository holds shell"))
+
+    if not md_stepped:
+        found.append(
+            ("markdownlint step", "no markdownlint step in any workflow, and every repository here holds Markdown")
+        )
 
     return found
 
