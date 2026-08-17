@@ -38,8 +38,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
         with:
-          # Nothing in this job uses the token, so it is not left
-          # in .git/config for a later step to read.
+          # Nothing in this job reads a repository through git, so the
+          # credential is not left in .git/config for a later step to use. The
+          # step below reaches the API with a token it is handed directly.
           persist-credentials: false
 
       - name: Set up Python
