@@ -22,7 +22,7 @@ Where the copies are meant to differ, they differ in named places:
 | Python | `per-file-ignores`, `extend-include`, `extend-exclude`, and `target-version` where a repository states a floor |
 | JavaScript | the eslint entries in `.lintstagedrc`, which name the script types a repository holds; `eslint.config.base.mjs` is byte-identical everywhere, and each repository's own `eslint.config.mjs` applies it to its paths |
 | Shell | `scandir` and `ignore_paths`, which name a repository's own vendored trees |
-| Markdown | `ignores`, where a repository adds its own test data to the shared entries |
+| Markdown | `ignores`, where a repository adds its own test data to the shared entries. Additions only: an entry canon names and a copy does not is reported |
 
 The sweep skips those and compares the rest.
 

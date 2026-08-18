@@ -41,7 +41,9 @@ PYTHON_LOCAL = (
 )
 SHELL_LOCAL = ("scandir", "ignore_paths")
 # The Markdown ignore list names a repository's own test data, which is meant to
-# differ. The step takes no per-repository input, so it is compared whole.
+# differ, so it is not compared whole. What canon names in it is still required:
+# dropped_ignores below reports an entry that went missing. The step takes no
+# per-repository input, so it is compared whole.
 MARKDOWN_LOCAL = (("ignores",),)
 
 # Repositories that hold shell and are meant to have no canonical ShellCheck
@@ -119,6 +121,20 @@ def prettier_entries(tree):
     --ignore-unknown is what keeps the two the same set.
     """
     return {glob: cmd for glob, cmd in tree.items() if "prettier" in str(cmd)}
+
+
+def dropped_ignores(canon_text, repo_text):
+    """Canonical Markdown ignore entries a repository no longer names.
+
+    Adding to this list is a local decision, which is why the key is not
+    compared whole. Dropping from it is not: node_modules is what keeps a local
+    run from walking a dependency tree that CI's checkout does not have, and the
+    agent instruction files are local-only, so a copy that stops naming them
+    starts linting files that are not in the repository.
+    """
+    canon = yaml.safe_load(canon_text).get("ignores") or []
+    theirs = set(yaml.safe_load(repo_text).get("ignores") or [])
+    return [entry for entry in canon if entry not in theirs]
 
 
 def local_rules(tree):
@@ -213,9 +229,14 @@ def check(repo):
             continue
         present.add(label)
         canon_text = (CANON / label / canon_name).read_text()
-        diff = compare_structured(label, canon_text, decode(content), loader, locals_)
+        repo_text = decode(content)
+        diff = compare_structured(label, canon_text, repo_text, loader, locals_)
         if diff:
             found.append((path, diff))
+        if label == "markdown":
+            missing = dropped_ignores(canon_text, repo_text)
+            if missing:
+                found.append((path, "ignores no longer names: " + ", ".join(missing)))
 
     # Reported rather than skipped, on the same reasoning as the ShellCheck step
     # below. Go and Python configs are skipped where the language is absent, but
