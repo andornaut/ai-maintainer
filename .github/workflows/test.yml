@@ -59,7 +59,7 @@ jobs:
         run: pip install -r requirements-dev.txt
 
       - name: Run tests
-        run: python -m pytest test_ai_maintainer.py -v
+        run: python -m pytest -v
 
   lint:
     name: Lint
