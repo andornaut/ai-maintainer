@@ -941,6 +941,33 @@ class TestRunGit:
         assert shell == ["nvm use && git pull"]
 
 
+class TestGitHubClientIsCommitVerified:
+    """The gate answers who produced a commit, not merely that it is signed."""
+
+    def _client(self, tmp_path, stdout, success=True):
+        client = github_client(tmp_path)
+        client._run = MagicMock(return_value=(success, stdout, ""))
+        return client
+
+    def test_a_commit_github_signed_for_dependabot_verifies(self, tmp_path):
+        client = self._client(tmp_path, "true\nnoreply@github.com\n")
+        assert client.is_commit_verified("cafe1234") is True
+
+    def test_a_signature_under_another_identity_does_not(self, tmp_path):
+        # An agent that rebases the branch signs it with its own key, and
+        # GitHub reports that commit verified too.
+        client = self._client(tmp_path, "true\nnoreply@anthropic.com\n")
+        assert client.is_commit_verified("cafe1234") is False
+
+    def test_an_unsigned_commit_does_not(self, tmp_path):
+        client = self._client(tmp_path, "false\nnoreply@github.com\n")
+        assert client.is_commit_verified("cafe1234") is False
+
+    def test_a_response_it_cannot_read_fails_closed(self, tmp_path):
+        assert self._client(tmp_path, "true\n").is_commit_verified("cafe1234") is False
+        assert self._client(tmp_path, "", success=False).is_commit_verified("cafe1234") is False
+
+
 class TestGitHubClientMergePr:
     """merge_pr stamps the squash commit so later runs can recognize it."""
 

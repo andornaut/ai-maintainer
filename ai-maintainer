@@ -158,6 +158,12 @@ CHECK_SET_STABLE_POLLS = 2
 # becomes mergeable on a subsequent run.
 DEPENDABOT_REBASE_COMMAND = "@dependabot rebase"
 
+# The committer on a commit GitHub made on the account's behalf, which is what
+# dependabot's carry. Checked alongside the signature: a signature says only
+# that a key GitHub trusts signed the commit, and anything else holding one
+# signs under its own identity.
+GITHUB_COMMITTER_EMAIL = "noreply@github.com"
+
 # Cap on the number of staged paths named in the pre-commit log line
 MAX_LOGGED_STAGED_FILES = 20
 
@@ -1348,10 +1354,15 @@ class GitHubClient:
         return permission in ("ADMIN", "MAINTAIN", "WRITE")
 
     def is_commit_verified(self, commit_sha: str) -> bool:
-        """Check if a commit is verified (GPG signed) using GitHub API.
+        """Whether GitHub produced and signed this commit, as dependabot's are.
 
-        GitHub signs dependabot commits with their GPG key. This checks
-        the verification status via the GitHub API.
+        Dependabot's commits are committed by `GitHub <noreply@github.com>` and
+        signed with GitHub's PGP key, and both halves are read here. The
+        signature alone answers only that some key GitHub trusts signed the
+        commit: anything else holding a signing key on this account rebases the
+        branch and verifies too, under its own identity, which is how an agent
+        run came to sign one `Claude <noreply@anthropic.com>`. Whoever produced
+        the commit is the question this gate exists to answer.
         """
         if not self.owner_repo:
             return False
@@ -1362,13 +1373,19 @@ class GitHubClient:
                 "api",
                 f"repos/{self.owner_repo}/commits/{commit_sha}",
                 "--jq",
-                ".commit.verification.verified",
+                ".commit.verification.verified, .commit.committer.email",
             ]
         )
         if not success:
             return False
 
-        return stdout.strip().lower() == "true"
+        # One field per line, and an address holds no whitespace. Anything else
+        # is a response this cannot read, which fails closed like the rest.
+        fields = stdout.split()
+        if len(fields) != 2:
+            return False
+        verified, committer = fields
+        return verified.lower() == "true" and committer == GITHUB_COMMITTER_EMAIL
 
     def wait_for_ci(self, head_sha: str, timeout_minutes: int) -> str | None:
         """Wait for a commit's checks to conclude.
@@ -2610,14 +2627,17 @@ class Maintainer:
             self.logger.warning(f"[{self.repo_name}] PR #{pr_num} branch '{branch}' doesn't match dependabot pattern")
             return False
 
-        # Check GPG signature verification (GitHub signs dependabot commits).
-        # A missing SHA fails closed: this is the only cryptographic gate on
-        # an automatic merge, so absent evidence is not evidence of safety.
+        # GitHub committed and signed it, which is what dependabot's commits
+        # carry. A missing SHA fails closed: this is the only cryptographic
+        # gate on an automatic merge, so absent evidence is not evidence of
+        # safety.
         if not head_sha:
             self.logger.warning(f"[{self.repo_name}] PR #{pr_num} has no head commit SHA to verify")
             return False
         if not self.github.is_commit_verified(head_sha):
-            self.logger.warning(f"[{self.repo_name}] PR #{pr_num} head commit {head_sha[:7]} is not GPG verified")
+            self.logger.warning(
+                f"[{self.repo_name}] PR #{pr_num} head commit {head_sha[:7]} was not committed and signed by GitHub"
+            )
             return False
 
         return True
