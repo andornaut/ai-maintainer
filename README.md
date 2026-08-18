@@ -108,7 +108,7 @@ What is trusted: the GitHub CLI's authentication, dependabot's identity as repor
 ### Mitigations
 
 - Untrusted context is fenced off in the prompt behind an explicit injection warning, and is labelled as data to analyze rather than instructions to follow.
-- Dependabot PRs are verified programmatically, with no AI in the loop: the branch must match `dependabot/<ecosystem>/<package>`, the head commit must be GPG-verified by GitHub, and the merge is pinned to that exact commit with `--match-head-commit`, so a branch that moves between verification and merge is rejected.
+- Dependabot PRs are verified programmatically, with no AI in the loop: the branch must match `dependabot/<ecosystem>/<package>`, the head commit must be signed by GitHub and committed by it, which a rebase under another identity is not, and the merge is pinned to that exact commit with `--match-head-commit`, so a branch that moves between verification and merge is rejected.
 - The agent runs in its own process group with no terminal, no stdin, and a hard timeout; each repository additionally has a wall-clock budget.
 - The agent's claims are checked against the working tree: changes it did not report are discarded, and a fix it claims to have made but did not is rejected.
 - Every file going into a commit is named in the log, so anything the agent left behind is visible.
