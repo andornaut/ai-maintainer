@@ -16,6 +16,7 @@ Exits 1 when anything has drifted, 0 when nothing has.
 import argparse
 import base64
 import difflib
+import json
 import subprocess
 import sys
 import tomllib
@@ -107,6 +108,17 @@ def strip(tree, paths):
         if isinstance(node, dict):
             node.pop(path[-1], None)
     return tree
+
+
+def prettier_entries(tree):
+    """The lint-staged entries that run prettier, which every repository shares.
+
+    The eslint entries name the script types a repository actually holds, so they
+    are its own. The prettier entry is not: a hand-written type list is how the
+    hook came to cover less than `prettier --check .` does, and `*` with
+    --ignore-unknown is what keeps the two the same set.
+    """
+    return {glob: cmd for glob, cmd in tree.items() if "prettier" in str(cmd)}
 
 
 def local_rules(tree):
@@ -218,6 +230,18 @@ def check(repo):
         diff = compare_bytes(canon_text, decode(content))
         if diff:
             found.append(("eslint.config.base.mjs", diff))
+
+    content = fetch(repo, ".lintstagedrc")
+    if content is not None:
+        canon = prettier_entries(json.loads((CANON / "javascript" / "lintstagedrc").read_text()))
+        theirs = prettier_entries(json.loads(decode(content)))
+        if canon != theirs:
+            found.append((".lintstagedrc", diff_trees(canon, theirs)))
+    elif fetch(repo, "package.json") is not None:
+        # Reported rather than skipped, on the reasoning the step checks below
+        # share: a repository that never added the hook reads exactly like one
+        # whose hook matched.
+        found.append((".lintstagedrc", "no lint-staged config, and the repository has a package.json"))
 
     stepped = False
     md_stepped = False

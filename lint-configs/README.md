@@ -20,7 +20,7 @@ Where the copies are meant to differ, they differ in named places:
 | --- | --- |
 | Go | the `gci` import prefix, the `gosec` suppression list, exclusion rules a repository states are local |
 | Python | `per-file-ignores`, `extend-include`, `extend-exclude`, and `target-version` where a repository states a floor |
-| JavaScript | nothing: `eslint.config.base.mjs` is byte-identical everywhere, and each repository's own `eslint.config.mjs` applies it to its paths |
+| JavaScript | the eslint entries in `.lintstagedrc`, which name the script types a repository holds; `eslint.config.base.mjs` is byte-identical everywhere, and each repository's own `eslint.config.mjs` applies it to its paths |
 | Shell | `scandir` and `ignore_paths`, which name a repository's own vendored trees |
 | Markdown | `ignores`, where a repository adds its own test data to the shared entries |
 
@@ -36,6 +36,12 @@ Markdown is checked for presence the same way, and has no exemption list: every
 repository here carries at least a `README.md`, so both `.markdownlint-cli2.yaml`
 and the step are expected everywhere. The Go and Python configs are the ones
 skipped where the language is absent.
+
+A repository with a `package.json` is expected to carry a `.lintstagedrc`, and its
+prettier entry to be `*` with `--ignore-unknown`. Only that entry is compared. The
+hook and CI have to cover one set of files: a hand-written list of types is how the
+hook came to check less than `prettier --check .` does, missing the
+`.markdownlint-cli2.yaml` every repository carries.
 
 ## Running it
 
