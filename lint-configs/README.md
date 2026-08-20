@@ -1,7 +1,8 @@
 # Lint configs
 
-The canonical lint configuration for each language, and the sweep that reports
-where a repository's copy has drifted from it.
+The canonical lint configuration for each language, plus the two files that are
+meant to be byte-identical everywhere, and the sweep that reports where a
+repository's copy has drifted from any of them.
 
 Every repository carries its own copy, because none of these tools can inherit
 from somewhere else: `golangci-lint` has no include mechanism at all, and
@@ -42,6 +43,17 @@ prettier entry to be `*` with `--ignore-unknown`. Only that entry is compared. T
 hook and CI have to cover one set of files: a hand-written list of types is how the
 hook came to check less than `prettier --check .` does, missing the
 `.markdownlint-cli2.yaml` every repository carries.
+
+The same repository is expected to carry `.husky/pre-commit`, compared byte for
+byte: it is one line, `npx lint-staged`, and every difference is a difference in
+what the hook runs.
+
+`.github/workflows/ai-attributions.yml` is compared byte for byte in every
+repository, rather than by step as the ShellCheck and markdownlint gates are. It
+is the attribution gate's own configuration, so a copy that quietly lost
+`agents-files`, `emdashes` or `fetch-depth` still runs, still reports success, and
+checks less than the others do. Absence is reported too, on the same reasoning as
+the steps above.
 
 ## Running it
 

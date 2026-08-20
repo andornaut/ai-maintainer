@@ -264,6 +264,27 @@ def check(repo):
         # whose hook matched.
         found.append((".lintstagedrc", "no lint-staged config, and the repository has a package.json"))
 
+    content = fetch(repo, ".husky/pre-commit")
+    if content is not None:
+        canon_text = (CANON / "javascript" / "husky-pre-commit").read_text()
+        diff = compare_bytes(canon_text, decode(content))
+        if diff:
+            found.append((".husky/pre-commit", diff))
+    elif fetch(repo, "package.json") is not None:
+        found.append((".husky/pre-commit", "no commit hook, and the repository has a package.json"))
+
+    # The attributions workflow, byte for byte rather than by step: it is the
+    # gate's own configuration, and a copy that quietly lost agents-files,
+    # emdashes or fetch-depth still runs and still reports success.
+    content = fetch(repo, ".github/workflows/ai-attributions.yml")
+    if content is not None:
+        canon_text = (CANON / "attributions" / "ai-attributions.yml").read_text()
+        diff = compare_bytes(canon_text, decode(content))
+        if diff:
+            found.append((".github/workflows/ai-attributions.yml", diff))
+    else:
+        found.append((".github/workflows/ai-attributions.yml", "no attributions workflow"))
+
     stepped = False
     md_stepped = False
     for name in workflow_names(repo):

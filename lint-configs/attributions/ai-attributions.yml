@@ -1,0 +1,60 @@
+name: AI attributions
+
+# Every branch, not just pull requests: work lands on main directly as often as
+# it arrives through one.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  # Called by the release workflow, so that nothing is published that this has
+  # not passed. Workflows do not wait on each other, so a green scan beside a
+  # release says nothing about whether the release waited for it.
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Keyed on the branch rather than the ref, so a re-push to one branch cancels
+# its own earlier scan and not another branch's. Keyed by the event as well: a
+# cancelled run leaves its check runs on the head commit, and GitHub counts
+# those against the required checks, so a push and its pull request cancelling
+# each other would block the merge.
+# Keyed by the calling workflow as well, so the run started by a push and the
+# run the release workflow calls do not cancel each other.
+# Qualified by the repository the branch lives in, since a fork names its
+# branches itself: two pull requests from different forks would otherwise share
+# a group whenever they pick the same branch name.
+concurrency:
+  group: attributions-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  ai-attributions:
+    name: AI attributions
+    runs-on: ubuntu-latest
+    # Capped well under the six-hour default: nothing here runs longer than
+    # six minutes, so a job still going at fifteen has hung rather than failed.
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+        with:
+          # Nothing in this job uses the token, so it is not left
+          # in .git/config for a later step to read.
+          persist-credentials: false
+          fetch-depth: 0
+
+      # Scans what the push or the pull request added, not the history it
+      # arrived on, and fails with the commands to take an attribution back off.
+      - name: Scan for AI attributions
+        uses: andornaut/ai-attributions@v1
+        with:
+          # Agent instruction files are local-only, so a branch that ships one
+          # fails here rather than waiting for a nightly sweep to notice.
+          agents-files: true
+          # An emdash or an endash is house style rather than an ad, so a
+          # message carrying one fails beside the attributions instead of being
+          # left alone.
+          emdashes: true
