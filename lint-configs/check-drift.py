@@ -190,18 +190,18 @@ def workflow_step(text, action):
     return None
 
 
-def holds_shell(repo):
-    """Whether GitHub detects shell in the repository.
+def holds_language(repo, language):
+    """Whether GitHub detects a language in the repository.
 
-    The languages endpoint rather than a sweep for *.sh: most of these scripts
-    carry no extension, and linguist reads the shebang.
+    The languages endpoint rather than a sweep for an extension: most of the
+    shell scripts carry none, and linguist reads the shebang.
 
     One name per line, compared after splitting on lines: a name can hold a
     space, and gh ends its output with a newline that would otherwise ride along
     on the last name and stop it matching.
     """
     out = gh("api", f"repos/andornaut/{repo}/languages", "--jq", "keys[]")
-    return "Shell" in (out or "").splitlines()
+    return language in (out or "").splitlines()
 
 
 def workflow_names(repo):
@@ -244,6 +244,14 @@ def check(repo):
     # config is a gate nobody added rather than one that does not apply.
     if "markdown" not in present:
         found.append((".markdownlint-cli2.yaml", "no markdownlint config, and every repository here holds Markdown"))
+
+    # Compared above only where the file exists, so absence needs asking about
+    # separately: a repository that holds the language and carries no config has
+    # a gate nobody added, which reads exactly like one every file passed. Same
+    # reasoning as the ShellCheck step below, and the same source for presence.
+    for label, path, language in (("go", ".golangci.yml", "Go"), ("python", "ruff.toml", "Python")):
+        if label not in present and holds_language(repo, language):
+            found.append((path, f"no {label} config, and GitHub reports {language}"))
 
     content = fetch(repo, "eslint.config.base.mjs")
     if content is not None:
@@ -314,7 +322,7 @@ def check(repo):
     # nothing about a repository that holds shell and never added the step, and
     # that repository is the one worth hearing about. SHELL_EXEMPT names the
     # ones that lint shell some other way or deliberately do not.
-    if not stepped and repo not in SHELL_EXEMPT and holds_shell(repo):
+    if not stepped and repo not in SHELL_EXEMPT and holds_language(repo, "Shell"):
         found.append(("ShellCheck step", "no ShellCheck step in any workflow, and the repository holds shell"))
 
     if not md_stepped:

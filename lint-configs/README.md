@@ -35,8 +35,9 @@ with the reason.
 
 Markdown is checked for presence the same way, and has no exemption list: every
 repository here carries at least a `README.md`, so both `.markdownlint-cli2.yaml`
-and the step are expected everywhere. The Go and Python configs are the ones
-skipped where the language is absent.
+and the step are expected everywhere. The Go and Python configs are skipped where
+the language is absent, and reported where GitHub detects the language and the
+config is missing, read from the same languages endpoint the Shell check uses.
 
 A repository with a `package.json` is expected to carry a `.lintstagedrc`, and its
 prettier entry to be `*` with `--ignore-unknown`. Only that entry is compared. The
