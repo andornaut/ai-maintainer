@@ -1,7 +1,7 @@
 # AI Maintainer
 
 [![CI](https://github.com/andornaut/ai-maintainer/actions/workflows/release.yml/badge.svg)](https://github.com/andornaut/ai-maintainer/actions/workflows/release.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/license/MIT)
 
 Automated GitHub repository maintenance with AI-powered dependency updates, test fixing, and CI monitoring.
 
@@ -16,7 +16,7 @@ chmod +x ai-maintainer
 ln -s "$(pwd)/ai-maintainer" ~/.local/bin/
 ```
 
-**Requirements**: Python 3.12+, Git, [GitHub CLI](https://cli.github.com/), and [Claude Code CLI](https://platform.claude.com/docs/en/docs/claude-code) (or [Ollama](https://ollama.com/))
+**Requirements**: Python 3.12+, Git, [GitHub CLI](https://cli.github.com/), and [Claude Code CLI](https://code.claude.com/docs) (or [Ollama](https://ollama.com/))
 
 Authenticate the GitHub CLI with `gh auth login`. This is mandatory: ai-maintainer checks it once at startup and exits if it fails, because CI status, write-access detection and dependabot verification all go through the API, and a run without it would report success for work it never did. The token needs the `repo` **and** `workflow` scopes. `workflow` is required to merge dependabot PRs that bump GitHub Actions; without it those merges fail with `refusing to allow an OAuth App to create or update workflow ... without 'workflow' scope`. Add the scope to an existing login with:
 
