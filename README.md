@@ -57,6 +57,8 @@ For each repository:
 
 ai-maintainer auto-detects each project's toolchain (Node via nvm/fnm, Python via pipenv/poetry/venv, Ruby via chruby/rbenv, plus Go and Rust) and activates it when running tests and git operations, so git hooks (e.g. husky `pre-commit`) use the project's runtime rather than whatever is on the ambient PATH. The same activation prefix is given to the AI agent, so its package-manager commands resolve the project's runtime too.
 
+Step 4 asks the package managers what is out of date (`bundle outdated`, `npm outdated`) and hands the agent that list, so successive runs over an unchanged repository agree on what is available. Each candidate is dated against its registry, and anything published within `--dependency-min-age-days` is held back before the list reaches the agent; a candidate that cannot be dated is passed on rather than dropped. Ecosystems with no query (Cargo, pip, Go) contribute no list, and there the age limit stays an instruction to the agent rather than something the tool applies.
+
 Skips repos that are: not git repos, not on default branch, have uncommitted changes, are archived/read-only, or have no dependency files.
 
 A repository with no detectable test command is reported as unverified rather than passing, and one whose declared test runner is not installed is abandoned rather than committed to. Each repository has a wall-clock budget (`--repo-timeout`) that bounds its CI waits as well as its fix attempts, so one repo cannot stall the rest of the run.

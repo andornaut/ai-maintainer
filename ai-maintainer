@@ -27,11 +27,13 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.request
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 __version__ = "0.2.1"
 
@@ -194,6 +196,19 @@ OUTDATED_COMMANDS = {
     "package.json": "npm outdated --json",
 }
 
+# One gem per line: "name (newest X, installed Y[, requested Z][, in cooldown ...])".
+# The trailing clauses vary with the project and are not read, and the progress
+# lines the command prints around the list do not match.
+BUNDLE_OUTDATED_LINE = re.compile(r"^(\S+) \(newest ([^,)]+), installed ([^,)]+)")
+
+# Where a candidate's release date is read from. RubyGems answers for a single
+# version. npm's per-version document carries no date, so its packument's whole
+# `time` map is fetched, and through npm rather than over HTTP so that the
+# project's own registry configuration applies.
+RUBYGEMS_VERSION_URL = "https://rubygems.org/api/v2/rubygems/{name}/versions/{version}.json"
+NPM_RELEASE_DATES_COMMAND = "npm view {name} time --json"
+RELEASE_DATE_TIMEOUT_SECONDS = 30
+
 # Cap on one ecosystem's outdated report before it reaches a prompt
 OUTDATED_MAX_LENGTH = 4000
 
@@ -331,6 +346,21 @@ def safe_json_parse(text: str, default: Any = None) -> Any:
         return json.loads(text)
     except json.JSONDecodeError:
         return default
+
+
+def parse_registry_timestamp(value: Any) -> datetime | None:
+    """A package registry's timestamp as an aware datetime, or None if it is not one.
+
+    Registries publish in UTC. A timestamp that arrives without a zone is read
+    as UTC rather than as local time, which would misdate it by the offset.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 class ProjectEnvironment:
@@ -2532,24 +2562,122 @@ class Maintainer:
         self.logger.error(f"[{self.repo_name}] Tests failed: {test_cmd}")
         return TESTS_FAILED, output
 
+    def _quiet_env_prefix(self) -> str:
+        """The toolchain activation prefix, with the prefix's own output discarded.
+
+        Activation writes to stdout of its own accord (`nvm use` announces the
+        version it selected), which would land in front of a report read as
+        JSON. A prefix that fails still says so on stderr, and still stops the
+        command that follows it from running.
+        """
+        runner = self.project_env.env_runner
+        return f"{{ {runner.rstrip('& ')}; }} >/dev/null && " if runner else ""
+
+    def _outdated_candidates(self, dep_file: str, report: str) -> list[tuple[str, str, str]] | None:
+        """Each (name, installed, newest) an ecosystem's report names.
+
+        None when the report cannot be read, which is not the same as a report
+        that names nothing: an unreadable report reaches the agent whole rather
+        than being filtered down to silence.
+        """
+        if dep_file == "Gemfile":
+            matched = [BUNDLE_OUTDATED_LINE.match(line) for line in report.splitlines()]
+            gems = [(m.group(1), m.group(3), m.group(2)) for m in matched if m]
+            # The command prints nothing when every gem is current, so output
+            # carrying no gem line is something other than a list of gems.
+            return gems or None
+        if dep_file == "package.json":
+            parsed = safe_json_parse(report)
+            if not isinstance(parsed, dict):
+                return None
+            packages = []
+            for name, reported in parsed.items():
+                # npm reports a list where one package is installed at more
+                # than one location, and a bare object otherwise.
+                entry = reported[0] if isinstance(reported, list) and reported else reported
+                if not isinstance(entry, dict) or not isinstance(entry.get("latest"), str):
+                    continue
+                installed = entry.get("current")
+                packages.append((name, installed if isinstance(installed, str) else "missing", entry["latest"]))
+            return packages
+        return None
+
+    def _release_date(self, dep_file: str, name: str, version: str) -> datetime | None:
+        """When a package's version was published, or None when it cannot be dated."""
+        if dep_file == "Gemfile":
+            return self._rubygems_release_date(name, version)
+        if dep_file == "package.json":
+            return self._npm_release_date(name, version)
+        return None
+
+    def _rubygems_release_date(self, name: str, version: str) -> datetime | None:
+        """When RubyGems published a gem version, or None when it cannot say."""
+        url = RUBYGEMS_VERSION_URL.format(name=quote(name, safe=""), version=quote(version, safe=""))
+        try:
+            # The URL is an https constant whose only interpolated parts are
+            # percent-encoded, so no other scheme or host is reachable here.
+            with urllib.request.urlopen(url, timeout=RELEASE_DATE_TIMEOUT_SECONDS) as response:  # noqa: S310
+                payload = json.load(response)
+        except (OSError, ValueError) as error:
+            self.logger.debug(f"[{self.repo_name}] Could not date {name} {version}: {error}")
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return parse_registry_timestamp(payload.get("created_at"))
+
+    def _npm_release_date(self, name: str, version: str) -> datetime | None:
+        """When npm published a package version, or None when it cannot say."""
+        command = NPM_RELEASE_DATES_COMMAND.format(name=shlex.quote(name))
+        success, stdout, _ = run_shell_command(
+            f"{self._quiet_env_prefix()}{command}",
+            self.repo_path,
+            timeout=RELEASE_DATE_TIMEOUT_SECONDS,
+        )
+        if not success:
+            self.logger.debug(f"[{self.repo_name}] Could not date {name} {version}")
+            return None
+        released = safe_json_parse(stdout)
+        if not isinstance(released, dict):
+            return None
+        return parse_registry_timestamp(released.get(version))
+
+    def _old_enough(self, dep_file: str, candidates: list[tuple[str, str, str]]) -> list[str]:
+        """The candidates old enough to take, one line each.
+
+        A candidate that cannot be dated is kept: not knowing its age is not
+        the same as knowing it is too new, and dropping it would hide an
+        eligible update behind a lookup that failed.
+        """
+        minimum_age = self.config.dependency_min_age_days
+        cutoff = datetime.now(UTC) - timedelta(days=minimum_age)
+        eligible = []
+        for name, installed, newest in candidates:
+            released = self._release_date(dep_file, name, newest)
+            if released is not None and released > cutoff:
+                self.logger.debug(
+                    f"[{self.repo_name}] Holding {name} {newest}: released {released.date()}, under {minimum_age} days"
+                )
+                continue
+            age = "release date unknown" if released is None else f"released {released.date()}"
+            eligible.append(f"{name}: {installed} -> {newest} ({age})")
+        return eligible
+
     def _outdated_report(self, dep_files: list[str]) -> dict[str, str]:
-        """What each ecosystem reports as out of date, keyed by the command asked.
+        """The updates each ecosystem offers that are old enough to take, keyed by command.
 
         Without a list the agent discovers the outdated set itself, so an
         unchanged repository answers differently from one run to the next and
         an eligible update can sit unapplied across several runs.
 
+        The minimum age is applied here rather than left to the agent. No
+        package manager reports a release date, so an agent told to skip recent
+        releases has nothing to apply that rule to and takes what it is shown.
+
         A manifest with no entry in OUTDATED_COMMANDS contributes nothing,
         which leaves the agent where it already was rather than telling it
         that ecosystem is up to date.
         """
-        # The activation prefix writes to stdout of its own accord (`nvm use`
-        # announces the version it selected), which would land in front of a
-        # report the agent reads as JSON. Only the command's output is kept.
-        # A prefix that fails still says so on stderr, and still stops the
-        # command from running.
-        runner = self.project_env.env_runner
-        prefix = f"{{ {runner.rstrip('& ')}; }} >/dev/null && " if runner else ""
+        prefix = self._quiet_env_prefix()
         report: dict[str, str] = {}
         for dep_file in dep_files:
             command = OUTDATED_COMMANDS.get(dep_file)
@@ -2563,9 +2691,13 @@ class Maintainer:
             output = stdout.strip() or stderr.strip()
             if not output:
                 continue
-            if len(output) > OUTDATED_MAX_LENGTH:
-                output = f"{output[:OUTDATED_MAX_LENGTH]}\n... (truncated)"
-            report[command] = output
+            candidates = self._outdated_candidates(dep_file, output)
+            eligible = output if candidates is None else "\n".join(self._old_enough(dep_file, candidates))
+            if not eligible:
+                continue
+            if len(eligible) > OUTDATED_MAX_LENGTH:
+                eligible = f"{eligible[:OUTDATED_MAX_LENGTH]}\n... (truncated)"
+            report[command] = eligible
         self.logger.debug(f"[{self.repo_name}] Outdated reports: {list(report)}")
         return report
 
@@ -2598,9 +2730,9 @@ class Maintainer:
 
         outdated = self._outdated_report(dep_files)
         ledger = (
-            "The context carries what each package manager reports as outdated. Work from that "
-            "list rather than rediscovering it, and account in `reasoning` for every listed "
-            "update you do not take. "
+            "The context carries the updates each package manager offers, already filtered to "
+            "those old enough to take. Work from that list rather than rediscovering it, and "
+            "account in `reasoning` for every listed update you do not take. "
             if outdated
             else ""
         )

@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Unit tests for ai-maintainer."""
 
+import contextlib
 import importlib.machinery
 
 # Import the module (it's an executable without .py extension)
 import importlib.util
+import io
 import json
 import logging
 import shlex
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import ClassVar
 from unittest.mock import MagicMock
@@ -74,6 +77,10 @@ def maintainer(repo_path, default_config):
 @pytest.fixture
 def agent_client(default_config):
     return gm.AgentClient(Path("/tmp"), "test-repo", default_config, MagicMock())
+
+
+# Comfortably outside any minimum age a test configures
+OLD_RELEASE = datetime(2020, 1, 1, tzinfo=UTC)
 
 
 def make_maintainer(repo_path, config, **overrides):
@@ -1740,10 +1747,169 @@ class TestUpdateDependencies:
         maintainer.git.reset_changes.assert_not_called()
 
 
+class TestParseRegistryTimestamp:
+    """Registry timestamps are read as UTC."""
+
+    def test_a_zulu_timestamp_is_aware(self):
+        parsed = gm.parse_registry_timestamp("2026-07-21T15:41:28.716Z")
+        assert parsed == datetime(2026, 7, 21, 15, 41, 28, 716000, tzinfo=UTC)
+
+    def test_an_offset_timestamp_keeps_its_offset(self):
+        parsed = gm.parse_registry_timestamp("2026-07-21T15:41:28+02:00")
+        assert parsed.utcoffset() == timedelta(hours=2)
+
+    def test_a_zoneless_timestamp_is_read_as_utc(self):
+        # Reading it as local time would misdate it by the offset
+        assert gm.parse_registry_timestamp("2026-07-21T15:41:28").tzinfo is UTC
+
+    def test_what_is_not_a_timestamp_has_no_date(self):
+        assert gm.parse_registry_timestamp("last tuesday") is None
+        assert gm.parse_registry_timestamp(None) is None
+        assert gm.parse_registry_timestamp(20260721) is None
+
+
+class TestOutdatedCandidates:
+    """Reading each ecosystem's report of what is out of date."""
+
+    def _maintainer(self, repo_path, default_config):
+        return make_maintainer(repo_path, default_config, dry_run=False)
+
+    def test_bundler_lines_are_read(self, repo_path, default_config):
+        report = (
+            "Fetching gem metadata from https://rubygems.org/...\n"
+            "Resolving dependencies...\n"
+            "\n"
+            "parallel (newest 2.1.0, installed 1.28.0)\n"
+            "rubocop-sorbet (newest 0.15.0, installed 0.14.0, requested ~> 0.14.0, in cooldown for 5 more days)\n"
+        )
+        assert self._maintainer(repo_path, default_config)._outdated_candidates("Gemfile", report) == [
+            ("parallel", "1.28.0", "2.1.0"),
+            ("rubocop-sorbet", "0.14.0", "0.15.0"),
+        ]
+
+    def test_output_with_no_gem_line_is_unreadable(self, repo_path, default_config):
+        # The command prints nothing when every gem is current, so output
+        # carrying no gem line is an error rather than an empty list
+        maintainer = self._maintainer(repo_path, default_config)
+        assert maintainer._outdated_candidates("Gemfile", "Could not locate Gemfile") is None
+
+    def test_npm_entries_are_read(self, repo_path, default_config):
+        report = json.dumps({"eslint": {"current": "9.39.5", "wanted": "9.39.5", "latest": "10.9.0"}})
+        assert self._maintainer(repo_path, default_config)._outdated_candidates("package.json", report) == [
+            ("eslint", "9.39.5", "10.9.0")
+        ]
+
+    def test_npm_reports_a_list_where_a_package_sits_in_two_places(self, repo_path, default_config):
+        report = json.dumps({"eslint": [{"current": "1.0.0", "latest": "2.0.0"}, {"current": "1.0.0"}]})
+        assert self._maintainer(repo_path, default_config)._outdated_candidates("package.json", report) == [
+            ("eslint", "1.0.0", "2.0.0")
+        ]
+
+    def test_a_package_npm_has_not_installed_is_still_a_candidate(self, repo_path, default_config):
+        report = json.dumps({"eslint": {"latest": "2.0.0"}})
+        assert self._maintainer(repo_path, default_config)._outdated_candidates("package.json", report) == [
+            ("eslint", "missing", "2.0.0")
+        ]
+
+    def test_npm_naming_nothing_is_not_an_unreadable_report(self, repo_path, default_config):
+        # `{}` is npm saying every package is current, which is an answer
+        assert self._maintainer(repo_path, default_config)._outdated_candidates("package.json", "{}") == []
+
+    def test_what_is_not_json_is_unreadable(self, repo_path, default_config):
+        maintainer = self._maintainer(repo_path, default_config)
+        assert maintainer._outdated_candidates("package.json", "npm ERR! code E404") is None
+
+    def test_a_manifest_with_no_reader_is_unreadable(self, repo_path, default_config):
+        assert self._maintainer(repo_path, default_config)._outdated_candidates("Cargo.toml", "anything") is None
+
+
+class TestReleaseDate:
+    """Dating a candidate version, and saying so when it cannot be dated."""
+
+    def test_rubygems_answers_for_one_version(self, repo_path, default_config, monkeypatch):
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False)
+        asked = []
+
+        @contextlib.contextmanager
+        def urlopen(url, timeout=None):
+            asked.append(url)
+            yield io.BytesIO(b'{"created_at": "2026-08-15T05:37:37.034Z"}')
+
+        monkeypatch.setattr(gm.urllib.request, "urlopen", urlopen)
+        assert maintainer._release_date("Gemfile", "sorbet", "0.6.13427") == datetime(
+            2026, 8, 15, 5, 37, 37, 34000, tzinfo=UTC
+        )
+        assert asked == ["https://rubygems.org/api/v2/rubygems/sorbet/versions/0.6.13427.json"]
+
+    def test_a_gem_name_cannot_reach_another_url(self, repo_path, default_config, monkeypatch):
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False)
+        asked = []
+
+        @contextlib.contextmanager
+        def urlopen(url, timeout=None):
+            asked.append(url)
+            yield io.BytesIO(b"{}")
+
+        monkeypatch.setattr(gm.urllib.request, "urlopen", urlopen)
+        maintainer._release_date("Gemfile", "../../evil", "1.0")
+        assert asked == ["https://rubygems.org/api/v2/rubygems/..%2F..%2Fevil/versions/1.0.json"]
+
+    def test_a_registry_that_cannot_be_reached_gives_no_date(self, repo_path, default_config, monkeypatch):
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False)
+
+        def urlopen(url, timeout=None):
+            raise OSError("no route to host")
+
+        monkeypatch.setattr(gm.urllib.request, "urlopen", urlopen)
+        assert maintainer._release_date("Gemfile", "sorbet", "0.6.13427") is None
+
+    def test_npm_is_asked_through_the_toolchain_prefix(self, repo_path, default_config, monkeypatch):
+        (repo_path / ".nvmrc").write_text("v24.19.0\n")
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False)
+        maintainer.project_env._env_runner = "source /x/nvm.sh && nvm use &&"
+        calls = []
+
+        def run(cmd, cwd, timeout=None):
+            calls.append(cmd)
+            return (True, json.dumps({"19.2.8": "2026-07-21T15:41:28.716Z"}), "")
+
+        monkeypatch.setattr(gm, "run_shell_command", run)
+        assert maintainer._release_date("package.json", "react", "19.2.8") == datetime(
+            2026, 7, 21, 15, 41, 28, 716000, tzinfo=UTC
+        )
+        assert calls == ["{ source /x/nvm.sh && nvm use; } >/dev/null && npm view react time --json"]
+
+    def test_a_scoped_package_name_is_quoted(self, repo_path, default_config, monkeypatch):
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False)
+        calls = []
+
+        def run(cmd, cwd, timeout=None):
+            calls.append(cmd)
+            return (True, "{}", "")
+
+        monkeypatch.setattr(gm, "run_shell_command", run)
+        maintainer._release_date("package.json", "@eslint/js; rm -rf /", "10.0.1")
+        assert calls == ["npm view '@eslint/js; rm -rf /' time --json"]
+
+    def test_a_version_npm_does_not_list_has_no_date(self, repo_path, default_config, monkeypatch):
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False)
+        monkeypatch.setattr(gm, "run_shell_command", lambda cmd, cwd, timeout=None: (True, "{}", ""))
+        assert maintainer._release_date("package.json", "react", "19.2.8") is None
+
+    def test_a_failed_lookup_has_no_date(self, repo_path, default_config, monkeypatch):
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False)
+        monkeypatch.setattr(gm, "run_shell_command", lambda cmd, cwd, timeout=None: (False, "", "E404"))
+        assert maintainer._release_date("package.json", "react", "19.2.8") is None
+
+    def test_a_manifest_with_no_registry_has_no_date(self, repo_path, default_config):
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False)
+        assert maintainer._release_date("Cargo.toml", "serde", "1.0.0") is None
+
+
 class TestOutdatedReport:
     """The agent works from what the package managers report, not from memory."""
 
-    def _maintainer(self, repo_path, default_config, monkeypatch, result):
+    def _maintainer(self, repo_path, default_config, monkeypatch, result, released=OLD_RELEASE):
         calls = []
 
         def run(cmd, cwd, timeout=None):
@@ -1751,7 +1917,11 @@ class TestOutdatedReport:
             return result
 
         monkeypatch.setattr(gm, "run_shell_command", run)
-        return make_maintainer(repo_path, default_config, dry_run=False), calls
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False)
+        # Dating is covered by TestReleaseDate; these cover what is done with
+        # the answer, so no lookup leaves the machine
+        maintainer._release_date = MagicMock(return_value=released)
+        return maintainer, calls
 
     def test_only_manifests_with_a_command_are_asked(self, repo_path, default_config, monkeypatch):
         # An ecosystem with no query contributes nothing, which is not the
@@ -1759,13 +1929,49 @@ class TestOutdatedReport:
         maintainer, calls = self._maintainer(repo_path, default_config, monkeypatch, (True, "up to date", ""))
         report = maintainer._outdated_report(["Cargo.toml", "package.json"])
         assert calls == ["npm outdated --json"]
+        # Output npm's reader cannot parse is handed over whole rather than
+        # filtered down to silence
         assert report == {"npm outdated --json": "up to date"}
 
     def test_output_is_read_despite_a_non_zero_exit(self, repo_path, default_config, monkeypatch):
         # npm outdated and bundle outdated both exit non-zero exactly when
         # they have something to report
-        maintainer, _ = self._maintainer(repo_path, default_config, monkeypatch, (False, '{"eslint": {}}', ""))
-        assert maintainer._outdated_report(["package.json"]) == {"npm outdated --json": '{"eslint": {}}'}
+        report = json.dumps({"eslint": {"current": "9.39.5", "latest": "10.9.0"}})
+        maintainer, _ = self._maintainer(repo_path, default_config, monkeypatch, (False, report, ""))
+        assert maintainer._outdated_report(["package.json"]) == {
+            "npm outdated --json": "eslint: 9.39.5 -> 10.9.0 (released 2020-01-01)"
+        }
+
+    def test_a_release_inside_the_window_is_dropped(self, repo_path, default_config, monkeypatch):
+        # The prompt states a minimum age, but no package manager reports a
+        # release date, so an agent left to apply the rule takes what it sees
+        report = json.dumps({"eslint": {"current": "9.39.5", "latest": "10.9.0"}})
+        recent = datetime.now(UTC) - timedelta(days=8)
+        maintainer, _ = self._maintainer(repo_path, default_config, monkeypatch, (False, report, ""), released=recent)
+        assert maintainer._outdated_report(["package.json"]) == {}
+
+    def test_a_release_on_the_far_side_of_the_window_is_kept(self, repo_path, default_config, monkeypatch):
+        report = json.dumps({"eslint": {"current": "9.39.5", "latest": "10.9.0"}})
+        old = datetime.now(UTC) - timedelta(days=31)
+        maintainer, _ = self._maintainer(repo_path, default_config, monkeypatch, (False, report, ""), released=old)
+        assert maintainer._outdated_report(["package.json"]) == {
+            "npm outdated --json": f"eslint: 9.39.5 -> 10.9.0 (released {old.date()})"
+        }
+
+    def test_a_candidate_that_cannot_be_dated_is_kept(self, repo_path, default_config, monkeypatch):
+        # Not knowing a candidate's age is not the same as knowing it is too
+        # new; dropping it would hide an update behind a lookup that failed
+        report = json.dumps({"eslint": {"current": "9.39.5", "latest": "10.9.0"}})
+        maintainer, _ = self._maintainer(repo_path, default_config, monkeypatch, (False, report, ""), released=None)
+        assert maintainer._outdated_report(["package.json"]) == {
+            "npm outdated --json": "eslint: 9.39.5 -> 10.9.0 (release date unknown)"
+        }
+
+    def test_every_candidate_held_back_omits_the_ecosystem(self, repo_path, default_config, monkeypatch):
+        report = json.dumps({"eslint": {"current": "1.0.0", "latest": "2.0.0"}})
+        recent = datetime.now(UTC) - timedelta(days=1)
+        maintainer, _ = self._maintainer(repo_path, default_config, monkeypatch, (False, report, ""), released=recent)
+        assert maintainer._outdated_report(["package.json"]) == {}
 
     def test_stderr_answers_when_stdout_is_empty(self, repo_path, default_config, monkeypatch):
         maintainer, _ = self._maintainer(
@@ -1796,12 +2002,13 @@ class TestOutdatedReport:
 
     def test_the_report_reaches_the_agent(self, repo_path, default_config, monkeypatch):
         (repo_path / "package.json").write_text("{}")
-        maintainer, _ = self._maintainer(repo_path, default_config, monkeypatch, (False, '{"eslint": {}}', ""))
+        report = json.dumps({"eslint": {"current": "9.39.5", "latest": "10.9.0"}})
+        maintainer, _ = self._maintainer(repo_path, default_config, monkeypatch, (False, report, ""))
         maintainer.agent.ask_json = MagicMock(return_value={"updated": False, "reasoning": "none"})
         maintainer.git.is_workdir_clean = MagicMock(return_value=True)
         maintainer.update_dependencies()
         prompt, context = maintainer.agent.ask_json.call_args[0]
-        assert context["outdated"] == {"npm outdated --json": '{"eslint": {}}'}
+        assert context["outdated"] == {"npm outdated --json": "eslint: 9.39.5 -> 10.9.0 (released 2020-01-01)"}
         assert "Work from that list" in prompt
 
     def test_nothing_to_report_leaves_the_prompt_alone(self, repo_path, default_config, monkeypatch):
