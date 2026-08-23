@@ -807,6 +807,32 @@ class TestDetectTestCommand:
         # Bundler is what has to resolve; rspec need not exist outside the bundle
         assert probes == ["which bundle"]
 
+    def test_a_runner_the_lockfile_does_not_carry_is_unresolved(self, repo_path, default_config):
+        # Resolving bundler leaves the runner unchecked: `bundle exec rspec`
+        # against a bundle with no rspec exits like a failing suite, which
+        # would send the fix loop after a suite that never ran
+        (repo_path / "Gemfile").write_text("source 'https://rubygems.org'\n")
+        (repo_path / "Gemfile.lock").write_text("GEM\n  specs:\n    rake (13.4.2)\n")
+        (repo_path / "spec").mkdir()
+        maintainer = gm.Maintainer(repo_path, default_config)
+        assert maintainer.detect_test_command() is None
+        assert "rspec" in maintainer._unresolved_runner
+
+    def test_a_runner_the_lockfile_carries_runs_through_bundler(self, repo_path, default_config):
+        (repo_path / "Gemfile").write_text("source 'https://rubygems.org'\n")
+        (repo_path / "Gemfile.lock").write_text("GEM\n  specs:\n    rspec (3.13.0)\n")
+        (repo_path / "spec").mkdir()
+        maintainer = gm.Maintainer(repo_path, default_config)
+        assert maintainer.detect_test_command() == "bundle exec rspec"
+
+    def test_no_lockfile_is_not_an_absent_runner(self, repo_path, default_config):
+        # "We could not ask" is not "there is nothing": a project with no
+        # lockfile still runs through bundler rather than being called broken
+        (repo_path / "Gemfile").write_text("source 'https://rubygems.org'\n")
+        (repo_path / "spec").mkdir()
+        maintainer = gm.Maintainer(repo_path, default_config)
+        assert maintainer.detect_test_command() == "bundle exec rspec"
+
     def test_ruby_without_a_gemfile_runs_the_runner_directly(self, repo_path, default_config):
         # No Gemfile is no bundle, and `bundle exec` would fail outright
         (repo_path / ".ruby-version").write_text("3.4.10\n")

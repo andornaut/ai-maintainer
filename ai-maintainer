@@ -1776,10 +1776,36 @@ class Maintainer:
 
         Ruby is the one toolchain env_runner cannot cover: chruby and rbenv
         select the interpreter, not the bundle.
+
+        Resolving bundler leaves the runner itself unchecked, so the lockfile
+        answers for it: a `spec` directory whose Gemfile never asked for rspec
+        would otherwise reach `bundle exec rspec` and exit like a failing
+        suite, which is what sends the fix loop after a suite that never ran.
         """
-        if (self.repo_path / "Gemfile").exists():
-            return self._test_command("bundle", f"exec {tool} {args}".rstrip())
-        return self._test_command(tool, args)
+        if not (self.repo_path / "Gemfile").exists():
+            return self._test_command(tool, args)
+        if self._bundle_resolves(tool) is False:
+            detail = f"'{tool}' is not among the gems its Gemfile.lock resolves"
+            self.logger.debug(f"[{self.repo_name}] {detail}")
+            self._unresolved_runner = detail
+            return None
+        return self._test_command("bundle", f"exec {tool} {args}".rstrip())
+
+    def _bundle_resolves(self, gem: str) -> bool | None:
+        """Whether Gemfile.lock resolves `gem`, or None when it cannot say.
+
+        Read rather than run: `bundle exec which <gem>` cannot tell a gem the
+        bundle does not carry from a bundle that is not installed, and those
+        call for opposite outcomes. A project with no lockfile gives no
+        answer, which is not the same as an answer of no.
+        """
+        try:
+            lockfile = (self.repo_path / "Gemfile.lock").read_text()
+        except OSError:
+            return None
+        # The specs section lists every gem the bundle carries, direct and
+        # transitive alike, each as an indented "name (version)".
+        return re.search(rf"^\s+{re.escape(gem)} \(", lockfile, re.MULTILINE) is not None
 
     def _has_python_test_files(self) -> bool:
         """Whether the project has conventionally named pytest modules.
