@@ -2412,25 +2412,6 @@ class TestRunTestsOutcome:
         maintainer.detect_test_command = MagicMock(return_value="false")
         assert maintainer.run_tests()[0] == gm.TESTS_FAILED
 
-    def test_unresolvable_dependencies_block_rather_than_fail(self, repo_path, default_config):
-        # The runner resolved and then could not load the project's gems, so
-        # it reported nothing about the code and there is nothing to fix
-        maintainer = make_maintainer(repo_path, default_config)
-        maintainer.detect_test_command = MagicMock(
-            return_value=(
-                "echo 'Could not find unparser-0.8.2 in locally installed gems (Bundler::GemNotFound)' >&2; exit 1"
-            )
-        )
-        status, message = maintainer.run_tests()
-        assert status == gm.TESTS_BLOCKED
-        assert "Bundler::GemNotFound" in message
-
-    def test_an_ordinary_failure_is_still_the_agents_to_fix(self, repo_path, default_config):
-        # A suite that starts and reports failures must not be read as blocked
-        maintainer = make_maintainer(repo_path, default_config)
-        maintainer.detect_test_command = MagicMock(return_value="echo '1 runs, 1 failures' >&2; exit 1")
-        assert maintainer.run_tests()[0] == gm.TESTS_FAILED
-
     def test_a_suite_that_runs_out_of_time_has_not_passed(self, repo_path, default_config, monkeypatch):
         # A suite killed at --test-timeout verified nothing. Reading the kill
         # as a pass is how an untested tree gets committed and pushed.
@@ -2489,25 +2470,6 @@ class TestGitHubAuthIsMandatory:
         monkeypatch.setattr(sys, "argv", ["ai-maintainer", "--base-dir", "/nonexistent"])
         assert gm.main() == 1  # no repos found
         assert len(calls) == 1
-
-
-class TestBlockedRunnerSignature:
-    """A suite that could not start must be told apart from one that failed."""
-
-    def test_no_signature_in_ordinary_failure_output(self):
-        assert gm.blocked_runner_signature("3 runs, 1 failures, 0 errors") is None
-
-    def test_a_missing_bundle_is_a_signature(self):
-        output = "Could not find unparser-0.8.2 in locally installed gems (Bundler::GemNotFound)"
-        assert gm.blocked_runner_signature(output) == "Bundler::GemNotFound"
-
-    def test_matching_ignores_case(self):
-        assert gm.blocked_runner_signature("bundler::gemfilenotfound") == "Bundler::GemfileNotFound"
-
-    def test_a_runtime_missing_module_is_not_a_signature(self):
-        # A require that fails inside the code under test is as often a real
-        # defect a dependency update introduced, which the agent can fix
-        assert gm.blocked_runner_signature("cannot load such file -- mdtoc/version") is None
 
 
 class TestTruncateCiLog:

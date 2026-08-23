@@ -75,18 +75,6 @@ TESTS_NOT_RUN = "not_run"
 # nothing for the agent to fix.
 TESTS_BLOCKED = "blocked"
 
-# Output that says the suite never started because the project's dependencies
-# could not be resolved, which is TESTS_BLOCKED rather than TESTS_FAILED.
-# Restricted to the dependency manager's own startup errors: those are raised
-# before a single test is loaded, so no change to the code under test can
-# answer them. A missing-module message from a language runtime is excluded,
-# being as often a real defect in the code the runtime was loading.
-BLOCKED_RUNNER_SIGNATURES = (
-    "Bundler::GemNotFound",
-    "Bundler::GemfileNotFound",
-    "Bundler::LockfileError",
-)
-
 # Default values for CLI arguments and configuration
 DEFAULT_AGENT_COMMAND = "claude"
 DEFAULT_AGENT_FLAGS = "--dangerously-skip-permissions"
@@ -332,22 +320,6 @@ def safe_json_parse(text: str, default: Any = None) -> Any:
         return json.loads(text)
     except json.JSONDecodeError:
         return default
-
-
-def blocked_runner_signature(output: str) -> str | None:
-    """The dependency-manager startup error in a failing test run's output.
-
-    Returns the signature that matched, or None when none did, which is what
-    separates a suite that could not start from a suite that ran and failed.
-    A runner resolving on PATH does not mean it can load the project's
-    dependencies: a Ruby project that vendors its gems resolves bundler and
-    still cannot start until they are installed.
-    """
-    haystack = output.lower()
-    for signature in BLOCKED_RUNNER_SIGNATURES:
-        if signature.lower() in haystack:
-            return signature
-    return None
 
 
 class ProjectEnvironment:
@@ -2520,17 +2492,6 @@ class Maintainer:
         if success:
             self.logger.debug(f"[{self.repo_name}] Tests passed")
             return TESTS_PASSED, output
-
-        # A runner that starts and reports failures is the agent's to fix. One
-        # that could not resolve the project's dependencies reported nothing
-        # about the code, so the agent has nothing to work from and every
-        # attempt returns the same verdict.
-        signature = blocked_runner_signature(output)
-        if signature:
-            message = f"This project declares a test suite that could not be started: '{test_cmd}' reported {signature}"
-            self.logger.error(f"[{self.repo_name}] {message}")
-            return TESTS_BLOCKED, message
-
         self.logger.error(f"[{self.repo_name}] Tests failed: {test_cmd}")
         return TESTS_FAILED, output
 
