@@ -2809,6 +2809,66 @@ class TestCommitAndPushWithoutPush:
         assert ran == [["commit", "-m", "msg"]]
 
 
+class TestPushingWhatWasAlreadyHere:
+    """Publishing an operator's own commits is not a change this run made."""
+
+    def _maintainer(self, repo_path, default_config, monkeypatch, workdir_clean, ran):
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False, push_changes=True)
+        maintainer.git.env_runner = None
+        maintainer.git.is_workdir_clean = MagicMock(return_value=workdir_clean)
+        maintainer.git.has_unpushed_commits = MagicMock(return_value=True)
+        maintainer.git.stage_all = MagicMock(return_value=(True, "", ""))
+        maintainer.git.get_staged_files = MagicMock(return_value=["go.mod"] if not workdir_clean else [])
+        maintainer.git.get_head_sha = MagicMock(return_value="abc1234")
+        maintainer.github.repo_url = None
+
+        def fake_run_git(args, cwd, env_runner=None, timeout=None):
+            ran.append(args)
+            return True, "", ""
+
+        monkeypatch.setattr(gm, "run_git", fake_run_git)
+        return maintainer
+
+    def test_a_push_of_existing_commits_is_not_a_change(self, repo_path, default_config, monkeypatch):
+        # An operator's own commit reaching the remote must not name the
+        # repository in the summary as one this run changed
+        ran = []
+        maintainer = self._maintainer(repo_path, default_config, monkeypatch, True, ran)
+        assert maintainer.commit_and_push("msg") == (True, False)
+        assert ran == [["push"]]
+        assert maintainer.changed_remote is False
+        # A dependabot merge pulled in earlier still has to reach the remote,
+        # so the push happens either way
+        assert maintainer.pushed_head is True
+
+    def test_such_a_push_is_still_watched_for_ci(self, repo_path, default_config, monkeypatch):
+        # Any push triggers CI, whoever wrote the commits it carried, so the
+        # run watches the commit it just published
+        maintainer = self._maintainer(repo_path, default_config, monkeypatch, True, [])
+        maintainer.update_dependencies = MagicMock(return_value=(True, False))
+        maintainer.run_tests = MagicMock(return_value=(gm.TESTS_PASSED, ""))
+        maintainer._handle_post_push_ci = MagicMock(return_value=True)
+        status, had_changes = maintainer._maintain_after_merge(True, [], None)
+        assert (status, had_changes) == (gm.STATUS_SUCCESS, False)
+        maintainer._handle_post_push_ci.assert_called_once_with(True, "abc1234")
+
+    def test_this_run_committing_is_a_change(self, repo_path, default_config, monkeypatch):
+        ran = []
+        maintainer = self._maintainer(repo_path, default_config, monkeypatch, False, ran)
+        assert maintainer.commit_and_push("msg") == (True, True)
+        assert maintainer.changed_remote is True
+        assert maintainer.pushed_head is True
+
+    def test_a_dry_run_that_would_only_push_reports_no_change(self, repo_path, default_config, monkeypatch):
+        ran = []
+        maintainer = self._maintainer(repo_path, default_config, monkeypatch, True, ran)
+        maintainer.config = gm.Config(**{**maintainer.config.__dict__, "dry_run": True})
+        assert maintainer.commit_and_push("msg") == (True, False)
+        assert ran == []
+        assert maintainer.changed_remote is False
+        assert maintainer.pushed_head is False
+
+
 class TestRunTestsOutcome:
     """ "Nothing was verified" must not be reported as "tests passed"."""
 

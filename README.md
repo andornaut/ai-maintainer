@@ -52,7 +52,7 @@ For each repository:
 3. Merge dependabot PRs on GitHub and pull changes (GPG-verified, branch pattern checked, merge pinned to the verified commit)
 4. Ask AI to analyze and update direct dependencies (respects `--dependency-min-age-days`)
 5. Run tests, ask AI to fix failures (with retries)
-6. Commit and push changes
+6. Commit anything the agent changed, and push whatever the branch has not pushed yet
 7. Wait for CI and fix build failures (automatic if CI exists); if a failure cannot be fixed, the repository is reported failed and left as it is
 
 ai-maintainer auto-detects each project's toolchain (Node via nvm/fnm, Python via pipenv/poetry/venv, Ruby via chruby/rbenv, plus Go and Rust) and activates it when running tests and git operations, so git hooks (e.g. husky `pre-commit`) use the project's runtime rather than whatever is on the ambient PATH. The same activation prefix is given to the AI agent, so its package-manager commands resolve the project's runtime too.
@@ -60,6 +60,8 @@ ai-maintainer auto-detects each project's toolchain (Node via nvm/fnm, Python vi
 Step 4 asks the package managers what is out of date and hands the agent that list, so successive runs over an unchanged repository agree on what is available. Two ecosystems have such a query: `bundle outdated` for a `Gemfile` and `npm outdated` for a `package.json`. Their candidates are dated against the registry, and anything published within `--dependency-min-age-days` is dropped before the list reaches the agent.
 
 **The tool applies that age limit only there.** Cargo, pip, Go and every other ecosystem get no list and no date check. Two cases inside the covered path also go unfiltered: a candidate whose release date cannot be read is passed on rather than dropped, and a report the tool cannot parse (a `bundle outdated` that errored, an `npm outdated` that did not return an object) is forwarded whole with no dates looked up at all. In every one of these the limit is stated to the agent and the agent decides, so treat it as enforced for Ruby and npm and advisory everywhere else. The prompt names which manifests were answered for, and entries carry their release date, so the agent can tell the filtered from the unfiltered.
+
+Step 6 pushes any unpushed commit on the branch, not only its own, so a dependabot merge pulled in earlier always reaches the remote. A push carrying only commits that were already there is not counted as a change the run made and does not name the repository in the summary, though CI is still watched on it, because a push triggers CI whoever wrote the commits.
 
 Skips repos that are: not git repos, not on default branch, have uncommitted changes, are archived/read-only, or have no dependency files.
 

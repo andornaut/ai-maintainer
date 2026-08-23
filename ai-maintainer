@@ -1615,8 +1615,13 @@ class Maintainer:
         )
         # CI is monitored at most once per run; see _handle_post_push_ci
         self._ci_monitored = False
-        # Whether this run has put anything on the remote; see maintain()
+        # Whether this run has put anything of its own on the remote; see
+        # maintain(). A push carrying only commits that were already in the
+        # repository does not count, hence pushed_head below
         self.changed_remote = False
+        # Whether this run pushed the branch at all, whoever wrote the commits
+        # it carried; see the CI monitoring in _maintain_after_merge
+        self.pushed_head = False
         # Why a declared test runner would not resolve; see run_tests
         self._unresolved_runner: str | None = None
         # Wall-clock ceiling for this repository; see _start_deadline
@@ -1680,7 +1685,9 @@ class Maintainer:
         Returns:
             Tuple of (success, had_changes) where:
             - success: whether the operation completed successfully
-            - had_changes: whether there were changes that were committed or pushed
+            - had_changes: whether this run committed something of its own.
+              Publishing commits that were already in the repository is not a
+              change this run made, so it does not report as one
         """
         pre_commit_sha = self.git.get_head_sha()
         workdir_dirty = not self.git.is_workdir_clean()
@@ -1738,7 +1745,7 @@ class Maintainer:
 
         if self.config.dry_run:
             self.logger.info(f"[{self.repo_name}] DRY RUN: Would push unpushed commits")
-            return True, True
+            return True, False
 
         self.logger.debug(f"[{self.repo_name}] Pushing to remote...")
         # Run through the project env runner too, so pre-push hooks resolve
@@ -1754,16 +1761,23 @@ class Maintainer:
                     self.logger.error(f"[{self.repo_name}] Failed to undo commits after push failure\n{reset_stderr}")
             return False, False
 
-        self.changed_remote = True
+        self.pushed_head = True
+        # Pushing commits the repository already carried publishes work this
+        # run did not do. It still has to happen, so a dependabot merge pulled
+        # in earlier always reaches the remote, but naming the repository as
+        # changed would credit this run with someone else's commit.
+        if committed:
+            self.changed_remote = True
 
         # Log with commit URL if available
+        did = "Committed and pushed" if committed else "Pushed commits that were already here"
         commit_sha = self.git.get_head_sha()
         if self.github.repo_url and commit_sha:
             commit_url = f"{self.github.repo_url}/commit/{commit_sha}"
-            self.logger.info(f"[{self.repo_name}] Committed and pushed ({commit_sha[:7]}): {commit_url}")
+            self.logger.info(f"[{self.repo_name}] {did} ({commit_sha[:7]}): {commit_url}")
         else:
-            self.logger.info(f"[{self.repo_name}] Committed and pushed")
-        return True, True
+            self.logger.info(f"[{self.repo_name}] {did}")
+        return True, committed
 
     def _has_pytest_config(self) -> bool:
         """Whether the project configures pytest, whichever file it uses."""
@@ -2485,7 +2499,7 @@ class Maintainer:
                         self._handle_post_push_ci(ci_was_passing, remote_sha)
                     return STATUS_FAILED, False
 
-        # Commit and push (only if we have changes)
+        # Commit anything the agent left, and push whatever is unpushed
         commit_msg = self.build_commit_message(had_dep_updates)
         success, committed_changes = self.commit_and_push(commit_msg)
         if not success:
@@ -2497,11 +2511,11 @@ class Maintainer:
             return STATUS_FAILED, False
 
         # Monitor CI after push and fix failures if we caused them. Runs whenever
-        # this run pushed a commit or merged a dependabot PR on GitHub, since a
+        # this run pushed the branch or merged a dependabot PR on GitHub, since a
         # merged PR triggers CI even when ai-maintainer made no local commit.
-        # A commit that was not pushed triggers no CI, so it is not monitored.
-        pushed_changes = committed_changes and self.config.push_changes
-        monitored_sha = self.git.get_head_sha() if pushed_changes else remote_sha
+        # Any push triggers CI, including one that carried only commits already
+        # here; a commit that was not pushed triggers none, so it is not watched.
+        monitored_sha = self.git.get_head_sha() if self.pushed_head else remote_sha
         if monitored_sha and not self._handle_post_push_ci(ci_was_passing, monitored_sha):
             return STATUS_FAILED, committed_changes
 
