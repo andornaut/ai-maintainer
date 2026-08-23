@@ -788,7 +788,34 @@ class TestDetectTestCommand:
         (repo_path / "Rakefile").write_text("task :test\n")
         (repo_path / "test").mkdir()
         maintainer = gm.Maintainer(repo_path, default_config)
-        assert maintainer.detect_test_command().endswith("rake test")
+        assert maintainer.detect_test_command().endswith("bundle exec rake test")
+
+    def test_a_gemfile_runs_the_suite_through_bundler(self, repo_path, default_config, monkeypatch):
+        # Gems a Gemfile declares resolve only through bundler: a project that
+        # vendors them has nothing on the default gem path, so a bare runner
+        # fails on the suite's own requires
+        (repo_path / "Gemfile").write_text("source 'https://rubygems.org'\n")
+        (repo_path / "spec").mkdir()
+        probes = []
+        monkeypatch.setattr(
+            gm,
+            "run_shell_command",
+            lambda cmd, *a, **k: (probes.append(cmd), (True, "", ""))[1],
+        )
+        maintainer = gm.Maintainer(repo_path, default_config)
+        assert maintainer.detect_test_command() == "bundle exec rspec"
+        # Bundler is what has to resolve; rspec need not exist outside the bundle
+        assert probes == ["which bundle"]
+
+    def test_ruby_without_a_gemfile_runs_the_runner_directly(self, repo_path, default_config):
+        # No Gemfile is no bundle, and `bundle exec` would fail outright
+        (repo_path / ".ruby-version").write_text("3.4.10\n")
+        (repo_path / "Rakefile").write_text("task :test\n")
+        (repo_path / "test").mkdir()
+        maintainer = gm.Maintainer(repo_path, default_config)
+        command = maintainer.detect_test_command()
+        assert command.endswith("rake test")
+        assert "bundle exec" not in command
 
     def test_rakefile_without_tests_is_not_a_test_command(self, repo_path, default_config):
         # `rake test` on a Rakefile with no test task fails on every run, which
@@ -802,7 +829,7 @@ class TestDetectTestCommand:
         (repo_path / "Gemfile").write_text("source 'https://rubygems.org'\n")
         (repo_path / "spec").mkdir()
         maintainer = gm.Maintainer(repo_path, default_config)
-        assert maintainer.detect_test_command().endswith("rspec")
+        assert maintainer.detect_test_command().endswith("bundle exec rspec")
 
     def test_detect_cargo_test(self, repo_path, default_config):
         (repo_path / "Cargo.toml").write_text("[package]")

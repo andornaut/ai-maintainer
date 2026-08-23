@@ -1764,6 +1764,23 @@ class Maintainer:
             return None
         return f"{prefix}{tool} {args}".rstrip()
 
+    def _ruby_test_command(self, tool: str, args: str = "") -> str | None:
+        """The command for a Ruby test runner, through bundler when there is a Gemfile.
+
+        A Gemfile's gems resolve only through bundler. Where BUNDLE_PATH sends
+        them to a vendor directory nothing is on the default gem path, so a
+        bare runner fails on the suite's own requires, and where the lockfile
+        pins a version the system also has, the bare runner silently uses the
+        wrong one. Bundler is what has to resolve in that case, since the
+        runner itself need not exist outside the bundle.
+
+        Ruby is the one toolchain env_runner cannot cover: chruby and rbenv
+        select the interpreter, not the bundle.
+        """
+        if (self.repo_path / "Gemfile").exists():
+            return self._test_command("bundle", f"exec {tool} {args}".rstrip())
+        return self._test_command(tool, args)
+
     def _has_python_test_files(self) -> bool:
         """Whether the project has conventionally named pytest modules.
 
@@ -1814,9 +1831,9 @@ class Maintainer:
         # otherwise look like a failing test suite on every run.
         if (p / "Gemfile").exists() or (p / ".ruby-version").exists():
             if (p / "spec").exists() or (p / ".rspec").exists():
-                return self._test_command("rspec")
+                return self._ruby_test_command("rspec")
             if (p / "Rakefile").exists() and (p / "test").exists():
-                return self._test_command("rake", "test")
+                return self._ruby_test_command("rake", "test")
 
         # Rust
         if (p / "Cargo.toml").exists():
