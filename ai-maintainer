@@ -3212,13 +3212,16 @@ def main():
     skip_count = 0
     fail_count = 0
     error_count = 0
-    repos_with_changes = 0
+    # Named rather than counted: a quiet run prints only the repositories that
+    # logged something, so a repository this run changed cleanly would leave
+    # nothing behind saying which one it was.
+    changed_repos: list[str] = []
     interrupted = False
 
     try:
         for repo_path in repos:
             # Check if we've reached the limit
-            if args.limit and repos_with_changes >= args.limit:
+            if args.limit and len(changed_repos) >= args.limit:
                 logger.info(f"Reached limit of {args.limit} repositories with changes, stopping")
                 break
 
@@ -3231,7 +3234,7 @@ def main():
                 # Counted whatever the outcome: a repository this run
                 # changed stays changed, so --limit has to bound those.
                 if had_changes:
-                    repos_with_changes += 1
+                    changed_repos.append(repo_path.name)
                 if outcome == STATUS_SUCCESS:
                     success_count += 1
                 elif outcome == STATUS_SKIPPED:
@@ -3250,7 +3253,7 @@ def main():
                 # repository names the tally it was counted in.
                 outcome, had_changes = "error", maintainer.changed_remote
                 if maintainer.changed_remote:
-                    repos_with_changes += 1
+                    changed_repos.append(repo_path.name)
             finally:
                 issues.repo = None
 
@@ -3279,7 +3282,9 @@ def main():
     report("=" * 80)
     report("Maintenance complete" + (" (interrupted)" if interrupted else ""))
     report(f"Successful: {success_count}")
-    report(f"With changes: {repos_with_changes}")
+    report(f"With changes: {len(changed_repos)}")
+    for name in changed_repos:
+        report(f"  {name}")
     report(f"Skipped: {skip_count}")
     report(f"Failed: {fail_count}")
     report(f"Errors: {error_count}")

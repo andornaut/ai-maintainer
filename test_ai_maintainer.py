@@ -3365,6 +3365,21 @@ class TestARunReportsWhatItLogged:
         assert f"[{repo_path.name}] Result: failed with changes (1 error, 1 warning)" in warnings
         assert f"  {repo_path.name}: 1 error, 1 warning" in warnings
 
+    def test_a_repo_that_changed_quietly_is_still_named(self, repo_path, monkeypatch, caplog):
+        # A repository that changed and logged nothing prints no line of its
+        # own, so without this the summary says a repository changed and never
+        # says which one
+        with caplog.at_level(logging.INFO):
+            self._run_main(monkeypatch, repo_path, lambda: (gm.STATUS_SUCCESS, True))
+        assert "With changes: 1" in caplog.text
+        assert f"  {repo_path.name}" in caplog.text
+
+    def test_an_unchanged_repo_is_not_named(self, repo_path, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO):
+            self._run_main(monkeypatch, repo_path, lambda: (gm.STATUS_SUCCESS, False))
+        assert "With changes: 0" in caplog.text
+        assert f"  {repo_path.name}" not in caplog.text
+
     def test_a_clean_run_says_nothing_at_warning(self, repo_path, monkeypatch, caplog):
         with caplog.at_level(logging.INFO):
             assert (
