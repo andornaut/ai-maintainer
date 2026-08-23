@@ -3380,6 +3380,15 @@ class TestARunReportsWhatItLogged:
         assert "With changes: 0" in caplog.text
         assert f"  {repo_path.name}" not in caplog.text
 
+    def test_a_run_that_changed_something_reports_at_warning(self, repo_path, monkeypatch, caplog):
+        # The names are the only record of which repository moved, and --quiet
+        # would drop the whole summary if it stayed at INFO
+        with caplog.at_level(logging.INFO):
+            self._run_main(monkeypatch, repo_path, lambda: (gm.STATUS_SUCCESS, True))
+        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert "With changes: 1" in warnings
+        assert f"  {repo_path.name}" in warnings
+
     def test_a_clean_run_says_nothing_at_warning(self, repo_path, monkeypatch, caplog):
         with caplog.at_level(logging.INFO):
             assert (

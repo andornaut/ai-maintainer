@@ -3272,9 +3272,11 @@ def main():
         interrupted = True
 
     # Summary. Reported at WARNING when the run logged anything at that level
-    # or above, so a quiet run that printed warnings also says how it ended.
+    # or above, so a quiet run that printed warnings also says how it ended,
+    # and when the run changed a repository, which is the only record naming
+    # which one it was. A quiet run that did neither stays quiet.
     totals = issues.totals()
-    level = logging.WARNING if issues.total else logging.INFO
+    level = logging.WARNING if issues.total or changed_repos else logging.INFO
 
     def report(message: str) -> None:
         logger.log(level, message, extra=SUMMARY_EXTRA)
