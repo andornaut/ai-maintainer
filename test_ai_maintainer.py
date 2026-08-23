@@ -1715,7 +1715,7 @@ class TestUpdateDependencies:
         maintainer = make_maintainer(repo_path, default_config, dry_run=False)
         maintainer.agent.ask_json = MagicMock(return_value=decision)
         maintainer.git.reset_changes = MagicMock(return_value=True)
-        maintainer._outdated_report = MagicMock(return_value={})
+        maintainer._outdated_report = MagicMock(return_value=gm.OutdatedReport({}, []))
         return maintainer
 
     def test_unreported_changes_are_discarded(self, repo_path, default_config):
@@ -1930,15 +1930,17 @@ class TestOutdatedReport:
         report = maintainer._outdated_report(["Cargo.toml", "package.json"])
         assert calls == ["npm outdated --json"]
         # Output npm's reader cannot parse is handed over whole rather than
-        # filtered down to silence
-        assert report == {"npm outdated --json": "up to date"}
+        # filtered down to silence, and is not answered for: an unreadable
+        # answer is no answer, so the agent stays free to look itself
+        assert report.updates == {"npm outdated --json": "up to date"}
+        assert report.answered == []
 
     def test_output_is_read_despite_a_non_zero_exit(self, repo_path, default_config, monkeypatch):
         # npm outdated and bundle outdated both exit non-zero exactly when
         # they have something to report
         report = json.dumps({"eslint": {"current": "9.39.5", "latest": "10.9.0"}})
         maintainer, _ = self._maintainer(repo_path, default_config, monkeypatch, (False, report, ""))
-        assert maintainer._outdated_report(["package.json"]) == {
+        assert maintainer._outdated_report(["package.json"]).updates == {
             "npm outdated --json": "eslint: 9.39.5 -> 10.9.0 (released 2020-01-01)"
         }
 
@@ -1948,13 +1950,18 @@ class TestOutdatedReport:
         report = json.dumps({"eslint": {"current": "9.39.5", "latest": "10.9.0"}})
         recent = datetime.now(UTC) - timedelta(days=8)
         maintainer, _ = self._maintainer(repo_path, default_config, monkeypatch, (False, report, ""), released=recent)
-        assert maintainer._outdated_report(["package.json"]) == {}
+        report = maintainer._outdated_report(["package.json"])
+        assert report.updates == {}
+        # Held back is not unasked: an ecosystem whose candidates were all too
+        # new must not be handed to the agent to rediscover, which would give
+        # back exactly what the limit held
+        assert report.answered == ["package.json"]
 
     def test_a_release_on_the_far_side_of_the_window_is_kept(self, repo_path, default_config, monkeypatch):
         report = json.dumps({"eslint": {"current": "9.39.5", "latest": "10.9.0"}})
         old = datetime.now(UTC) - timedelta(days=31)
         maintainer, _ = self._maintainer(repo_path, default_config, monkeypatch, (False, report, ""), released=old)
-        assert maintainer._outdated_report(["package.json"]) == {
+        assert maintainer._outdated_report(["package.json"]).updates == {
             "npm outdated --json": f"eslint: 9.39.5 -> 10.9.0 (released {old.date()})"
         }
 
@@ -1963,7 +1970,7 @@ class TestOutdatedReport:
         # new; dropping it would hide an update behind a lookup that failed
         report = json.dumps({"eslint": {"current": "9.39.5", "latest": "10.9.0"}})
         maintainer, _ = self._maintainer(repo_path, default_config, monkeypatch, (False, report, ""), released=None)
-        assert maintainer._outdated_report(["package.json"]) == {
+        assert maintainer._outdated_report(["package.json"]).updates == {
             "npm outdated --json": "eslint: 9.39.5 -> 10.9.0 (release date unknown)"
         }
 
@@ -1971,23 +1978,29 @@ class TestOutdatedReport:
         report = json.dumps({"eslint": {"current": "1.0.0", "latest": "2.0.0"}})
         recent = datetime.now(UTC) - timedelta(days=1)
         maintainer, _ = self._maintainer(repo_path, default_config, monkeypatch, (False, report, ""), released=recent)
-        assert maintainer._outdated_report(["package.json"]) == {}
+        assert maintainer._outdated_report(["package.json"]).updates == {}
 
     def test_stderr_answers_when_stdout_is_empty(self, repo_path, default_config, monkeypatch):
         maintainer, _ = self._maintainer(
             repo_path, default_config, monkeypatch, (False, "", "could not reach registry")
         )
-        assert maintainer._outdated_report(["package.json"]) == {"npm outdated --json": "could not reach registry"}
+        report = maintainer._outdated_report(["package.json"])
+        assert report.updates == {"npm outdated --json": "could not reach registry"}
+        assert report.answered == []
 
     def test_an_empty_report_is_omitted(self, repo_path, default_config, monkeypatch):
+        # `bundle outdated --parseable` prints nothing when every gem is
+        # current, which is an answer rather than a silence
         maintainer, _ = self._maintainer(repo_path, default_config, monkeypatch, (True, "  ", ""))
-        assert maintainer._outdated_report(["package.json"]) == {}
+        report = maintainer._outdated_report(["package.json"])
+        assert report.updates == {}
+        assert report.answered == ["package.json"]
 
     def test_an_oversized_report_says_it_was_cut(self, repo_path, default_config, monkeypatch):
         maintainer, _ = self._maintainer(
             repo_path, default_config, monkeypatch, (False, "x" * (gm.OUTDATED_MAX_LENGTH + 10), "")
         )
-        report = maintainer._outdated_report(["package.json"])["npm outdated --json"]
+        report = maintainer._outdated_report(["package.json"]).updates["npm outdated --json"]
         assert report.endswith("... (truncated)")
         assert len(report) < gm.OUTDATED_MAX_LENGTH + 40
 
@@ -2009,7 +2022,8 @@ class TestOutdatedReport:
         maintainer.update_dependencies()
         prompt, context = maintainer.agent.ask_json.call_args[0]
         assert context["outdated"] == {"npm outdated --json": "eslint: 9.39.5 -> 10.9.0 (released 2020-01-01)"}
-        assert "Work from it rather than rediscovering the set" in prompt
+        assert "asked about package.json." in prompt
+        assert "work from it rather than rediscovering the set" in prompt
 
     def test_nothing_to_report_leaves_the_prompt_alone(self, repo_path, default_config, monkeypatch):
         # Naming a list the context does not carry would be an instruction to
@@ -2021,24 +2035,25 @@ class TestOutdatedReport:
         maintainer.update_dependencies()
         prompt, context = maintainer.agent.ask_json.call_args[0]
         assert "outdated" not in context
-        assert "Work from it" not in prompt
+        assert "work from it" not in prompt
+        assert "were asked about" not in prompt
 
 
 class TestMinimumAgeInThePrompt:
     """What the agent is told about an age limit the tool only partly applies."""
 
-    def _prompt(self, repo_path, default_config, monkeypatch, dep_files, outdated, minimum_age=30):
+    def _prompt(self, repo_path, default_config, monkeypatch, dep_files, updates, answered=(), minimum_age=30):
         for dep_file in dep_files:
             (repo_path / dep_file).write_text("{}")
         monkeypatch.setattr(gm, "run_shell_command", lambda cmd, cwd, timeout=None: (True, "", ""))
         maintainer = make_maintainer(repo_path, default_config, dry_run=False, dependency_min_age_days=minimum_age)
-        maintainer._outdated_report = MagicMock(return_value=outdated)
+        maintainer._outdated_report = MagicMock(return_value=gm.OutdatedReport(updates, list(answered)))
         maintainer.agent.ask_json = MagicMock(return_value={"updated": False, "reasoning": "none"})
         maintainer.git.is_workdir_clean = MagicMock(return_value=True)
         maintainer.update_dependencies()
         return maintainer.agent.ask_json.call_args[0][0]
 
-    def test_the_prompt_names_the_manifests_the_list_covers(self, repo_path, default_config, monkeypatch):
+    def test_the_prompt_names_the_manifests_asked_about(self, repo_path, default_config, monkeypatch):
         # Only manifests in OUTDATED_COMMANDS arrive age-filtered, so the
         # agent has to be told which ones the tool answered for
         prompt = self._prompt(
@@ -2047,26 +2062,56 @@ class TestMinimumAgeInThePrompt:
             monkeypatch,
             ["package.json", "Cargo.toml"],
             {"npm outdated --json": "eslint: 1.0.0 -> 2.0.0 (released 2026-02-06)"},
+            answered=["package.json"],
         )
-        assert "report for package.json." in prompt
+        assert "asked about package.json." in prompt
         assert "Cargo.toml" not in prompt.split("You may edit")[0]
 
-    def test_an_entry_without_a_date_is_left_to_the_agent(self, repo_path, default_config, monkeypatch):
-        # A candidate the registry could not date is passed through unfiltered
+    def test_an_ecosystem_held_back_entirely_is_still_named(self, repo_path, default_config, monkeypatch):
+        # Held back is not unasked. Leaving it unnamed sends the agent to
+        # rediscover the set with no way to date it, which gives back exactly
+        # the updates the limit held
+        prompt = self._prompt(
+            repo_path,
+            default_config,
+            monkeypatch,
+            ["Gemfile", "package.json"],
+            {"npm outdated --json": "eslint: 1.0.0 -> 2.0.0 (released 2026-02-06)"},
+            answered=["Gemfile", "package.json"],
+        )
+        assert "asked about Gemfile, package.json." in prompt
+
+    def test_nothing_old_enough_says_so_rather_than_going_quiet(self, repo_path, default_config, monkeypatch):
+        prompt = self._prompt(repo_path, default_config, monkeypatch, ["Gemfile"], {}, answered=["Gemfile"])
+        assert "asked about Gemfile. They offer nothing old enough to take." in prompt
+
+    def test_a_report_that_could_not_be_read_is_not_named_as_asked(self, repo_path, default_config, monkeypatch):
+        # An unreadable answer is no answer, so the agent stays free to look
+        prompt = self._prompt(
+            repo_path, default_config, monkeypatch, ["Gemfile"], {"bundle outdated --parseable": "not found"}
+        )
+        assert "were asked about" not in prompt
+        assert "work from it rather than rediscovering the set" in prompt
+
+    def test_the_prompt_hands_undated_entries_back(self, repo_path, default_config, monkeypatch):
+        # A candidate the registry could not date reaches the agent unfiltered
+        # alongside filtered ones, so the wording has to separate them
         prompt = self._prompt(
             repo_path,
             default_config,
             monkeypatch,
             ["package.json"],
             {"npm outdated --json": "eslint: 1.0.0 -> 2.0.0 (release date unknown)"},
+            answered=["package.json"],
         )
-        assert "An entry carrying a release date is already past that limit" in prompt
+        assert "Entries carrying a release date are already past that limit" in prompt
         assert "you age-check yourself" in prompt
 
     def test_the_limit_is_stated_even_with_no_list(self, repo_path, default_config, monkeypatch):
         prompt = self._prompt(repo_path, default_config, monkeypatch, ["Cargo.toml"], {})
         assert "published within the last 30 days" in prompt
-        assert "Work from it" not in prompt
+        assert "work from it" not in prompt
+        assert "were asked about" not in prompt
 
     def test_no_limit_leaves_the_prompt_free_of_age(self, repo_path, default_config, monkeypatch):
         # The default is 0, where an age sentence is an instruction to do
@@ -2077,11 +2122,12 @@ class TestMinimumAgeInThePrompt:
             monkeypatch,
             ["package.json"],
             {"npm outdated --json": "eslint: 1.0.0 -> 2.0.0 (released 2026-02-06)"},
+            answered=["package.json"],
             minimum_age=0,
         )
         assert "days unless security-critical" not in prompt
         assert "age-check" not in prompt
-        assert "Work from it rather than rediscovering the set" in prompt
+        assert "work from it rather than rediscovering the set" in prompt
 
 
 class TestMaintainMergedPrCiMonitoring:

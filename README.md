@@ -59,7 +59,7 @@ ai-maintainer auto-detects each project's toolchain (Node via nvm/fnm, Python vi
 
 Step 4 asks the package managers what is out of date and hands the agent that list, so successive runs over an unchanged repository agree on what is available. Two ecosystems have such a query: `bundle outdated` for a `Gemfile` and `npm outdated` for a `package.json`. Their candidates are dated against the registry, and anything published within `--dependency-min-age-days` is dropped before the list reaches the agent.
 
-**The tool applies that age limit only there.** Cargo, pip, Go and every other ecosystem get no list and no date check, and a candidate whose release date cannot be read is passed on rather than dropped. In both cases the limit is stated to the agent and the agent decides, so treat it as enforced for Ruby and npm and advisory everywhere else.
+**The tool applies that age limit only there.** Cargo, pip, Go and every other ecosystem get no list and no date check. Two cases inside the covered path also go unfiltered: a candidate whose release date cannot be read is passed on rather than dropped, and a report the tool cannot parse (a `bundle outdated` that errored, an `npm outdated` that did not return an object) is forwarded whole with no dates looked up at all. In every one of these the limit is stated to the agent and the agent decides, so treat it as enforced for Ruby and npm and advisory everywhere else. The prompt names which manifests were answered for, and entries carry their release date, so the agent can tell the filtered from the unfiltered.
 
 Skips repos that are: not git repos, not on default branch, have uncommitted changes, are archived/read-only, or have no dependency files.
 

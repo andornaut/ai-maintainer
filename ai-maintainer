@@ -32,7 +32,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import quote
 
 __version__ = "0.2.1"
@@ -40,6 +40,22 @@ __version__ = "0.2.1"
 # Type aliases for common return types
 CommandResult = tuple[bool, str, str]  # (success, stdout, stderr)
 MaintainResult = tuple[bool, bool]  # (success, had_changes)
+
+
+class OutdatedReport(NamedTuple):
+    """What the outdated queries answered.
+
+    `updates` holds what each command named that is old enough to take, keyed
+    by the command asked. `answered` names every manifest whose query could be
+    read, which is a different set: an ecosystem whose candidates were all held
+    back on age answers for itself while contributing no updates, and sending
+    the agent to rediscover it would hand back the updates the age limit held.
+    """
+
+    updates: dict[str, str]
+    answered: list[str]
+
+
 MergeResult = list[int]  # merged_pr_numbers
 RepoResult = tuple[str, bool]  # (status, had_changes); status is a STATUS_* value
 TestResult = tuple[str, str]  # (TESTS_* value, output)
@@ -2662,8 +2678,8 @@ class Maintainer:
             eligible.append(f"{name}: {installed} -> {newest} ({age})")
         return eligible
 
-    def _outdated_report(self, dep_files: list[str]) -> dict[str, str]:
-        """The updates each ecosystem offers that are old enough to take, keyed by command.
+    def _outdated_report(self, dep_files: list[str]) -> OutdatedReport:
+        """The updates each ecosystem offers that are old enough to take, and what was asked.
 
         Without a list the agent discovers the outdated set itself, so an
         unchanged repository answers differently from one run to the next and
@@ -2675,10 +2691,13 @@ class Maintainer:
 
         A manifest with no entry in OUTDATED_COMMANDS contributes nothing,
         which leaves the agent where it already was rather than telling it
-        that ecosystem is up to date.
+        that ecosystem is up to date. A report that cannot be read reaches the
+        agent whole and is not answered for, since an unreadable answer is no
+        answer.
         """
         prefix = self._quiet_env_prefix()
-        report: dict[str, str] = {}
+        updates: dict[str, str] = {}
+        answered: list[str] = []
         for dep_file in dep_files:
             command = OUTDATED_COMMANDS.get(dep_file)
             if not command:
@@ -2690,16 +2709,27 @@ class Maintainer:
             )
             output = stdout.strip() or stderr.strip()
             if not output:
+                # `bundle outdated --parseable` prints nothing when every gem
+                # is current, which is an answer of "no update available"
+                answered.append(dep_file)
                 continue
             candidates = self._outdated_candidates(dep_file, output)
-            eligible = output if candidates is None else "\n".join(self._old_enough(dep_file, candidates))
-            if not eligible:
+            if candidates is None:
+                updates[command] = self._within_length(output)
                 continue
-            if len(eligible) > OUTDATED_MAX_LENGTH:
-                eligible = f"{eligible[:OUTDATED_MAX_LENGTH]}\n... (truncated)"
-            report[command] = eligible
-        self.logger.debug(f"[{self.repo_name}] Outdated reports: {list(report)}")
-        return report
+            answered.append(dep_file)
+            eligible = "\n".join(self._old_enough(dep_file, candidates))
+            if eligible:
+                updates[command] = self._within_length(eligible)
+        self.logger.debug(f"[{self.repo_name}] Outdated: asked about {answered}, offers from {list(updates)}")
+        return OutdatedReport(updates, answered)
+
+    @staticmethod
+    def _within_length(report: str) -> str:
+        """A report cut to what a prompt will carry, saying so when it was cut."""
+        if len(report) <= OUTDATED_MAX_LENGTH:
+            return report
+        return f"{report[:OUTDATED_MAX_LENGTH]}\n... (truncated)"
 
     def update_dependencies(self) -> MaintainResult:
         """Update dependencies by asking AI to analyze and execute updates directly.
@@ -2729,24 +2759,27 @@ class Maintainer:
         self.logger.info(f"[{self.repo_name}] Asking AI to update dependencies...")
 
         outdated = self._outdated_report(dep_files)
-        covered = ", ".join(f for f in dep_files if OUTDATED_COMMANDS.get(f) in outdated)
         minimum_age = self.config.dependency_min_age_days
         # Only the manifests in OUTDATED_COMMANDS arrive filtered by age, and
         # within those an entry that could not be dated is passed through
         # unfiltered. Both hold the agent to the limit where the tool cannot,
-        # so the prompt says which entries it has already answered for.
+        # so the prompt names what it has answered for and hands back the rest.
         age_rule = f"Skip dependencies published within the last {minimum_age} days unless security-critical. "
-        unfiltered = (
-            "An entry carrying a release date is already past that limit; anything else there, and "
-            "every manifest the list does not cover, you age-check yourself. "
-        )
-        ledger = (
-            f"`outdated` lists what the package managers report for {covered}. Work from it rather than "
-            f"rediscovering the set, and account in `reasoning` for every entry you skip. "
-            f"{unfiltered if minimum_age else ''}"
-            if outdated
+        asked = f"The package managers were asked about {', '.join(outdated.answered)}. " if outdated.answered else ""
+        nothing = "They offer nothing old enough to take. " if minimum_age else "They offer nothing to take. "
+        offered = (
+            "`outdated` carries what the package managers offer; work from it rather than "
+            "rediscovering the set, and account in `reasoning` for every entry you skip. "
+            if outdated.updates
+            else nothing
+            if outdated.answered
             else ""
         )
+        unfiltered = (
+            "Entries carrying a release date are already past that limit; anything else, and every "
+            "manifest not named as asked about, you age-check yourself. "
+        )
+        ledger = f"{asked}{offered}{unfiltered if (asked or offered) and minimum_age else ''}"
 
         prompt = (
             f"Analyze and update DIRECT dependencies in this repository. "
@@ -2763,8 +2796,8 @@ class Maintainer:
         )
 
         context: dict[str, Any] = {"dependency_files": dep_files}
-        if outdated:
-            context["outdated"] = outdated
+        if outdated.updates:
+            context["outdated"] = outdated.updates
 
         decision = self.agent.ask_json(prompt, context)
         if decision is None:
