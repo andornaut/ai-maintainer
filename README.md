@@ -57,7 +57,9 @@ For each repository:
 
 ai-maintainer auto-detects each project's toolchain (Node via nvm/fnm, Python via pipenv/poetry/venv, Ruby via chruby/rbenv, plus Go and Rust) and activates it when running tests and git operations, so git hooks (e.g. husky `pre-commit`) use the project's runtime rather than whatever is on the ambient PATH. The same activation prefix is given to the AI agent, so its package-manager commands resolve the project's runtime too.
 
-Step 4 asks the package managers what is out of date (`bundle outdated`, `npm outdated`) and hands the agent that list, so successive runs over an unchanged repository agree on what is available. Each candidate is dated against its registry, and anything published within `--dependency-min-age-days` is held back before the list reaches the agent; a candidate that cannot be dated is passed on rather than dropped. Ecosystems with no query (Cargo, pip, Go) contribute no list, and there the age limit stays an instruction to the agent rather than something the tool applies.
+Step 4 asks the package managers what is out of date and hands the agent that list, so successive runs over an unchanged repository agree on what is available. Two ecosystems have such a query: `bundle outdated` for a `Gemfile` and `npm outdated` for a `package.json`. Their candidates are dated against the registry, and anything published within `--dependency-min-age-days` is dropped before the list reaches the agent.
+
+**The tool applies that age limit only there.** Cargo, pip, Go and every other ecosystem get no list and no date check, and a candidate whose release date cannot be read is passed on rather than dropped. In both cases the limit is stated to the agent and the agent decides, so treat it as enforced for Ruby and npm and advisory everywhere else.
 
 Skips repos that are: not git repos, not on default branch, have uncommitted changes, are archived/read-only, or have no dependency files.
 
@@ -125,7 +127,7 @@ Rewinding would mean force pushing away commits that are already on the remote, 
 
 ### Before running in production
 
-Use `--dry-run` first, start with `--limit 1`, exclude critical repos with `-e`, and set `--dependency-min-age-days` high (90+) for sensitive projects. Watch for repositories reported as failed: their builds stay broken until you act. Understand that agent commands run with your user privileges, and prefer running under an account that does not hold credentials beyond what maintenance needs.
+Use `--dry-run` first, start with `--limit 1`, exclude critical repos with `-e`, and set `--dependency-min-age-days` high (90+) for sensitive projects, remembering that the tool only holds updates back for Ruby and npm and leaves the limit to the agent elsewhere. Watch for repositories reported as failed: their builds stay broken until you act. Understand that agent commands run with your user privileges, and prefer running under an account that does not hold credentials beyond what maintenance needs.
 
 ## Developing
 

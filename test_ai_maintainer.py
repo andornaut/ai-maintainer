@@ -2009,7 +2009,7 @@ class TestOutdatedReport:
         maintainer.update_dependencies()
         prompt, context = maintainer.agent.ask_json.call_args[0]
         assert context["outdated"] == {"npm outdated --json": "eslint: 9.39.5 -> 10.9.0 (released 2020-01-01)"}
-        assert "Work from that list" in prompt
+        assert "Work from it rather than rediscovering the set" in prompt
 
     def test_nothing_to_report_leaves_the_prompt_alone(self, repo_path, default_config, monkeypatch):
         # Naming a list the context does not carry would be an instruction to
@@ -2021,7 +2021,67 @@ class TestOutdatedReport:
         maintainer.update_dependencies()
         prompt, context = maintainer.agent.ask_json.call_args[0]
         assert "outdated" not in context
-        assert "Work from that list" not in prompt
+        assert "Work from it" not in prompt
+
+
+class TestMinimumAgeInThePrompt:
+    """What the agent is told about an age limit the tool only partly applies."""
+
+    def _prompt(self, repo_path, default_config, monkeypatch, dep_files, outdated, minimum_age=30):
+        for dep_file in dep_files:
+            (repo_path / dep_file).write_text("{}")
+        monkeypatch.setattr(gm, "run_shell_command", lambda cmd, cwd, timeout=None: (True, "", ""))
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False, dependency_min_age_days=minimum_age)
+        maintainer._outdated_report = MagicMock(return_value=outdated)
+        maintainer.agent.ask_json = MagicMock(return_value={"updated": False, "reasoning": "none"})
+        maintainer.git.is_workdir_clean = MagicMock(return_value=True)
+        maintainer.update_dependencies()
+        return maintainer.agent.ask_json.call_args[0][0]
+
+    def test_the_prompt_names_the_manifests_the_list_covers(self, repo_path, default_config, monkeypatch):
+        # Only manifests in OUTDATED_COMMANDS arrive age-filtered, so the
+        # agent has to be told which ones the tool answered for
+        prompt = self._prompt(
+            repo_path,
+            default_config,
+            monkeypatch,
+            ["package.json", "Cargo.toml"],
+            {"npm outdated --json": "eslint: 1.0.0 -> 2.0.0 (released 2026-02-06)"},
+        )
+        assert "report for package.json." in prompt
+        assert "Cargo.toml" not in prompt.split("You may edit")[0]
+
+    def test_an_entry_without_a_date_is_left_to_the_agent(self, repo_path, default_config, monkeypatch):
+        # A candidate the registry could not date is passed through unfiltered
+        prompt = self._prompt(
+            repo_path,
+            default_config,
+            monkeypatch,
+            ["package.json"],
+            {"npm outdated --json": "eslint: 1.0.0 -> 2.0.0 (release date unknown)"},
+        )
+        assert "An entry carrying a release date is already past that limit" in prompt
+        assert "you age-check yourself" in prompt
+
+    def test_the_limit_is_stated_even_with_no_list(self, repo_path, default_config, monkeypatch):
+        prompt = self._prompt(repo_path, default_config, monkeypatch, ["Cargo.toml"], {})
+        assert "published within the last 30 days" in prompt
+        assert "Work from it" not in prompt
+
+    def test_no_limit_leaves_the_prompt_free_of_age(self, repo_path, default_config, monkeypatch):
+        # The default is 0, where an age sentence is an instruction to do
+        # nothing and the ledger has no limit to refer back to
+        prompt = self._prompt(
+            repo_path,
+            default_config,
+            monkeypatch,
+            ["package.json"],
+            {"npm outdated --json": "eslint: 1.0.0 -> 2.0.0 (released 2026-02-06)"},
+            minimum_age=0,
+        )
+        assert "days unless security-critical" not in prompt
+        assert "age-check" not in prompt
+        assert "Work from it rather than rediscovering the set" in prompt
 
 
 class TestMaintainMergedPrCiMonitoring:

@@ -2729,10 +2729,21 @@ class Maintainer:
         self.logger.info(f"[{self.repo_name}] Asking AI to update dependencies...")
 
         outdated = self._outdated_report(dep_files)
+        covered = ", ".join(f for f in dep_files if OUTDATED_COMMANDS.get(f) in outdated)
+        minimum_age = self.config.dependency_min_age_days
+        # Only the manifests in OUTDATED_COMMANDS arrive filtered by age, and
+        # within those an entry that could not be dated is passed through
+        # unfiltered. Both hold the agent to the limit where the tool cannot,
+        # so the prompt says which entries it has already answered for.
+        age_rule = f"Skip dependencies published within the last {minimum_age} days unless security-critical. "
+        unfiltered = (
+            "An entry carrying a release date is already past that limit; anything else there, and "
+            "every manifest the list does not cover, you age-check yourself. "
+        )
         ledger = (
-            "The context carries the updates each package manager offers, already filtered to "
-            "those old enough to take. Work from that list rather than rediscovering it, and "
-            "account in `reasoning` for every listed update you do not take. "
+            f"`outdated` lists what the package managers report for {covered}. Work from it rather than "
+            f"rediscovering the set, and account in `reasoning` for every entry you skip. "
+            f"{unfiltered if minimum_age else ''}"
             if outdated
             else ""
         )
@@ -2740,7 +2751,7 @@ class Maintainer:
         prompt = (
             f"Analyze and update DIRECT dependencies in this repository. "
             f"Update only direct/top-level dependencies, NOT transitive dependencies. "
-            f"Skip dependencies newer than {self.config.dependency_min_age_days} days unless security-critical. "
+            f"{age_rule if minimum_age else ''}"
             f"{ledger}"
             f"You may edit version constraints in dependency files (Cargo.toml, package.json, etc.) "
             f"to allow newer versions, then run the appropriate update command. "
