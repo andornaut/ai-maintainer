@@ -1708,6 +1708,7 @@ class TestUpdateDependencies:
         maintainer = make_maintainer(repo_path, default_config, dry_run=False)
         maintainer.agent.ask_json = MagicMock(return_value=decision)
         maintainer.git.reset_changes = MagicMock(return_value=True)
+        maintainer._outdated_report = MagicMock(return_value={})
         return maintainer
 
     def test_unreported_changes_are_discarded(self, repo_path, default_config):
@@ -1737,6 +1738,83 @@ class TestUpdateDependencies:
         assert success is True
         assert had_updates is True
         maintainer.git.reset_changes.assert_not_called()
+
+
+class TestOutdatedReport:
+    """The agent works from what the package managers report, not from memory."""
+
+    def _maintainer(self, repo_path, default_config, monkeypatch, result):
+        calls = []
+
+        def run(cmd, cwd, timeout=None):
+            calls.append(cmd)
+            return result
+
+        monkeypatch.setattr(gm, "run_shell_command", run)
+        return make_maintainer(repo_path, default_config, dry_run=False), calls
+
+    def test_only_manifests_with_a_command_are_asked(self, repo_path, default_config, monkeypatch):
+        # An ecosystem with no query contributes nothing, which is not the
+        # same as reporting it up to date
+        maintainer, calls = self._maintainer(repo_path, default_config, monkeypatch, (True, "up to date", ""))
+        report = maintainer._outdated_report(["Cargo.toml", "package.json"])
+        assert calls == ["npm outdated --json"]
+        assert report == {"npm outdated --json": "up to date"}
+
+    def test_output_is_read_despite_a_non_zero_exit(self, repo_path, default_config, monkeypatch):
+        # npm outdated and bundle outdated both exit non-zero exactly when
+        # they have something to report
+        maintainer, _ = self._maintainer(repo_path, default_config, monkeypatch, (False, '{"eslint": {}}', ""))
+        assert maintainer._outdated_report(["package.json"]) == {"npm outdated --json": '{"eslint": {}}'}
+
+    def test_stderr_answers_when_stdout_is_empty(self, repo_path, default_config, monkeypatch):
+        maintainer, _ = self._maintainer(
+            repo_path, default_config, monkeypatch, (False, "", "could not reach registry")
+        )
+        assert maintainer._outdated_report(["package.json"]) == {"npm outdated --json": "could not reach registry"}
+
+    def test_an_empty_report_is_omitted(self, repo_path, default_config, monkeypatch):
+        maintainer, _ = self._maintainer(repo_path, default_config, monkeypatch, (True, "  ", ""))
+        assert maintainer._outdated_report(["package.json"]) == {}
+
+    def test_an_oversized_report_says_it_was_cut(self, repo_path, default_config, monkeypatch):
+        maintainer, _ = self._maintainer(
+            repo_path, default_config, monkeypatch, (False, "x" * (gm.OUTDATED_MAX_LENGTH + 10), "")
+        )
+        report = maintainer._outdated_report(["package.json"])["npm outdated --json"]
+        assert report.endswith("... (truncated)")
+        assert len(report) < gm.OUTDATED_MAX_LENGTH + 40
+
+    def test_the_toolchain_prefix_keeps_its_output_out_of_the_report(self, repo_path, default_config, monkeypatch):
+        # `nvm use` announces the version it selected on stdout, which would
+        # land in front of a report the agent reads as JSON
+        (repo_path / ".nvmrc").write_text("v24.19.0\n")
+        maintainer, calls = self._maintainer(repo_path, default_config, monkeypatch, (True, "{}", ""))
+        maintainer.project_env._env_runner = "source /x/nvm.sh && nvm use &&"
+        maintainer._outdated_report(["package.json"])
+        assert calls == ["{ source /x/nvm.sh && nvm use; } >/dev/null && npm outdated --json"]
+
+    def test_the_report_reaches_the_agent(self, repo_path, default_config, monkeypatch):
+        (repo_path / "package.json").write_text("{}")
+        maintainer, _ = self._maintainer(repo_path, default_config, monkeypatch, (False, '{"eslint": {}}', ""))
+        maintainer.agent.ask_json = MagicMock(return_value={"updated": False, "reasoning": "none"})
+        maintainer.git.is_workdir_clean = MagicMock(return_value=True)
+        maintainer.update_dependencies()
+        prompt, context = maintainer.agent.ask_json.call_args[0]
+        assert context["outdated"] == {"npm outdated --json": '{"eslint": {}}'}
+        assert "Work from that list" in prompt
+
+    def test_nothing_to_report_leaves_the_prompt_alone(self, repo_path, default_config, monkeypatch):
+        # Naming a list the context does not carry would be an instruction to
+        # work from nothing
+        (repo_path / "Cargo.toml").write_text("[package]")
+        maintainer, _ = self._maintainer(repo_path, default_config, monkeypatch, (True, "", ""))
+        maintainer.agent.ask_json = MagicMock(return_value={"updated": False, "reasoning": "none"})
+        maintainer.git.is_workdir_clean = MagicMock(return_value=True)
+        maintainer.update_dependencies()
+        prompt, context = maintainer.agent.ask_json.call_args[0]
+        assert "outdated" not in context
+        assert "Work from that list" not in prompt
 
 
 class TestMaintainMergedPrCiMonitoring:
