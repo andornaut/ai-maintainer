@@ -2084,6 +2084,8 @@ class TestMinimumAgeInThePrompt:
     def test_nothing_old_enough_says_so_rather_than_going_quiet(self, repo_path, default_config, monkeypatch):
         prompt = self._prompt(repo_path, default_config, monkeypatch, ["Gemfile"], {}, answered=["Gemfile"])
         assert "asked about Gemfile. They offer nothing old enough to take." in prompt
+        # No entries, so nothing to say about which of them carry a date
+        assert "already past that limit" not in prompt
 
     def test_a_report_that_could_not_be_read_is_not_named_as_asked(self, repo_path, default_config, monkeypatch):
         # An unreadable answer is no answer, so the agent stays free to look
@@ -2104,8 +2106,24 @@ class TestMinimumAgeInThePrompt:
             {"npm outdated --json": "eslint: 1.0.0 -> 2.0.0 (release date unknown)"},
             answered=["package.json"],
         )
-        assert "Entries carrying a release date are already past that limit" in prompt
-        assert "you age-check yourself" in prompt
+        assert "Entries carrying a release date are already past that limit; anything else there is not." in prompt
+
+    def test_the_prompt_does_not_send_the_agent_researching(self, repo_path, default_config, monkeypatch):
+        # Directing the agent at a manifest no query covers makes it research
+        # an ecosystem it cannot date, which spends the agent timeout to reach
+        # the answer it started with. The rule is stated, not delegated
+        prompt = self._prompt(
+            repo_path,
+            default_config,
+            monkeypatch,
+            ["package.json", "requirements-dev.txt"],
+            {"npm outdated --json": "eslint: 1.0.0 -> 2.0.0 (released 2026-02-06)"},
+            answered=["package.json"],
+        )
+        assert "yourself" not in prompt
+        assert "requirements-dev.txt" not in prompt.split("You may edit")[0]
+        # The limit still governs what the list does not cover
+        assert "published within the last 30 days" in prompt
 
     def test_the_limit_is_stated_even_with_no_list(self, repo_path, default_config, monkeypatch):
         prompt = self._prompt(repo_path, default_config, monkeypatch, ["Cargo.toml"], {})
@@ -2126,7 +2144,7 @@ class TestMinimumAgeInThePrompt:
             minimum_age=0,
         )
         assert "days unless security-critical" not in prompt
-        assert "age-check" not in prompt
+        assert "already past that limit" not in prompt
         assert "work from it rather than rediscovering the set" in prompt
 
 

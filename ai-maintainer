@@ -2789,11 +2789,12 @@ class Maintainer:
             if outdated.answered
             else ""
         )
-        unfiltered = (
-            "Entries carrying a release date are already past that limit; anything else, and every "
-            "manifest not named as asked about, you age-check yourself. "
-        )
-        ledger = f"{asked}{offered}{unfiltered if (asked or offered) and minimum_age else ''}"
+        # Scoped to the list. Directing the agent at the manifests no query
+        # covers sends it researching an ecosystem it cannot date, which costs
+        # the run its agent timeout to reach the answer it started with. The
+        # rule above still governs those; it is stated, not delegated.
+        unfiltered = "Entries carrying a release date are already past that limit; anything else there is not. "
+        ledger = f"{asked}{offered}{unfiltered if outdated.updates and minimum_age else ''}"
 
         prompt = (
             f"Analyze and update DIRECT dependencies in this repository. "
