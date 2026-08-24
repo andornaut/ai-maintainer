@@ -1,6 +1,6 @@
 # AI Maintainer
 
-[![CI](https://github.com/andornaut/ai-maintainer/actions/workflows/release.yml/badge.svg)](https://github.com/andornaut/ai-maintainer/actions/workflows/release.yml)
+[![Release](https://github.com/andornaut/ai-maintainer/actions/workflows/release.yml/badge.svg)](https://github.com/andornaut/ai-maintainer/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/license/MIT)
 
 Automated GitHub repository maintenance with AI-powered dependency updates, test fixing, and CI monitoring.
