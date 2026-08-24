@@ -31,6 +31,7 @@ import urllib.request
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, NamedTuple
 from urllib.parse import quote
@@ -201,8 +202,14 @@ DEPENDENCY_FILES = (
     "go.mod",
     "package.json",
     "pyproject.toml",
+    "requirements-dev.txt",
     "requirements.txt",
 )
+
+# Manifests whose outdated set is read here rather than from a package manager.
+# pip has no query for a pinned file: `pip list --outdated` reports whatever
+# environment happens to be installed, not what the file pins.
+REQUIREMENTS_FILES = ("requirements-dev.txt", "requirements.txt")
 
 # How each ecosystem is asked what is out of date, keyed by the manifest that
 # declares it. Both commands exit non-zero exactly when they have something to
@@ -224,6 +231,20 @@ BUNDLE_OUTDATED_LINE = re.compile(r"^(\S+) \(newest ([^,)]+), installed ([^,)]+)
 RUBYGEMS_VERSION_URL = "https://rubygems.org/api/v2/rubygems/{name}/versions/{version}.json"
 NPM_RELEASE_DATES_COMMAND = "npm view {name} time --json"
 RELEASE_DATE_TIMEOUT_SECONDS = 30
+
+# PyPI's release feed, read instead of its JSON or simple APIs: both of those
+# list every file of every version, which runs to megabytes for a project with
+# many wheels, while the feed is a few kilobytes and carries the two things
+# needed, a version and when it was published. Items are newest first.
+PYPI_RELEASES_URL = "https://pypi.org/rss/project/{name}/releases.xml"
+PYPI_RELEASE_ITEM = re.compile(r"<item>.*?<title>([^<]+)</title>.*?<pubDate>([^<]+)</pubDate>", re.DOTALL)
+
+# A requirements line pinning one version. Extras and environment markers are
+# allowed for and not read; a comment or an `-r` include matches nothing.
+REQUIREMENT_PIN = re.compile(r"^ *([A-Za-z0-9][A-Za-z0-9._-]*) *(?:\[[^\]]*\])? *== *([A-Za-z0-9.!+-]+)", re.MULTILINE)
+
+# PEP 440 pre-release and development suffixes, which are not offered as updates
+PRERELEASE_SUFFIX = re.compile(r"(?:a|b|rc)\d+$|\.?dev\d*$", re.IGNORECASE)
 
 # Cap on one ecosystem's outdated report before it reaches a prompt
 OUTDATED_MAX_LENGTH = 4000
@@ -1633,6 +1654,10 @@ class Maintainer:
         # Whether this run pushed the branch at all, whoever wrote the commits
         # it carried; see the CI monitoring in _maintain_after_merge
         self.pushed_head = False
+        # Release feeds already fetched this run, keyed by project name; see
+        # _pypi_releases. Reading one answers both what is newest and when it
+        # was published, so the second question must not fetch it again
+        self._pypi_feeds: dict[str, list[tuple[str, datetime]] | None] = {}
         # Why a declared test runner would not resolve; see run_tests
         self._unresolved_runner: str | None = None
         # Wall-clock ceiling for this repository; see _start_deadline
@@ -2649,7 +2674,63 @@ class Maintainer:
             return self._rubygems_release_date(name, version)
         if dep_file == "package.json":
             return self._npm_release_date(name, version)
+        if dep_file in REQUIREMENTS_FILES:
+            releases = self._pypi_releases(name)
+            return next((published for v, published in releases or [] if v == version), None)
         return None
+
+    def _pypi_releases(self, name: str) -> list[tuple[str, datetime]] | None:
+        """A PyPI project's recent releases, newest first, or None when it cannot say.
+
+        Fetched once per run per project: one feed answers both what is newest
+        and when each version was published.
+        """
+        if name in self._pypi_feeds:
+            return self._pypi_feeds[name]
+        url = PYPI_RELEASES_URL.format(name=quote(name, safe=""))
+        try:
+            # The URL is an https constant whose only interpolated part is
+            # percent-encoded, so no other scheme or host is reachable here.
+            with urllib.request.urlopen(url, timeout=RELEASE_DATE_TIMEOUT_SECONDS) as response:  # noqa: S310
+                feed = response.read().decode("utf-8", "replace")
+        except OSError as error:
+            self.logger.debug(f"[{self.repo_name}] Could not read the release feed for {name}: {error}")
+            self._pypi_feeds[name] = None
+            return None
+        releases = []
+        for version, published in PYPI_RELEASE_ITEM.findall(feed):
+            # A feed entry whose date will not parse is one release lost, not
+            # a reason to discard the rest of the project's history.
+            with contextlib.suppress(TypeError, ValueError):
+                releases.append((version.strip(), parsedate_to_datetime(published)))
+        # A project the feed names no release for answers nothing, which is not
+        # an answer that its pin is current.
+        self._pypi_feeds[name] = releases or None
+        return self._pypi_feeds[name]
+
+    def _pypi_outdated(self, dep_file: str) -> list[tuple[str, str, str]] | None:
+        """Each (name, pinned, newest) a requirements file's `==` pins are behind on.
+
+        None when the file names no pin this can check, or when PyPI answered
+        for none of them. A file whose pins are all current returns an empty
+        list, which is an answer rather than a silence.
+        """
+        try:
+            text = (self.repo_path / dep_file).read_text()
+        except OSError as error:
+            self.logger.debug(f"[{self.repo_name}] Could not read {dep_file}: {error}")
+            return None
+        candidates = []
+        answered = 0
+        for name, pinned in REQUIREMENT_PIN.findall(text):
+            releases = self._pypi_releases(name)
+            if releases is None:
+                continue
+            answered += 1
+            newest = next((v for v, _ in releases if not PRERELEASE_SUFFIX.search(v)), None)
+            if newest and newest != pinned:
+                candidates.append((name, pinned, newest))
+        return candidates if answered else None
 
     def _rubygems_release_date(self, name: str, version: str) -> datetime | None:
         """When RubyGems published a gem version, or None when it cannot say."""
@@ -2714,16 +2795,25 @@ class Maintainer:
         package manager reports a release date, so an agent told to skip recent
         releases has nothing to apply that rule to and takes what it is shown.
 
-        A manifest with no entry in OUTDATED_COMMANDS contributes nothing,
-        which leaves the agent where it already was rather than telling it
-        that ecosystem is up to date. A report that cannot be read reaches the
-        agent whole and is not answered for, since an unreadable answer is no
-        answer.
+        A manifest with neither an OUTDATED_COMMANDS entry nor a reader of its
+        own contributes nothing, which leaves the agent where it already was
+        rather than telling it that ecosystem is up to date. A report that
+        cannot be read reaches the agent whole and is not answered for, since
+        an unreadable answer is no answer.
         """
         prefix = self._quiet_env_prefix()
         updates: dict[str, str] = {}
         answered: list[str] = []
         for dep_file in dep_files:
+            if dep_file in REQUIREMENTS_FILES:
+                pinned = self._pypi_outdated(dep_file)
+                if pinned is None:
+                    continue
+                answered.append(dep_file)
+                behind = "\n".join(self._old_enough(dep_file, pinned))
+                if behind:
+                    updates[f"PyPI releases newer than the {dep_file} pins"] = self._within_length(behind)
+                continue
             command = OUTDATED_COMMANDS.get(dep_file)
             if not command:
                 continue

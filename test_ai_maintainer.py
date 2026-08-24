@@ -1906,6 +1906,142 @@ class TestReleaseDate:
         assert maintainer._release_date("Cargo.toml", "serde", "1.0.0") is None
 
 
+PYPI_FEED = b"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel>
+  <title>PyPI recent updates for ruff</title>
+  <item><title>0.17.0rc1</title><pubDate>Fri, 21 Aug 2026 09:00:00 GMT</pubDate></item>
+  <item><title>0.16.4</title><pubDate>Thu, 20 Aug 2026 17:43:16 GMT</pubDate></item>
+  <item><title>0.16.3</title><pubDate>Thu, 13 Aug 2026 15:16:27 GMT</pubDate></item>
+</channel></rss>"""
+
+
+class TestRequirementPin:
+    """Which lines of a requirements file name a version this can check."""
+
+    def test_a_plain_pin_is_read(self):
+        assert gm.REQUIREMENT_PIN.findall("ruff==0.16.3\n") == [("ruff", "0.16.3")]
+
+    def test_extras_and_spacing_are_allowed_for(self):
+        assert gm.REQUIREMENT_PIN.findall("  celery[redis] == 5.4.0\n") == [("celery", "5.4.0")]
+
+    def test_a_comment_is_not_a_pin(self):
+        assert gm.REQUIREMENT_PIN.findall("# ruff==0.16.3\n") == []
+
+    def test_an_include_is_not_a_pin(self):
+        assert gm.REQUIREMENT_PIN.findall("-r base.txt\n") == []
+
+    def test_an_unpinned_requirement_is_not_a_pin(self):
+        # Nothing says which version is installed, so nothing can be compared
+        assert gm.REQUIREMENT_PIN.findall("ruff>=0.16\nblack\n") == []
+
+
+class TestPrereleaseSuffix:
+    """A pre-release is never offered as an update."""
+
+    @pytest.mark.parametrize("version", ["0.17.0rc1", "1.0a1", "1.0b2", "2.0.dev1", "2.0dev"])
+    def test_prereleases_are_recognised(self, version):
+        assert gm.PRERELEASE_SUFFIX.search(version)
+
+    @pytest.mark.parametrize("version", ["0.16.4", "1.0", "0.0.292", "2.1.0.post1"])
+    def test_releases_are_not(self, version):
+        assert not gm.PRERELEASE_SUFFIX.search(version)
+
+
+class TestPypiReleases:
+    """pip has no query for a pinned file, so PyPI's release feed answers."""
+
+    def _maintainer(self, repo_path, default_config, monkeypatch, payload=PYPI_FEED, error=None):
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False)
+        fetched = []
+
+        @contextlib.contextmanager
+        def urlopen(url, timeout=None):
+            fetched.append(url)
+            if error:
+                raise error
+            yield io.BytesIO(payload)
+
+        monkeypatch.setattr(gm.urllib.request, "urlopen", urlopen)
+        return maintainer, fetched
+
+    def test_the_feed_is_read_newest_first(self, repo_path, default_config, monkeypatch):
+        maintainer, fetched = self._maintainer(repo_path, default_config, monkeypatch)
+        releases = maintainer._pypi_releases("ruff")
+        assert [v for v, _ in releases] == ["0.17.0rc1", "0.16.4", "0.16.3"]
+        assert releases[1][1] == datetime(2026, 8, 20, 17, 43, 16, tzinfo=UTC)
+        assert fetched == ["https://pypi.org/rss/project/ruff/releases.xml"]
+
+    def test_one_feed_answers_both_questions(self, repo_path, default_config, monkeypatch):
+        # Reading it says what is newest and when each version was published,
+        # so asking the second question must not fetch it again
+        maintainer, fetched = self._maintainer(repo_path, default_config, monkeypatch)
+        (repo_path / "requirements.txt").write_text("ruff==0.16.3\n")
+        assert maintainer._pypi_outdated("requirements.txt") == [("ruff", "0.16.3", "0.16.4")]
+        assert maintainer._release_date("requirements.txt", "ruff", "0.16.4") == datetime(
+            2026, 8, 20, 17, 43, 16, tzinfo=UTC
+        )
+        assert len(fetched) == 1
+
+    def test_a_project_name_cannot_reach_another_url(self, repo_path, default_config, monkeypatch):
+        maintainer, fetched = self._maintainer(repo_path, default_config, monkeypatch)
+        maintainer._pypi_releases("../../evil")
+        assert fetched == ["https://pypi.org/rss/project/..%2F..%2Fevil/releases.xml"]
+
+    def test_a_feed_that_cannot_be_reached_says_nothing(self, repo_path, default_config, monkeypatch):
+        maintainer, _ = self._maintainer(repo_path, default_config, monkeypatch, error=OSError("no route"))
+        assert maintainer._pypi_releases("ruff") is None
+
+    def test_a_project_with_no_releases_says_nothing(self, repo_path, default_config, monkeypatch):
+        # Not the same as answering that its pin is current
+        maintainer, _ = self._maintainer(repo_path, default_config, monkeypatch, payload=b"<rss></rss>")
+        assert maintainer._pypi_releases("ruff") is None
+
+    def test_a_prerelease_is_not_offered(self, repo_path, default_config, monkeypatch):
+        maintainer, _ = self._maintainer(repo_path, default_config, monkeypatch)
+        (repo_path / "requirements.txt").write_text("ruff==0.16.3\n")
+        assert maintainer._pypi_outdated("requirements.txt") == [("ruff", "0.16.3", "0.16.4")]
+
+    def test_a_current_pin_offers_nothing(self, repo_path, default_config, monkeypatch):
+        maintainer, _ = self._maintainer(repo_path, default_config, monkeypatch)
+        (repo_path / "requirements.txt").write_text("ruff==0.16.4\n")
+        assert maintainer._pypi_outdated("requirements.txt") == []
+
+    def test_a_file_with_no_pins_is_not_an_answer(self, repo_path, default_config, monkeypatch):
+        maintainer, fetched = self._maintainer(repo_path, default_config, monkeypatch)
+        (repo_path / "requirements.txt").write_text("# nothing pinned here\n-r base.txt\n")
+        assert maintainer._pypi_outdated("requirements.txt") is None
+        assert fetched == []
+
+    def test_a_missing_file_is_not_an_answer(self, repo_path, default_config, monkeypatch):
+        maintainer, _ = self._maintainer(repo_path, default_config, monkeypatch)
+        assert maintainer._pypi_outdated("requirements.txt") is None
+
+    def test_pypi_answering_for_no_pin_is_not_an_answer(self, repo_path, default_config, monkeypatch):
+        # Every lookup failing is ignorance, not a file whose pins are current
+        maintainer, _ = self._maintainer(repo_path, default_config, monkeypatch, error=OSError("no route"))
+        (repo_path / "requirements.txt").write_text("ruff==0.16.3\n")
+        assert maintainer._pypi_outdated("requirements.txt") is None
+
+    def test_the_report_names_the_requirements_file(self, repo_path, default_config, monkeypatch):
+        maintainer, _ = self._maintainer(repo_path, default_config, monkeypatch)
+        (repo_path / "requirements-dev.txt").write_text("ruff==0.16.3\n")
+        monkeypatch.setattr(gm, "run_shell_command", lambda cmd, cwd, timeout=None: (True, "", ""))
+        report = maintainer._outdated_report(["requirements-dev.txt"])
+        assert report.answered == ["requirements-dev.txt"]
+        # 0.16.4 is three days old against a 30 day limit, so nothing is offered
+        assert report.updates == {}
+
+    def test_a_pin_far_enough_behind_reaches_the_agent(self, repo_path, default_config, monkeypatch):
+        maintainer, _ = self._maintainer(repo_path, default_config, monkeypatch)
+        (repo_path / "requirements.txt").write_text("ruff==0.16.3\n")
+        maintainer._release_date = MagicMock(return_value=OLD_RELEASE)
+        monkeypatch.setattr(gm, "run_shell_command", lambda cmd, cwd, timeout=None: (True, "", ""))
+        report = maintainer._outdated_report(["requirements.txt"])
+        assert report.updates == {
+            "PyPI releases newer than the requirements.txt pins": "ruff: 0.16.3 -> 0.16.4 (released 2020-01-01)"
+        }
+
+
 class TestOutdatedReport:
     """The agent works from what the package managers report, not from memory."""
 
