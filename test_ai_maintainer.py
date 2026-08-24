@@ -1996,7 +1996,21 @@ class TestOutdatedReport:
         assert report.updates == {}
         assert report.answered == ["package.json"]
 
-    def test_an_oversized_report_says_it_was_cut(self, repo_path, default_config, monkeypatch):
+    def test_an_oversized_report_is_cut_on_a_line_boundary(self, repo_path, default_config, monkeypatch):
+        # Half an entry names a version nothing offered, and the prompt tells
+        # the agent to work from this list rather than rediscover it, so the
+        # list has to say when it does not carry everything
+        entry = "pkg{}: 1.0.0 -> 2.0.0 (released 2026-01-01)"
+        report = "\n".join(entry.format(i) for i in range(200))
+        maintainer, _ = self._maintainer(repo_path, default_config, monkeypatch, (False, report, ""))
+        maintainer._outdated_candidates = MagicMock(return_value=None)
+        cut = maintainer._outdated_report(["package.json"]).updates["npm outdated --json"]
+        lines = cut.splitlines()
+        assert all(line.endswith("(released 2026-01-01)") for line in lines[:-1])
+        assert lines[-1] == f"... ({200 - len(lines) + 1} more, not shown; this list is incomplete)"
+        assert len(cut) < gm.OUTDATED_MAX_LENGTH + 60
+
+    def test_a_single_line_over_the_budget_is_still_cut(self, repo_path, default_config, monkeypatch):
         maintainer, _ = self._maintainer(
             repo_path, default_config, monkeypatch, (False, "x" * (gm.OUTDATED_MAX_LENGTH + 10), "")
         )
@@ -3088,9 +3102,11 @@ class TestKillAgent:
             return -9
 
     class _CooperativeProc(_StuckProc):
+        output = ("what it was doing", "and what went wrong")
+
         def communicate(self, timeout=None):
             self.drains.append(timeout)
-            return "", ""
+            return self.output
 
     def _signals(self, monkeypatch):
         seen = []
@@ -3122,6 +3138,20 @@ class TestKillAgent:
         proc = self._CooperativeProc()
         gm.AgentClient._kill_agent(proc)
         assert proc.drains == [5]
+
+    def test_what_the_agent_had_written_is_returned(self, monkeypatch):
+        # The drain reads it either way; discarding it throws away the only
+        # record of what the agent did with the time it was given
+        self._signals(monkeypatch)
+        assert gm.AgentClient._kill_agent(self._CooperativeProc()) == (
+            True,
+            "what it was doing",
+            "and what went wrong",
+        )
+
+    def test_pipes_that_never_drain_report_nothing_read(self, monkeypatch):
+        self._signals(monkeypatch)
+        assert gm.AgentClient._kill_agent(self._StuckProc()) == (False, "", "")
 
 
 class TestRepoTimeBudget:
