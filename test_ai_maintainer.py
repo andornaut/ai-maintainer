@@ -2106,22 +2106,27 @@ class TestMinimumAgeInThePrompt:
             {"npm outdated --json": "eslint: 1.0.0 -> 2.0.0 (release date unknown)"},
             answered=["package.json"],
         )
-        assert "Entries carrying a release date are already past that limit; anything else there is not." in prompt
+        # _old_enough keeps a candidate it could not date rather than judging
+        # it too new, so the prompt must not tell the agent it is too new
+        assert "an entry without one could not be dated, so age-check it yourself." in prompt
 
     def test_the_prompt_does_not_send_the_agent_researching(self, repo_path, default_config, monkeypatch):
         # Directing the agent at a manifest no query covers makes it research
-        # an ecosystem it cannot date, which spends the agent timeout to reach
-        # the answer it started with. The rule is stated, not delegated
+        # an ecosystem it cannot date. Cargo is such a manifest: it is a
+        # dependency file the tool reads and has no entry in OUTDATED_COMMANDS
         prompt = self._prompt(
             repo_path,
             default_config,
             monkeypatch,
-            ["package.json", "requirements-dev.txt"],
+            ["package.json", "Cargo.toml"],
             {"npm outdated --json": "eslint: 1.0.0 -> 2.0.0 (released 2026-02-06)"},
             answered=["package.json"],
         )
-        assert "yourself" not in prompt
-        assert "requirements-dev.txt" not in prompt.split("You may edit")[0]
+        ledger = prompt.split("You may edit")[0]
+        # Nothing in the ledger points at a manifest, which is what sent the
+        # agent looking; what it says about age is scoped to the list's entries
+        assert "manifest" not in ledger
+        assert "an entry without one could not be dated" in ledger
         # The limit still governs what the list does not cover
         assert "published within the last 30 days" in prompt
 

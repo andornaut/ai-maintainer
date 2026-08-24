@@ -2790,10 +2790,14 @@ class Maintainer:
             else ""
         )
         # Scoped to the list. Directing the agent at the manifests no query
-        # covers sends it researching an ecosystem it cannot date, which costs
-        # the run its agent timeout to reach the answer it started with. The
-        # rule above still governs those; it is stated, not delegated.
-        unfiltered = "Entries carrying a release date are already past that limit; anything else there is not. "
+        # covers sends it researching an ecosystem it cannot date; the rule
+        # above still governs those, stated rather than delegated. Within the
+        # list an undated entry is the agent's call, matching _old_enough,
+        # which keeps such a candidate rather than judging it too new.
+        unfiltered = (
+            "Entries carrying a release date are already past that limit; an entry without one "
+            "could not be dated, so age-check it yourself. "
+        )
         ledger = f"{asked}{offered}{unfiltered if outdated.updates and minimum_age else ''}"
 
         prompt = (
