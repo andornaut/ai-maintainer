@@ -162,6 +162,11 @@ CI_UNKNOWN = "unknown"
 # as itself rather than as a failure, so it cannot trigger a fix attempt.
 FAILING_CHECK_CONCLUSIONS = ("failure", "timed_out")
 
+# What a rejected push says when the remote is one to leave alone rather than
+# one to report. Either way the repository is skipped; this only decides
+# whether an operator is told about it.
+UNWRITABLE_REASONS = ("archived", "read-only", "permission")
+
 # Check conclusions that do not stand in the way of a passing commit. Checks
 # are per job, so a job skipped by an `if:` condition is the common case and
 # must not hold back a commit whose other jobs passed.
@@ -774,9 +779,6 @@ Respond with ONLY a JSON object. No explanations, no markdown outside the JSON.
         with surrounding prose, and plain JSON. Returns None when no JSON
         object can be found.
         """
-        if not response or not response.strip():
-            return None
-
         # Prefer a fenced code block, but only when its content is a JSON
         # object; a non-JSON block (e.g. a bash snippet) falls through to
         # scanning the whole response.
@@ -991,13 +993,9 @@ class GitClient:
         """
         success, _, stderr = run_git(["push", "--dry-run"], self.repo_path, self.env_runner, self.hook_timeout)
         if not success:
-            # Check if error indicates archived/read-only repository
-            error_msg = stderr.lower()
-            if "archived" in error_msg or "read-only" in error_msg or "permission" in error_msg:
-                self.logger.debug(f"[{self.repo_name}] Repository is archived or read-only")
-                return False
-            # Other push errors (network, etc.) - log but don't treat as archived
-            self.logger.warning(f"[{self.repo_name}] Push test failed: {stderr.strip()}")
+            expected = any(reason in stderr.lower() for reason in UNWRITABLE_REASONS)
+            report = self.logger.debug if expected else self.logger.warning
+            report(f"[{self.repo_name}] Push test failed: {stderr.strip()}")
         return success
 
     def reset_changes(self) -> bool:

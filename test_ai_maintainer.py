@@ -91,33 +91,25 @@ def make_maintainer(repo_path, config, **overrides):
 
 
 class TestSafeJsonParse:
-    """Tests for safe_json_parse function."""
+    """Unparseable output yields the caller's default, never an exception."""
 
-    def test_valid_json(self):
-        result = gm.safe_json_parse('{"key": "value"}')
-        assert result == {"key": "value"}
+    CASES: ClassVar = [
+        ("json is parsed", '{"key": "value"}', None, {"key": "value"}),
+        ("junk yields the default", "not json", [], []),
+    ]
 
-    def test_valid_json_array(self):
-        result = gm.safe_json_parse("[1, 2, 3]")
-        assert result == [1, 2, 3]
+    @pytest.mark.parametrize(("name", "text", "default", "expected"), CASES, ids=[c[0] for c in CASES])
+    def test_the_text_is_parsed_or_the_default_returned(self, name, text, default, expected):
+        assert gm.safe_json_parse(text, default=default) == expected
 
-    def test_invalid_json_returns_default(self):
-        result = gm.safe_json_parse("not json")
-        assert result is None
-
-    def test_invalid_json_returns_custom_default(self):
-        result = gm.safe_json_parse("not json", default=[])
-        assert result == []
-
-    def test_empty_string_returns_default(self):
-        result = gm.safe_json_parse("", default={})
-        assert result == {}
+    def test_a_caller_that_names_no_default_gets_none(self):
+        assert gm.safe_json_parse("not json") is None
 
 
 class TestProjectEnvironment:
-    """Tests for ProjectEnvironment class."""
+    """The prefix comes from what the project declares, not from what this machine has."""
 
-    def test_no_version_files(self, tmp_path):
+    def test_a_project_declaring_no_toolchain_needs_no_prefix(self, tmp_path):
         assert gm.ProjectEnvironment(tmp_path).env_runner is None
 
     def _installed(self, monkeypatch, repo_path, *paths):
@@ -160,11 +152,11 @@ class TestProjectEnvironment:
         self._installed(monkeypatch, tmp_path)
         assert gm.ProjectEnvironment(tmp_path).env_runner is None
 
-    def test_pipfile_detection(self, tmp_path):
+    def test_a_pipfile_selects_pipenv(self, tmp_path):
         (tmp_path / "Pipfile").write_text("[packages]")
         assert gm.ProjectEnvironment(tmp_path).env_runner == "pipenv run"
 
-    def test_poetry_detection(self, tmp_path):
+    def test_a_poetry_lock_selects_poetry(self, tmp_path):
         (tmp_path / "poetry.lock").write_text("")
         assert gm.ProjectEnvironment(tmp_path).env_runner == "poetry run"
 
@@ -294,81 +286,57 @@ class TestProjectEnvironment:
 
 
 class TestAgentClientParseJson:
-    """Tests for AgentClient.parse_json."""
+    """An agent wraps its JSON in prose and fences; the decision must survive that."""
 
-    def test_plain_json(self, agent_client):
-        assert agent_client.parse_json('{"key": "value"}') == {"key": "value"}
+    CASES: ClassVar = [
+        ("bare object", '{"key": "value"}', {"key": "value"}),
+        (
+            "fenced as json",
+            'Here\'s the result:\n```json\n{"should_update": true, "commands": ["npm update"]}\n```\n',
+            {"should_update": True, "commands": ["npm update"]},
+        ),
+        ("fenced without a language", '```\n{"fixed": false}\n```', {"fixed": False}),
+        (
+            "prose before",
+            'Some explanation text here.\n\n{"updated": false, "reasoning": "All up to date"}',
+            {"updated": False, "reasoning": "All up to date"},
+        ),
+        (
+            "prose after",
+            '{"fixed": true, "changes_made": "bumped"}\n\nDone, hope that helps!',
+            {"fixed": True, "changes_made": "bumped"},
+        ),
+        # The fenced block is not JSON, so the scan must carry on past it
+        ("a shell fence then json", 'I ran:\n```bash\nnpm update lodash\n```\n{"updated": true}', {"updated": True}),
+        # Without the fence preference the scan would return the earlier brace
+        ("a brace in the prose before the fence", 'I considered {"a": 1} but chose:\n```json\n{"b": 2}\n```', {"b": 2}),
+        ("empty response", "", None),
+        ("no json anywhere", "Just plain text with no JSON", None),
+    ]
 
-    def test_json_from_markdown_block(self, agent_client):
-        response = """Here's the result:
-```json
-{"should_update": true, "commands": ["npm update"]}
-```
-"""
-        assert agent_client.parse_json(response) == {
-            "should_update": True,
-            "commands": ["npm update"],
-        }
-
-    def test_json_from_code_block_without_lang(self, agent_client):
-        response = """```
-{"fixed": false}
-```"""
-        assert agent_client.parse_json(response) == {"fixed": False}
-
-    def test_json_with_text_before(self, agent_client):
-        response = """Some explanation text here.
-
-{"updated": false, "changes_made": "", "reasoning": "All up to date"}"""
-        assert agent_client.parse_json(response) == {
-            "updated": False,
-            "changes_made": "",
-            "reasoning": "All up to date",
-        }
-
-    def test_json_with_text_after(self, agent_client):
-        response = '{"fixed": true, "changes_made": "bumped"}\n\nDone, hope that helps!'
-        assert agent_client.parse_json(response) == {
-            "fixed": True,
-            "changes_made": "bumped",
-        }
-
-    def test_non_json_code_block_falls_through_to_json(self, agent_client):
-        response = """I ran:
-```bash
-npm update lodash
-```
-{"updated": true, "changes_made": "bumped lodash"}"""
-        assert agent_client.parse_json(response) == {
-            "updated": True,
-            "changes_made": "bumped lodash",
-        }
-
-    def test_empty_response(self, agent_client):
-        assert agent_client.parse_json("") is None
-
-    def test_no_json_found(self, agent_client):
-        assert agent_client.parse_json("Just plain text with no JSON") is None
+    @pytest.mark.parametrize(("name", "response", "expected"), CASES, ids=[c[0] for c in CASES])
+    def test_the_decision_is_recovered(self, agent_client, name, response, expected):
+        assert agent_client.parse_json(response) == expected
 
 
 class TestRunCommand:
-    """Tests for run_command function."""
+    """A command that did not succeed never reports one, whatever it printed."""
 
-    def test_successful_command(self):
+    def test_a_command_that_succeeds_returns_its_output(self):
         success, stdout, stderr = gm.run_command(["echo", "hello"], Path("/tmp"))
         assert success is True
         assert stdout.strip() == "hello"
         assert stderr == ""
 
-    def test_failed_command(self):
+    def test_a_non_zero_exit_is_not_a_success(self):
         success, _stdout, _stderr = gm.run_command(["false"], Path("/tmp"))
         assert success is False
 
-    def test_nonexistent_command(self):
+    def test_a_command_that_does_not_exist_is_not_a_success(self):
         success, _stdout, _stderr = gm.run_command(["nonexistent_command_12345"], Path("/tmp"))
         assert success is False
 
-    def test_shell_command(self):
+    def test_a_shell_command_gets_the_shell(self):
         success, stdout, _stderr = gm.run_shell_command("echo hello && echo world", Path("/tmp"))
         assert success is True
         assert "hello" in stdout
@@ -387,27 +355,27 @@ class TestRunCommand:
 
 
 class TestGitClient:
-    """Tests for GitClient class."""
+    """Whether a commit is this tool's own decides if a failure is its to fix."""
 
-    def test_is_git_repo_true(self, repo_path):
+    def test_a_directory_with_a_git_dir_is_a_repository(self, repo_path):
         assert gm.GitClient(repo_path, MagicMock()).is_git_repo() is True
 
-    def test_is_git_repo_false(self, tmp_path):
+    def test_a_directory_without_one_is_not_a_repository(self, tmp_path):
         assert gm.GitClient(tmp_path, MagicMock()).is_git_repo() is False
 
-    def test_has_unpushed_commits_false_when_no_upstream(self):
+    def test_no_upstream_reports_nothing_unpushed(self):
         client = gm.GitClient(Path("/path/to/my-repo"), MagicMock())
         client._run = MagicMock(return_value=(False, "", "fatal: no upstream configured"))
         assert client.has_unpushed_commits() is False
 
-    def test_latest_commit_from_maintainer_squash_merge_attribution(self):
+    def test_a_squash_merge_carrying_the_attribution_is_this_tools_commit(self):
         # A squash merge performed by this tool carries the attribution body
         client = gm.GitClient(Path("/path/to/my-repo"), MagicMock())
         message = f"chore(deps): bump lodash (#12)\n\n{gm.COMMIT_ATTRIBUTION}\n"
         client._run = MagicMock(return_value=(True, message, ""))
         assert client.is_latest_commit_from_maintainer() is True
 
-    def test_latest_commit_not_from_maintainer_without_attribution(self):
+    def test_a_commit_without_the_attribution_is_someone_elses(self):
         client = gm.GitClient(Path("/path/to/my-repo"), MagicMock())
         for message in (
             # A human squash merge of a dependabot PR has no attribution body
@@ -419,20 +387,20 @@ class TestGitClient:
             client._run = MagicMock(return_value=(True, message, ""))
             assert client.is_latest_commit_from_maintainer() is False, message
 
-    def test_latest_commit_ci_fix(self):
+    def test_a_ci_fix_commit_is_recognised(self):
         client = gm.GitClient(Path("/path/to/my-repo"), MagicMock())
         message = f"{gm.CI_FIX_COMMIT_TITLE}\n\nFixed CI build failure with AI assistance\n\n{gm.COMMIT_ATTRIBUTION}\n"
         client._run = MagicMock(return_value=(True, message, ""))
         assert client.is_latest_commit_ci_fix() is True
 
-    def test_latest_commit_ci_fix_false_for_other_maintainer_commits(self):
+    def test_another_commit_of_this_tools_is_not_a_ci_fix(self):
         # Attributed, but a dependency update rather than a CI fix
         client = gm.GitClient(Path("/path/to/my-repo"), MagicMock())
         message = f"chore(deps): update direct dependencies\n\nUpdated direct dependencies\n\n{gm.COMMIT_ATTRIBUTION}\n"
         client._run = MagicMock(return_value=(True, message, ""))
         assert client.is_latest_commit_ci_fix() is False
 
-    def test_latest_commit_ci_fix_needs_the_attribution_too(self):
+    def test_a_fix_subject_without_the_attribution_is_not_a_ci_fix(self):
         # Quoting the title is not authorship. Claiming a human's commit here
         # locks the repository out of CI fixes for good.
         client = gm.GitClient(Path("/path/to/my-repo"), MagicMock())
@@ -525,13 +493,13 @@ class TestGetDefaultBranch:
 
 
 class TestFindRepos:
-    """Tests for find_repos function."""
+    """Every repository below the base directory is found exactly once."""
 
-    def test_base_dir_is_git_repo(self, repo_path):
+    def test_the_base_directory_itself_can_be_the_repository(self, repo_path):
         repos = gm.find_repos(repo_path, MagicMock())
         assert repos == [repo_path]
 
-    def test_finds_subdirectory_repos(self, tmp_path):
+    def test_every_git_directory_below_the_base_is_found(self, tmp_path):
         # Create two git repos as subdirectories
         (tmp_path / "repo-a" / ".git").mkdir(parents=True)
         (tmp_path / "repo-b" / ".git").mkdir(parents=True)
@@ -542,7 +510,7 @@ class TestFindRepos:
         assert (tmp_path / "repo-a") in repos
         assert (tmp_path / "repo-b") in repos
 
-    def test_empty_directory(self, tmp_path):
+    def test_a_directory_holding_no_repositories_yields_none(self, tmp_path):
         repos = gm.find_repos(tmp_path, MagicMock())
         assert repos == []
 
@@ -657,9 +625,9 @@ class TestFeatureToggles:
 
 
 class TestMaintainerValidation:
-    """Tests for Maintainer validation methods."""
+    """A dependabot PR is accepted on branch shape and a verified head, never on trust."""
 
-    def test_is_valid_dependabot_pr_valid_branch(self, maintainer):
+    def test_a_dependabot_branch_with_a_verified_head_is_accepted(self, maintainer):
         maintainer.github.is_commit_verified = MagicMock(return_value=True)
         pr = {
             "number": 123,
@@ -668,7 +636,7 @@ class TestMaintainerValidation:
         }
         assert maintainer._is_valid_dependabot_pr(pr) is True
 
-    def test_is_valid_dependabot_pr_invalid_branch(self, maintainer):
+    def test_a_branch_that_is_not_dependabots_is_rejected(self, maintainer):
         pr = {
             "number": 123,
             "headRefName": "feature/some-feature",
@@ -676,7 +644,7 @@ class TestMaintainerValidation:
         }
         assert maintainer._is_valid_dependabot_pr(pr) is False
 
-    def test_is_valid_dependabot_pr_unverified_commit(self, maintainer):
+    def test_an_unverified_head_commit_is_rejected(self, maintainer):
         maintainer.github.is_commit_verified = MagicMock(return_value=False)
         pr = {
             "number": 123,
@@ -685,7 +653,7 @@ class TestMaintainerValidation:
         }
         assert maintainer._is_valid_dependabot_pr(pr) is False
 
-    def test_is_valid_dependabot_pr_missing_head_sha_fails_closed(self, maintainer):
+    def test_a_pr_naming_no_head_sha_is_rejected(self, maintainer):
         # The signature is the only cryptographic gate on an automatic merge,
         # so a PR with nothing to verify must not pass on branch name alone
         maintainer.github.is_commit_verified = MagicMock(return_value=True)
@@ -699,7 +667,7 @@ class TestMaintainerValidation:
 
 
 class TestDetectTestCommand:
-    """Tests for test command detection."""
+    """A project's declared suite wins over any guess, and a guess never blocks."""
 
     @pytest.fixture(autouse=True)
     def _runners_installed(self, monkeypatch):
@@ -731,18 +699,18 @@ class TestDetectTestCommand:
         assert maintainer.detect_test_command() == ("source .venv/bin/activate && pytest")
         assert probes == ["source .venv/bin/activate && which pytest"]
 
-    def test_detect_npm_test(self, repo_path, default_config):
+    def test_a_package_json_test_script_runs_npm_test(self, repo_path, default_config):
         (repo_path / "package.json").write_text('{"scripts": {"test": "jest"}}')
         maintainer = gm.Maintainer(repo_path, default_config)
         assert maintainer.detect_test_command() == "npm test"
 
-    def test_detect_pytest(self, repo_path, default_config):
+    def test_declared_pytest_config_runs_pytest(self, repo_path, default_config):
         (repo_path / "pyproject.toml").write_text("[tool.pytest]")
         (repo_path / "tests").mkdir()
         maintainer = gm.Maintainer(repo_path, default_config)
         assert maintainer.detect_test_command() == "pytest"
 
-    def test_detect_pytest_from_root_test_module(self, repo_path, default_config):
+    def test_a_root_test_module_runs_pytest(self, repo_path, default_config):
         # No pyproject.toml, setup.py or pytest.ini: pytest still collects a
         # conventionally named module, so tests must not be reported missing
         (repo_path / "requirements.txt").write_text("requests\n")
@@ -750,7 +718,7 @@ class TestDetectTestCommand:
         maintainer = gm.Maintainer(repo_path, default_config)
         assert maintainer.detect_test_command() == "pytest"
 
-    def test_detect_pytest_from_nested_test_module(self, repo_path, default_config):
+    def test_a_nested_test_module_runs_pytest(self, repo_path, default_config):
         (repo_path / "tests" / "unit").mkdir(parents=True)
         (repo_path / "tests" / "unit" / "thing_test.py").write_text("")
         maintainer = gm.Maintainer(repo_path, default_config)
@@ -763,7 +731,7 @@ class TestDetectTestCommand:
         maintainer = gm.Maintainer(repo_path, default_config)
         assert maintainer.detect_test_command() is None
 
-    def test_detect_pytest_from_setup_cfg(self, repo_path, default_config):
+    def test_pytest_declared_in_setup_cfg_runs_pytest(self, repo_path, default_config):
         (repo_path / "pyproject.toml").write_text("[project]\nname = 'x'\n")
         (repo_path / "setup.cfg").write_text("[tool:pytest]\ntestpaths = suite\n")
         maintainer = gm.Maintainer(repo_path, default_config)
@@ -790,7 +758,7 @@ class TestDetectTestCommand:
         maintainer = gm.Maintainer(repo_path, default_config)
         assert maintainer.detect_test_command() == "pytest"
 
-    def test_detect_rake_test(self, repo_path, default_config):
+    def test_a_rakefile_beside_a_test_directory_runs_rake_test(self, repo_path, default_config):
         (repo_path / "Gemfile").write_text("source 'https://rubygems.org'\n")
         (repo_path / "Rakefile").write_text("task :test\n")
         (repo_path / "test").mkdir()
@@ -858,23 +826,23 @@ class TestDetectTestCommand:
         maintainer = gm.Maintainer(repo_path, default_config)
         assert maintainer.detect_test_command() is None
 
-    def test_detect_rspec(self, repo_path, default_config):
+    def test_a_spec_directory_runs_rspec(self, repo_path, default_config):
         (repo_path / "Gemfile").write_text("source 'https://rubygems.org'\n")
         (repo_path / "spec").mkdir()
         maintainer = gm.Maintainer(repo_path, default_config)
         assert maintainer.detect_test_command().endswith("bundle exec rspec")
 
-    def test_detect_cargo_test(self, repo_path, default_config):
+    def test_a_cargo_manifest_runs_cargo_test(self, repo_path, default_config):
         (repo_path / "Cargo.toml").write_text("[package]")
         maintainer = gm.Maintainer(repo_path, default_config)
         assert maintainer.detect_test_command().endswith("cargo test")
 
-    def test_detect_go_test(self, repo_path, default_config):
+    def test_a_go_module_runs_go_test(self, repo_path, default_config):
         (repo_path / "go.mod").write_text("module example.com/foo\n")
         maintainer = gm.Maintainer(repo_path, default_config)
         assert maintainer.detect_test_command().endswith("go test ./...")
 
-    def test_detect_no_test(self, maintainer):
+    def test_a_project_declaring_no_suite_yields_no_command(self, maintainer):
         assert maintainer.detect_test_command() is None
 
 
@@ -1046,7 +1014,7 @@ class TestGitHubClientMergePr:
     def _client_with_pr_body(self, tmp_path, pr_body, calls):
         return self._client_with_pr(tmp_path, {"body": pr_body}, calls)
 
-    def test_merge_pr_appends_attribution_to_pr_body(self, tmp_path):
+    def test_the_squash_body_carries_the_attribution(self, tmp_path):
         calls = []
         client = self._client_with_pr_body(tmp_path, "Bumps lodash from 1 to 2.", calls)
         success, error = client.merge_pr(42, "cafe1234")
@@ -1058,7 +1026,7 @@ class TestGitHubClientMergePr:
         body = merge_args[merge_args.index("--body") + 1]
         assert body == f"Bumps lodash from 1 to 2.\n\n{gm.COMMIT_ATTRIBUTION}"
 
-    def test_merge_pr_pins_the_verified_head_commit(self, tmp_path):
+    def test_the_merge_is_pinned_to_the_verified_head(self, tmp_path):
         # Dependabot rebases its own branches, so a merge that is not pinned
         # to the verified SHA can land a commit that was never verified
         calls = []
@@ -1067,7 +1035,7 @@ class TestGitHubClientMergePr:
         merge_args = calls[-1]
         assert merge_args[merge_args.index("--match-head-commit") + 1] == "cafe1234"
 
-    def test_merge_pr_attribution_only_when_pr_body_empty(self, tmp_path):
+    def test_an_empty_pr_body_gets_only_the_attribution(self, tmp_path):
         calls = []
         client = self._client_with_pr_body(tmp_path, "", calls)
         success, _ = client.merge_pr(42, "cafe1234")
@@ -1075,7 +1043,7 @@ class TestGitHubClientMergePr:
         merge_args = calls[-1]
         assert merge_args[merge_args.index("--body") + 1] == gm.COMMIT_ATTRIBUTION
 
-    def test_merge_pr_preserves_coauthors_excluding_pr_author(self, tmp_path):
+    def test_coauthors_carry_over_without_the_pr_author(self, tmp_path):
         calls = []
         alice = {"login": "alice", "name": "Alice", "email": "alice@example.com"}
         payload = {
@@ -1103,7 +1071,7 @@ class TestGitHubClientMergePr:
         body = merge_args[merge_args.index("--body") + 1]
         assert body == (f"Bumps lodash.\n\n{gm.COMMIT_ATTRIBUTION}\n\nCo-authored-by: Alice <alice@example.com>")
 
-    def test_merge_pr_strips_newlines_from_coauthor_fields(self, tmp_path):
+    def test_a_newline_in_a_coauthor_field_cannot_forge_a_trailer(self, tmp_path):
         calls = []
         payload = {
             "body": "Bumps lodash.",
@@ -1130,7 +1098,7 @@ class TestGitHubClientMergePr:
         assert len(trailer_lines) == 1
         assert trailer_lines[0].endswith("<mal@example.com>")
 
-    def test_merge_pr_strips_angle_brackets_from_coauthor_name(self, tmp_path):
+    def test_angle_brackets_in_a_coauthor_name_are_stripped(self, tmp_path):
         # An embedded "<addr>" would otherwise be read as the trailer identity
         calls = []
         payload = {
@@ -1183,16 +1151,16 @@ class TestMergePrsOnGithub:
         "been met, add the `--auto` flag."
     )
 
-    def test_dry_run_skips_merge(self, maintainer):
+    def test_a_dry_run_merges_nothing(self, maintainer):
         assert maintainer._merge_prs_on_github([(1, "aaa"), (2, "bbb")]) == [1, 2]
 
-    def test_merge_success(self, repo_path, default_config):
+    def test_a_merged_pr_is_reported_merged(self, repo_path, default_config):
         maintainer = make_maintainer(repo_path, default_config, dry_run=False)
         maintainer.github.merge_pr = MagicMock(return_value=(True, ""))
         assert maintainer._merge_prs_on_github([(1, "aaa"), (2, "bbb")]) == [1, 2]
         assert maintainer.github.merge_pr.call_count == 2
 
-    def test_merge_is_pinned_to_the_verified_sha(self, repo_path, default_config):
+    def test_the_merge_call_names_the_verified_sha(self, repo_path, default_config):
         maintainer = make_maintainer(repo_path, default_config, dry_run=False)
         maintainer.github.merge_pr = MagicMock(return_value=(True, ""))
         maintainer._merge_prs_on_github([(1, "aaa"), (2, "bbb")])
@@ -1201,16 +1169,16 @@ class TestMergePrsOnGithub:
             (2, "bbb"),
         ]
 
-    def test_merge_partial_failure(self, repo_path, default_config):
+    def test_one_pr_failing_does_not_stop_the_rest(self, repo_path, default_config):
         maintainer = make_maintainer(repo_path, default_config, dry_run=False)
         maintainer.github.merge_pr = MagicMock(side_effect=[(True, ""), (False, "merge blocked"), (True, "")])
         prs = [(1, "aaa"), (2, "bbb"), (3, "ccc")]
         assert maintainer._merge_prs_on_github(prs) == [1, 3]
 
-    def test_empty_list(self, maintainer):
+    def test_no_prs_merges_nothing(self, maintainer):
         assert maintainer._merge_prs_on_github([]) == []
 
-    def test_merge_conflict_triggers_rebase(self, repo_path, default_config):
+    def test_a_conflicted_pr_is_asked_to_rebase(self, repo_path, default_config):
         maintainer = make_maintainer(repo_path, default_config, dry_run=False)
         maintainer.github.merge_pr = MagicMock(return_value=(False, self.GH_CONFLICT_STDERR))
         maintainer.github.get_recent_pr_comment_bodies = MagicMock(return_value=[])
@@ -1218,7 +1186,7 @@ class TestMergePrsOnGithub:
         assert maintainer._merge_prs_on_github([(5, "eee")]) == []
         maintainer.github.comment_pr.assert_called_once_with(5, gm.DEPENDABOT_REBASE_COMMAND)
 
-    def test_merge_conflict_skips_rebase_when_already_requested(self, repo_path, default_config):
+    def test_a_rebase_already_requested_is_not_asked_again(self, repo_path, default_config):
         maintainer = make_maintainer(repo_path, default_config, dry_run=False)
         maintainer.github.merge_pr = MagicMock(return_value=(False, self.GH_CONFLICT_STDERR))
         maintainer.github.get_recent_pr_comment_bodies = MagicMock(
@@ -1228,14 +1196,14 @@ class TestMergePrsOnGithub:
         assert maintainer._merge_prs_on_github([(5, "eee")]) == []
         maintainer.github.comment_pr.assert_not_called()
 
-    def test_already_merged_counts_as_merged(self, repo_path, default_config):
+    def test_a_pr_merged_out_of_band_still_counts(self, repo_path, default_config):
         maintainer = make_maintainer(repo_path, default_config, dry_run=False)
         maintainer.github.merge_pr = MagicMock(return_value=(True, "! Pull request #9 was already merged"))
         maintainer.github.comment_pr = MagicMock(return_value=True)
         assert maintainer._merge_prs_on_github([(9, "999")]) == [9]
         maintainer.github.comment_pr.assert_not_called()
 
-    def test_non_conflict_failure_skips_without_rebase(self, repo_path, default_config):
+    def test_a_failure_that_is_not_a_conflict_asks_for_no_rebase(self, repo_path, default_config):
         maintainer = make_maintainer(repo_path, default_config, dry_run=False)
         maintainer.github.merge_pr = MagicMock(return_value=(False, self.GH_BLOCKED_STDERR))
         maintainer.github.comment_pr = MagicMock(return_value=True)
@@ -1642,7 +1610,7 @@ class TestGetCheckRuns:
         client._get_runs = MagicMock(return_value=[])
         return client
 
-    def test_parses_one_object_per_line(self, tmp_path):
+    def test_each_line_of_the_response_is_one_check(self, tmp_path):
         stdout = (
             '{"name":"test","status":"completed",'
             '"conclusion":"success","app":"github-actions"}\n'
@@ -1655,14 +1623,14 @@ class TestGetCheckRuns:
             pending("build", status="queued"),
         ]
 
-    def test_queries_the_commits_checks(self, tmp_path):
+    def test_the_commits_own_checks_are_asked_for(self, tmp_path):
         client = self._client(tmp_path, (True, "", ""))
         client.get_check_runs("abc123")
         args = client._run.call_args_list[0].args[0]
         assert "repos/owner/repo/commits/abc123/check-runs?per_page=100" in args
         assert "--paginate" in args
 
-    def test_no_checks_is_an_empty_list(self, tmp_path):
+    def test_a_commit_with_no_checks_answers_empty(self, tmp_path):
         client = self._client(tmp_path, (True, "", ""))
         assert client.get_check_runs("abc") == []
 
@@ -2776,6 +2744,29 @@ class TestWritability:
         client = self._client(tmp_path, (False, "", "boom"))
         assert client.get_write_access() is None
 
+    PUSH_PROBE: ClassVar = [
+        # One string per row: GitHub's real message carries several of them,
+        # which would let a broken match still be caught by its neighbour
+        ("archived", "remote: This repository was archived.", "DEBUG"),
+        ("read-only", "remote: The repository is in a read-only state.", "DEBUG"),
+        ("permission denied", "remote: Permission to owner/repo.git denied to someone.", "DEBUG"),
+        # A push that failed for another reason is still a repository to leave
+        # alone, but an operator has to be told why
+        ("network failure", "fatal: unable to access: Could not resolve host github.com", "WARNING"),
+    ]
+
+    @pytest.mark.parametrize(("name", "stderr", "level"), PUSH_PROBE, ids=[c[0] for c in PUSH_PROBE])
+    def test_the_push_probe_refuses_and_says_why(self, repo_path, monkeypatch, caplog, name, stderr, level):
+        monkeypatch.setattr(gm, "run_git", lambda *a, **k: (False, "", stderr))
+        client = gm.GitClient(repo_path, logging.getLogger("probe"))
+        with caplog.at_level("DEBUG", logger="probe"):
+            assert client.is_writable() is False
+        assert caplog.records[-1].levelname == level
+
+    def test_a_push_that_succeeds_means_writable(self, repo_path, monkeypatch):
+        monkeypatch.setattr(gm, "run_git", lambda *a, **k: (True, "", ""))
+        assert gm.GitClient(repo_path, MagicMock()).is_writable() is True
+
     def test_missing_permission_is_undetermined(self, tmp_path):
         client = self._client(tmp_path, self._view(isArchived=False))
         assert client.get_write_access() is None
@@ -2854,6 +2845,19 @@ class TestAgentClientAsk:
         def communicate(self, timeout=None):
             return "half a thought", "traceback"
 
+    class _TimingOutProc(_FakeProc):
+        """Times out, then yields what it had written once it is killed."""
+
+        def __init__(self, output=""):
+            self.calls = 0
+            self.output = output
+
+        def communicate(self, timeout=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise gm.subprocess.TimeoutExpired("agent", timeout)
+            return self.output, ""
+
     def _capture(self, monkeypatch, proc=None):
         captured = {}
 
@@ -2887,6 +2891,21 @@ class TestAgentClientAsk:
         client = gm.AgentClient(tmp_path, "test-repo", default_config, MagicMock())
         self._capture(monkeypatch, self._FailedProc())
         assert client.ask("do something") is None
+
+    def test_a_timed_out_agent_leaves_behind_what_it_wrote(self, default_config, monkeypatch, tmp_path):
+        # Without this the only record of a timeout is that one happened, and
+        # nothing says what the agent spent the time doing
+        monkeypatch.setattr(gm.os, "killpg", lambda pid, sig: None)
+        logger = MagicMock()
+        client = gm.AgentClient(tmp_path, "test-repo", default_config, logger)
+        self._capture(monkeypatch, self._TimingOutProc("x" * gm.AGENT_OUTPUT_TAIL + "the last thing it said"))
+        assert client.ask("do something") is None
+        errors = " ".join(str(c.args[0]) for c in logger.error.call_args_list)
+        debug = " ".join(str(c.args[0]) for c in logger.debug.call_args_list)
+        assert f"timed out after {default_config.agent_timeout_seconds}s" in errors
+        assert "the last thing it said" in debug
+        # Bounded: an agent that wrote megabytes must not put them in the log
+        assert len(debug) < 2 * gm.AGENT_OUTPUT_TAIL
 
     def test_untrusted_context_is_fenced_by_the_injection_warning(self, default_config, monkeypatch, tmp_path):
         # CI logs and PR titles reach the prompt verbatim
@@ -3370,18 +3389,18 @@ class TestStagedFileLogging:
 
 
 class TestBuildCommitMessage:
-    """Tests for commit message building."""
+    """The subject says what the run did, so history reads without the diff."""
 
-    def test_commit_message_deps_only(self, maintainer):
+    def test_a_dependency_update_says_so(self, maintainer):
         msg = maintainer.build_commit_message(had_dep_updates=True)
         assert "chore(deps): update direct dependencies" in msg
 
-    def test_commit_message_no_changes(self, maintainer):
+    def test_a_run_with_no_updates_gets_a_generic_subject(self, maintainer):
         msg = maintainer.build_commit_message(had_dep_updates=False)
         assert "chore: automated maintenance" in msg
         assert "\n\n\n" not in msg
 
-    def test_commit_message_fix(self, maintainer):
+    def test_a_fix_commit_says_so(self, maintainer):
         msg = maintainer.build_commit_message(had_dep_updates=False, is_fix=True)
         assert "fix: CI build failure" in msg
 
