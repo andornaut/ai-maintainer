@@ -1026,6 +1026,18 @@ class TestGitHubClientMergePr:
         body = merge_args[merge_args.index("--body") + 1]
         assert body == f"Bumps lodash from 1 to 2.\n\n{gm.COMMIT_ATTRIBUTION}"
 
+    def test_the_squash_body_carries_no_emdash(self, tmp_path):
+        # A changelog quoted into the PR description becomes a commit message
+        # the moment the PR is squashed, and no later run can edit one that is
+        # already pushed
+        calls = []
+        body_text = "Bumps lodash \u2014 see https://example.com/a\u2014b \u2013 and 1\u2014\u20142."
+        client = self._client_with_pr_body(tmp_path, body_text, calls)
+        client.merge_pr(42, "cafe1234")
+        body = calls[-1][calls[-1].index("--body") + 1]
+        # A dash inside a URL is part of the address, so it is left alone
+        assert "Bumps lodash - see https://example.com/a\u2014b - and 1-2." in body
+
     def test_the_merge_is_pinned_to_the_verified_head(self, tmp_path):
         # Dependabot rebases its own branches, so a merge that is not pinned
         # to the verified SHA can land a commit that was never verified
@@ -1382,15 +1394,36 @@ class TestGitHubClientCi:
         )
         assert client.get_latest_failed_run_id("abc") is None
 
+    def test_every_failed_run_on_the_commit_is_returned(self, tmp_path):
+        client = self._client(tmp_path)
+        client._get_runs = MagicMock(
+            return_value=[
+                {"databaseId": 9, "status": "completed", "conclusion": "failure", "headSha": "abc"},
+                {"databaseId": 8, "status": "completed", "conclusion": "success", "headSha": "abc"},
+                {"databaseId": 7, "status": "completed", "conclusion": "failure", "headSha": "abc"},
+            ]
+        )
+        assert client.get_failed_run_ids("abc") == [9, 7]
+
+    def test_only_the_newest_failure_is_returned_for_an_unrun_commit(self, tmp_path):
+        client = self._client(tmp_path)
+        client._get_runs = MagicMock(
+            return_value=[
+                {"databaseId": 5, "status": "completed", "conclusion": "failure", "headSha": "old"},
+                {"databaseId": 4, "status": "completed", "conclusion": "failure", "headSha": "older"},
+            ]
+        )
+        assert client.get_failed_run_ids("abc") == [5]
+
     def test_no_logs_and_no_startup_failure_is_none(self, tmp_path):
         client = self._client(tmp_path)
-        client.get_latest_failed_run_id = MagicMock(return_value=None)
+        client.get_failed_run_ids = MagicMock(return_value=[])
         client._startup_failure_checks = MagicMock(return_value=[])
         assert client.get_ci_failure_logs("abc") is None
 
     def test_failure_logs_come_from_the_failed_run(self, tmp_path):
         client = self._client(tmp_path)
-        client.get_latest_failed_run_id = MagicMock(return_value=77)
+        client.get_failed_run_ids = MagicMock(return_value=[77])
         calls = []
 
         def fake_run(args):
@@ -1400,6 +1433,33 @@ class TestGitHubClientCi:
         client._run = fake_run
         assert client.get_ci_failure_logs("abc") == "boom"
         assert "77" in calls[0]
+
+    def test_failure_logs_fall_through_to_a_run_that_has_them(self, tmp_path):
+        """A run failing through a called workflow's job holds no log for it."""
+        client = self._client(tmp_path)
+        client.get_failed_run_ids = MagicMock(return_value=[77, 88])
+        calls = []
+
+        def fake_run(args):
+            calls.append(args)
+            return True, ("" if "77" in args else "boom"), ""
+
+        client._run = fake_run
+        assert client.get_ci_failure_logs("abc") == "boom"
+        assert [a for a in calls if "--log" in a] == []
+        assert "88" in calls[-1]
+
+    def test_a_full_run_log_says_it_is_not_a_failing_job_log(self, tmp_path):
+        client = self._client(tmp_path)
+        client.get_failed_run_ids = MagicMock(return_value=[77])
+
+        def fake_run(args):
+            return True, ("" if "--log-failed" in args else "every step passed"), ""
+
+        client._run = fake_run
+        logs = client.get_ci_failure_logs("abc")
+        assert logs.startswith(gm.NO_FAILED_JOB_LOG_NOTE)
+        assert "every step passed" in logs
 
     def test_latest_conclusion_uses_the_newest_checked_commit(self, tmp_path):
         client = self._client(tmp_path)
@@ -2563,10 +2623,10 @@ class TestABlockedSuiteIsNotNoTests:
         # the only thing that can stop the commit is the blocked suite
         maintainer.git.is_workdir_clean = MagicMock(side_effect=[True, False])
         maintainer.git.reset_changes = MagicMock(return_value=True)
-        maintainer._ask_ai_to_fix = MagicMock(return_value="fixed it")
+        maintainer._ask_ai_to_fix = MagicMock(return_value=(gm.FIX_RESOLVED, "fixed it"))
         maintainer.run_tests = MagicMock(return_value=(gm.TESTS_BLOCKED, "no pytest"))
         maintainer.commit_and_push = MagicMock()
-        assert maintainer.fix_ci_failure("boom") is False
+        assert maintainer.fix_ci_failure("boom") == gm.FIX_FAILED
         maintainer.commit_and_push.assert_not_called()
 
 
@@ -2595,7 +2655,7 @@ class TestDryRunGuards:
 
     def test_ask_ai_to_fix_skips_agent(self, maintainer):
         maintainer.agent.ask = MagicMock()
-        assert maintainer._ask_ai_to_fix("fix it", {"logs": "boom"}) is None
+        assert maintainer._ask_ai_to_fix("fix it", {"logs": "boom"}) == (gm.FIX_FAILED, None)
         maintainer.agent.ask.assert_not_called()
 
     def test_pre_existing_ci_failure_not_fixed_in_dry_run(self, maintainer):
@@ -2679,7 +2739,7 @@ class TestFixRefusesDirtyTree:
     def test_fix_ci_failure_refuses(self, repo_path, default_config):
         maintainer = self._maintainer(repo_path, default_config)
         maintainer._ask_ai_to_fix = MagicMock()
-        assert maintainer.fix_ci_failure("boom") is False
+        assert maintainer.fix_ci_failure("boom") == gm.FIX_FAILED
         maintainer._ask_ai_to_fix.assert_not_called()
 
     def test_fix_ci_with_retries_refuses_before_fetching_logs(self, repo_path, default_config):
@@ -2691,9 +2751,9 @@ class TestFixRefusesDirtyTree:
     def test_clean_tree_is_allowed(self, repo_path, default_config):
         maintainer = self._maintainer(repo_path, default_config)
         maintainer.git.is_workdir_clean = MagicMock(return_value=True)
-        maintainer._ask_ai_to_fix = MagicMock(return_value=None)
+        maintainer._ask_ai_to_fix = MagicMock(return_value=(gm.FIX_FAILED, None))
         maintainer.git.reset_changes = MagicMock(return_value=True)
-        assert maintainer.fix_ci_failure("boom") is False
+        assert maintainer.fix_ci_failure("boom") == gm.FIX_FAILED
         maintainer._ask_ai_to_fix.assert_called_once()
 
 
@@ -2821,7 +2881,7 @@ class TestFailedResetAborts:
         maintainer.git.stash_apply = MagicMock(return_value=(True, "", ""))
         maintainer.git.stash_drop = MagicMock(return_value=(True, "", ""))
         maintainer.git.reset_changes = MagicMock(return_value=False)
-        maintainer._try_fix_tests = MagicMock(return_value=False)
+        maintainer._try_fix_tests = MagicMock(return_value=gm.FIX_FAILED)
         with pytest.raises(gm.WorkingTreeError):
             maintainer.fix_test_with_retries("boom")
         # The stash holds the only clean copy of the dependency updates left
@@ -2954,7 +3014,7 @@ class TestFixTestWithRetriesStash:
         # `git stash push` exits 0 without creating an entry when it has
         # nothing to save; refs/stash still points at an unrelated stash
         maintainer.git.get_stash_ref = MagicMock(return_value="preexisting")
-        maintainer._try_fix_tests = MagicMock(return_value=True)
+        maintainer._try_fix_tests = MagicMock(return_value=gm.FIX_RESOLVED)
         assert maintainer.fix_test_with_retries("boom") is False
         maintainer.git.stash_apply.assert_not_called()
         maintainer.git.stash_drop.assert_not_called()
@@ -2966,7 +3026,7 @@ class TestFixTestWithRetriesStash:
         maintainer = self._maintainer(repo_path, default_config)
         maintainer.git.get_stash_ref = MagicMock(side_effect=[None, "ours"])
         maintainer.git.stash_apply = MagicMock(side_effect=[(True, "", ""), (False, "", "exists")])
-        maintainer._try_fix_tests = MagicMock(return_value=False)
+        maintainer._try_fix_tests = MagicMock(return_value=gm.FIX_FAILED)
         maintainer.run_tests = MagicMock()
         assert maintainer.fix_test_with_retries("boom") is False
         maintainer.run_tests.assert_not_called()
@@ -2976,10 +3036,49 @@ class TestFixTestWithRetriesStash:
     def test_applies_and_drops_only_its_own_stash(self, repo_path, default_config):
         maintainer = self._maintainer(repo_path, default_config)
         maintainer.git.get_stash_ref = MagicMock(side_effect=["preexisting", "ours"])
-        maintainer._try_fix_tests = MagicMock(return_value=True)
+        maintainer._try_fix_tests = MagicMock(return_value=gm.FIX_RESOLVED)
         assert maintainer.fix_test_with_retries("boom") is True
         maintainer.git.stash_apply.assert_called_once()
         maintainer.git.stash_drop.assert_called_once()
+
+
+class TestADeclinedFixIsNotRetried:
+    """A decline is an answer. The tree and the failure are unchanged, so the
+    remaining attempts put the identical question and spend the agent timeout
+    on the identical answer."""
+
+    def test_ci_fix_stops_at_the_first_decline(self, repo_path, default_config):
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False, push_changes=True)
+        maintainer.git.is_workdir_clean = MagicMock(return_value=True)
+        maintainer.github.get_ci_failure_logs = MagicMock(return_value="boom")
+        maintainer.fix_ci_failure = MagicMock(return_value=gm.FIX_DECLINED)
+        assert maintainer.fix_ci_with_retries() is False
+        maintainer.fix_ci_failure.assert_called_once()
+
+    def test_ci_fix_retries_a_fix_that_did_not_hold(self, repo_path, default_config):
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False, push_changes=True)
+        maintainer.git.is_workdir_clean = MagicMock(return_value=True)
+        maintainer.github.get_ci_failure_logs = MagicMock(return_value="boom")
+        maintainer.fix_ci_failure = MagicMock(return_value=gm.FIX_FAILED)
+        assert maintainer.fix_ci_with_retries() is False
+        assert maintainer.fix_ci_failure.call_count == default_config.max_fix_attempts
+
+    def test_test_fix_stops_at_the_first_decline(self, repo_path, default_config):
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False)
+        maintainer.git.is_workdir_clean = MagicMock(return_value=True)
+        maintainer.git.reset_changes = MagicMock(return_value=True)
+        maintainer._try_fix_tests = MagicMock(return_value=gm.FIX_DECLINED)
+        assert maintainer.fix_test_with_retries("boom") is False
+        maintainer._try_fix_tests.assert_called_once()
+
+    def test_a_declining_agent_leaves_the_tree_clean(self, repo_path, default_config):
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False, push_changes=True)
+        maintainer.git.is_workdir_clean = MagicMock(return_value=True)
+        maintainer.git.reset_changes = MagicMock(return_value=True)
+        maintainer.agent.ask_json = MagicMock(return_value={"fixed": False, "reasoning": "needs a force push"})
+        maintainer.run_tests = MagicMock(side_effect=AssertionError("tested a tree the agent did not change"))
+        assert maintainer.fix_ci_failure("boom") == gm.FIX_DECLINED
+        maintainer.git.reset_changes.assert_called_once()
 
 
 class TestCommitAndPushWithoutPush:

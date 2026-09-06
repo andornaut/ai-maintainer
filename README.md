@@ -94,6 +94,12 @@ Anything published within `--dependency-min-age-days` is dropped before the list
 
 In all three the limit is stated to the agent and the agent decides. Treat it as enforced for Ruby, npm and pinned pip requirements, and advisory everywhere else. The prompt names which manifests were answered for and every entry carries its release date, so the agent can tell the filtered from the unfiltered.
 
+### Merging dependabot PRs
+
+Step 3 squash-merges each verified PR with a body built from the PR description, this tool's attribution and the PR's `Co-authored-by` trailers, so the release notes and credits stay in git history and a later run can recognize the merge as its own.
+
+Emdashes and endashes in that body are rewritten as hyphens, dashes inside a URL excepted. The body becomes a commit message the moment the PR is squashed, a quoted changelog routinely carries those characters, and a repository whose CI scans commit messages for them would then fail on a commit that no change to the working tree can fix.
+
 ### Pushing
 
 Step 6 pushes any unpushed commit on the branch, not only its own, so a dependabot merge pulled in earlier always reaches the remote. A push carrying only commits that were already there is not counted as a change the run made and does not name the repository in the summary, though CI is still watched on it, because a push triggers CI whoever wrote the commits.
@@ -111,6 +117,14 @@ Verdicts come from the commit's check runs (`/commits/{sha}/check-runs`), which 
 Classic commit statuses (Travis, Netlify and other older external reporters) are a separate, older mechanism and are not consulted.
 
 A failing verdict is returned at once. A non-failing one is held back until the set of checks has been unchanged for two 30-second polls, counted from when the verdict first became terminal. That costs one extra poll on the passing path and covers both GitHub's check-creation window and a workflow chained off another's completion. A check still not created by the end of that window cannot be observed.
+
+### Fixing a CI failure
+
+Every failed run on the commit is asked for its failing jobs' logs, and the first that answers is what the agent is given. One push commonly fails more than one workflow, and the run reporting a failure need not hold its log: a job run by a called reusable workflow is reported on the calling run while its log belongs to its own.
+
+When no run yields a failing job's log, a full run log is passed instead, prefixed with a note saying so. A run whose own jobs all passed logs nothing but successful output, and offered as a failure log it sends the agent looking for an error that is not in the text.
+
+`--max-fix-attempts` bounds the retries, but an agent that reads the failure and declines to fix it ends them immediately. The tree is reset and the logs come from the same commit, so a further attempt asks the identical question and spends the agent timeout on the identical answer. A fix that was made and did not hold is retried as normal.
 
 ## Options
 

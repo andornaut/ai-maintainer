@@ -94,6 +94,15 @@ TESTS_NOT_RUN = "not_run"
 # nothing for the agent to fix.
 TESTS_BLOCKED = "blocked"
 
+# AI fix outcomes. FIX_DECLINED is not a failure to retry: the agent read the
+# failure and would not change the tree, so a further attempt asks the same
+# question over the same tree and gets the same answer back. FIX_FAILED covers
+# an agent that could not be asked or whose fix did not hold, both of which a
+# retry can still resolve.
+FIX_RESOLVED = "resolved"
+FIX_FAILED = "failed"
+FIX_DECLINED = "declined"
+
 # Default values for CLI arguments and configuration
 DEFAULT_AGENT_COMMAND = "claude"
 DEFAULT_AGENT_FLAGS = "--dangerously-skip-permissions"
@@ -187,6 +196,18 @@ DEPENDABOT_REBASE_COMMAND = "@dependabot rebase"
 # that a key GitHub trusts signed the commit, and anything else holding one
 # signs under its own identity.
 GITHUB_COMMITTER_EMAIL = "noreply@github.com"
+
+# Heads a full run log handed to the fix path because no failing job's log
+# could be fetched. Without it the log reads as a green build, and the agent
+# spends its attempts looking for an error that is not in the text.
+NO_FAILED_JOB_LOG_NOTE = (
+    "NOTE: no log could be retrieved for the job that failed, so what follows "
+    "is the full log of one failed run and every step in it may have "
+    "succeeded. A job that a called reusable workflow ran logs this way: it "
+    "is reported on the calling run while its log belongs to its own run. "
+    "Look for the failure in this repository's other workflows before "
+    "concluding that nothing failed."
+)
 
 # Cap on the number of staged paths named in the pre-commit log line
 MAX_LOGGED_STAGED_FILES = 20
@@ -352,6 +373,27 @@ def run_git(
         quoted = " ".join(shlex.quote(arg) for arg in args)
         return run_shell_command(f"{env_runner} git {quoted}", cwd, timeout=timeout)
     return run_command(["git", *args], cwd, timeout=timeout)
+
+
+# An emdash or an endash, either of which a hyphen says as well, or a URL,
+# matched first only to step over it: a dash inside an address is part of the
+# address. The figure dash and the horizontal bar are left alone, being
+# typography for a numeric span and for quoted speech.
+URL_OR_DASH_RE = re.compile(r"[a-z][a-z0-9+.-]*://[^\s<>]+|[\u2014\u2013]+", re.IGNORECASE)
+
+
+def replace_dashes(text: str) -> str:
+    """Rewrite emdash and endash runs as a single hyphen, leaving URLs alone.
+
+    A dependabot PR description quotes the dependency's changelog, and a
+    changelog written with emdashes puts them in the squash commit message
+    composed from it. That message is history the moment it is merged, so a
+    repository whose CI scans commit messages for these dashes fails on a
+    commit nothing in the working tree can fix.
+    """
+    if not any(dash in text for dash in "\u2014\u2013"):
+        return text
+    return URL_OR_DASH_RE.sub(lambda m: m.group() if "://" in m.group() else "-", text)
 
 
 def _sanitize_trailer_value(value: str) -> str:
@@ -1146,9 +1188,11 @@ class GitHubClient:
         PR's release notes and co-author credits stay in git history and a
         later run can recognize the merge as ai-maintainer's work (the
         default body, which varies with the repo's squash-message setting,
-        would be indistinguishable from a human merge). On branches that
-        require a merge queue, gh ignores these flags, so the merge is
-        recorded without attribution and is not recognized later.
+        would be indistinguishable from a human merge). Emdashes and endashes
+        in the description are rewritten as hyphens, since the body becomes a
+        commit message and no later run can edit one that is already pushed.
+        On branches that require a merge queue, gh ignores these flags, so the
+        merge is recorded without attribution and is not recognized later.
 
         Returns (success, error) where error is gh's stderr (or stdout) on
         failure, so callers can log the root cause instead of a bare failure.
@@ -1156,7 +1200,7 @@ class GitHubClient:
         pr_body, coauthors = self.get_pr_body_and_coauthors(pr_num)
         # Trailers go in the final block so git interprets them as trailers
         parts = [pr_body, COMMIT_ATTRIBUTION, "\n".join(coauthors)]
-        body = "\n\n".join(p for p in parts if p)
+        body = replace_dashes("\n\n".join(p for p in parts if p))
         success, stdout, stderr = self._run(
             [
                 "gh",
@@ -1192,15 +1236,28 @@ class GitHubClient:
         return bodies[-limit:]
 
     def get_ci_failure_logs(self, head_sha: str | None = None) -> str | None:
-        """Get logs from the latest failed CI run, preferring head_sha's run."""
-        run_id = self.get_latest_failed_run_id(head_sha)
-        if run_id:
+        """The failing jobs' logs from the commit's failed CI runs.
+
+        Every failed run is asked, because a run can fail through a job whose
+        log it does not hold: a called reusable workflow's job is reported on
+        the caller's run while its log belongs to its own, and `--log-failed`
+        returns nothing for it. The run holding the log answers even when the
+        run reporting the failure cannot.
+
+        Only when no run yields a failing job's log does this fall back to a
+        full run log, and it says so. A run whose own jobs all passed logs
+        nothing but successful output, and handed over as a failure log it
+        sends the agent after an error that is not in it.
+        """
+        run_ids = self.get_failed_run_ids(head_sha)
+        for run_id in run_ids:
             success, stdout, _ = self._run(["gh", "run", "view", str(run_id), "--log-failed"])
-            # Fall back to full logs if --log-failed returns empty
-            if not stdout:
-                success, stdout, _ = self._run(["gh", "run", "view", str(run_id), "--log"])
             if success and stdout:
                 return truncate_ci_log(stdout)
+        if run_ids:
+            success, stdout, _ = self._run(["gh", "run", "view", str(run_ids[0]), "--log"])
+            if success and stdout:
+                return truncate_ci_log(f"{NO_FAILED_JOB_LOG_NOTE}\n{stdout}")
         if head_sha:
             # A workflow that failed to start ran no job, so there is no log
             # to fetch. Describe it instead: the fault is in the workflow file
@@ -1367,12 +1424,15 @@ class GitHubClient:
             return runs[0]["databaseId"]
         return None
 
-    def get_latest_failed_run_id(self, head_sha: str | None = None) -> int | None:
-        """Get the database ID of the most recent failed CI run.
+    def get_failed_run_ids(self, head_sha: str | None = None) -> list[int]:
+        """Database IDs of the commit's failed CI runs, newest first.
 
         A push can trigger several workflows, so the most recent run is not
         necessarily the one that failed; selecting on recency alone can hand
-        the logs of a green build to the AI fix path.
+        the logs of a green build to the AI fix path. Every failed run on the
+        commit is returned, not just the first: one push commonly fails more
+        than one workflow, and the run that reports a failure need not be the
+        one holding its log.
 
         A run counts as failed on the same conclusions a check does
         (FAILING_CHECK_CONCLUSIONS). Narrowing it here would leave a verdict
@@ -1385,23 +1445,30 @@ class GitHubClient:
             r for r in runs if r.get("status") == "completed" and r.get("conclusion") in FAILING_CHECK_CONCLUSIONS
         ]
         if not failed:
-            return None
+            return []
         if head_sha:
-            for run in failed:
-                if run.get("headSha") == head_sha:
-                    return run.get("databaseId")
+            matched = [r.get("databaseId") for r in failed if r.get("headSha") == head_sha]
+            if matched:
+                return [run_id for run_id in matched if run_id is not None]
             if any(r.get("headSha") == head_sha for r in runs):
                 # This commit ran and none of its runs failed, so the verdict
                 # came from a check with no run behind it at all. An older
                 # failure on the branch is a different problem, and handing
                 # its logs to the fix path would have the agent change code
                 # for something that did not fail here.
-                return None
+                return []
             # This commit produced no runs at all, which is what a
             # paths-filtered workflow leaves behind. get_ci_conclusion judges
             # such a commit by the newest checked one, so that commit's logs
-            # are the ones behind the verdict being acted on.
-        return failed[0].get("databaseId")
+            # are the ones behind the verdict being acted on. Only that run
+            # is relevant, so the rest of the branch's failures are dropped.
+        run_id = failed[0].get("databaseId")
+        return [run_id] if run_id is not None else []
+
+    def get_latest_failed_run_id(self, head_sha: str | None = None) -> int | None:
+        """The newest failed CI run's database ID, for a URL to report."""
+        run_ids = self.get_failed_run_ids(head_sha)
+        return run_ids[0] if run_ids else None
 
     def get_write_access(self) -> bool | None:
         """Whether the authenticated user can push to this repository.
@@ -1988,28 +2055,31 @@ class Maintainer:
 
         return None
 
-    def fix_ci_failure(self, logs: str) -> bool:
-        """Ask AI to fix a CI failure, verify, commit and push. Returns True if successful.
+    def fix_ci_failure(self, logs: str) -> str:
+        """Ask AI to fix a CI failure, verify, commit and push.
+
+        Returns FIX_RESOLVED once the fix is pushed, FIX_DECLINED when the
+        agent would not fix the failure, or FIX_FAILED for everything else.
 
         Requires a clean working tree: this path commits everything it finds,
         so running it over changes an earlier stage could not discard would
         push those changes untested.
         """
         if not self._can_commit_a_fix():
-            return False
+            return FIX_FAILED
 
         self.logger.info(f"[{self.repo_name}] Asking AI to fix CI failure...")
 
-        changes = self._ask_ai_to_fix(
+        outcome, changes = self._ask_ai_to_fix(
             "CI build failed. Analyze the logs, identify the build error, and fix it. "
             "Run tests locally to verify. "
             f"{COMMIT_MESSAGE_INSTRUCTIONS}"
             'Return JSON: {"fixed": <bool>, "changes_made": "<desc>", "reasoning": "<why>"}',
             {"ci_logs": logs},
         )
-        if not changes:
+        if outcome != FIX_RESOLVED:
             self._reset_changes()
-            return False
+            return outcome
 
         self.logger.info(f"[{self.repo_name}] AI fix: {changes}")
 
@@ -2018,16 +2088,16 @@ class Maintainer:
         if self.run_tests()[0] in (TESTS_FAILED, TESTS_BLOCKED):
             self.logger.error(f"[{self.repo_name}] Tests still failing after fix")
             self._reset_changes()
-            return False
+            return FIX_FAILED
 
         if self.git.is_workdir_clean():
             self.logger.error(f"[{self.repo_name}] AI claimed to fix but no changes made")
-            return False
+            return FIX_FAILED
 
         success, _ = self.commit_and_push(self.build_commit_message(False, is_fix=True))
         if not success:
             self._reset_changes()
-        return success
+        return FIX_RESOLVED if success else FIX_FAILED
 
     def fix_ci_with_retries(self) -> bool:
         """Attempt to fix CI failures with retries. Returns True if CI passes."""
@@ -2056,7 +2126,17 @@ class Maintainer:
                 return False
 
             self.logger.info(f"[{self.repo_name}] CI fix attempt {attempt}/{max_attempts}")
-            if not self.fix_ci_failure(logs):
+            outcome = self.fix_ci_failure(logs)
+            if outcome == FIX_DECLINED:
+                # The tree is back as it was and the logs come from the same
+                # commit, so every further attempt puts the identical question
+                # to the agent and spends its timeout on the same answer.
+                self.logger.error(
+                    f"[{self.repo_name}] The agent will not fix this failure; "
+                    "the remaining attempts would ask the same question"
+                )
+                return False
+            if outcome != FIX_RESOLVED:
                 if attempt >= max_attempts:
                     self.logger.error(f"[{self.repo_name}] Exhausted all {max_attempts} fix attempts")
                     return False
@@ -2075,33 +2155,37 @@ class Maintainer:
 
         return False
 
-    def _try_fix_tests(self, test_output: str) -> bool:
-        """Ask AI to fix a test failure and verify. Returns True if tests pass.
+    def _try_fix_tests(self, test_output: str) -> str:
+        """Ask AI to fix a test failure and verify.
 
-        On failure, resets the working directory to undo AI's changes.
+        Returns FIX_RESOLVED once the suite passes, FIX_DECLINED when the
+        agent would not fix the failure, or FIX_FAILED for everything else.
+
+        On anything but FIX_RESOLVED, resets the working directory to undo
+        AI's changes.
         """
         self.logger.info(f"[{self.repo_name}] Asking AI to fix test failure...")
 
-        changes = self._ask_ai_to_fix(
+        outcome, changes = self._ask_ai_to_fix(
             "Tests failed after updating dependencies. Analyze the output, identify the error, "
             "and fix the code (do NOT revert dependencies). Run tests to verify. "
             f"{COMMIT_MESSAGE_INSTRUCTIONS}"
             'Return JSON: {"fixed": <bool>, "changes_made": "<desc>", "reasoning": "<why>"}',
             {"test_output": test_output},
         )
-        if not changes:
+        if outcome != FIX_RESOLVED:
             self._reset_changes()
-            return False
+            return outcome
 
         self.logger.info(f"[{self.repo_name}] AI fix: {changes}")
 
         if self.run_tests()[0] != TESTS_PASSED:
             self.logger.error(f"[{self.repo_name}] Tests still failing after fix")
             self._reset_changes()
-            return False
+            return FIX_FAILED
 
         self.logger.info(f"[{self.repo_name}] Tests passing after AI fix")
-        return True
+        return FIX_RESOLVED
 
     def fix_test_with_retries(self, test_output: str) -> bool:
         """Attempt to fix test failures with retries. Returns True if tests pass.
@@ -2162,9 +2246,20 @@ class Maintainer:
                         self._reset_changes()
                         return False
 
-                if self._try_fix_tests(test_output):
+                outcome = self._try_fix_tests(test_output)
+                if outcome == FIX_RESOLVED:
                     self.logger.info(f"[{self.repo_name}] Tests passed after {attempt} fix attempt(s)")
                     return True
+                if outcome == FIX_DECLINED:
+                    # The tree is back to the same dependency updates and the
+                    # suite would fail the same way, so every further attempt
+                    # puts the identical question to the agent.
+                    self.logger.error(
+                        f"[{self.repo_name}] The agent will not fix this failure; "
+                        "the remaining attempts would ask the same question"
+                    )
+                    self._reset_changes()
+                    return False
 
                 # _try_fix_tests reset all changes. Re-apply deps and re-run tests
                 # to capture fresh failure output for the next attempt.
@@ -3008,19 +3103,26 @@ class Maintainer:
         if not self.git.reset_changes():
             raise WorkingTreeError("Could not discard uncommitted changes; manual cleanup required")
 
-    def _ask_ai_to_fix(self, prompt: str, context: dict[str, Any]) -> str | None:
-        """Ask AI to fix an error. Returns changes_made description or None if failed."""
+    def _ask_ai_to_fix(self, prompt: str, context: dict[str, Any]) -> tuple[str, str | None]:
+        """Ask AI to fix an error.
+
+        Returns (outcome, changes_made): FIX_RESOLVED with the agent's
+        description of what it changed, FIX_DECLINED when the agent read the
+        failure and would not fix it, or FIX_FAILED when it could not be asked
+        at all. Declined is kept apart from failed because only the first is
+        an answer, and repeating the question cannot change it.
+        """
         if self.config.dry_run:
             self.logger.info(f"[{self.repo_name}] DRY RUN: Would ask AI to fix failures")
-            return None
+            return FIX_FAILED, None
 
         decision = self.agent.ask_json(prompt, context)
         if decision is None:
-            return None
+            return FIX_FAILED, None
         if not decision.get("fixed", False):
             self.logger.warning(f"[{self.repo_name}] AI could not fix: {decision.get('reasoning', 'No reason')}")
-            return None
-        return decision.get("changes_made", "Changes made")
+            return FIX_DECLINED, None
+        return FIX_RESOLVED, decision.get("changes_made", "Changes made")
 
     def _is_valid_dependabot_pr(self, pr: dict[str, Any]) -> bool:
         """Verify a PR is legitimately from dependabot using structural checks.
