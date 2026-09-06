@@ -1419,7 +1419,7 @@ class TestGitHubClientCi:
         client = self._client(tmp_path)
         client.get_failed_run_ids = MagicMock(return_value=[])
         client._startup_failure_checks = MagicMock(return_value=[])
-        assert client.get_ci_failure_logs("abc") is None
+        assert client.get_ci_failure_logs("abc") == (None, None)
 
     def test_failure_logs_come_from_the_failed_run(self, tmp_path):
         client = self._client(tmp_path)
@@ -1431,7 +1431,7 @@ class TestGitHubClientCi:
             return True, "boom", ""
 
         client._run = fake_run
-        assert client.get_ci_failure_logs("abc") == "boom"
+        assert client.get_ci_failure_logs("abc") == ("boom", 77)
         assert "77" in calls[0]
 
     def test_failure_logs_fall_through_to_a_run_that_has_them(self, tmp_path):
@@ -1445,7 +1445,7 @@ class TestGitHubClientCi:
             return True, ("" if "77" in args else "boom"), ""
 
         client._run = fake_run
-        assert client.get_ci_failure_logs("abc") == "boom"
+        assert client.get_ci_failure_logs("abc") == ("boom", 88)
         assert [a for a in calls if "--log" in a] == []
         assert "88" in calls[-1]
 
@@ -1458,7 +1458,8 @@ class TestGitHubClientCi:
             return True, ("" if "--log-failed" in args else "every step passed"), ""
 
         client._run = fake_run
-        logs = client.get_ci_failure_logs("abc")
+        logs, run_id = client.get_ci_failure_logs("abc")
+        assert run_id == 77
         assert logs.startswith(gm.NO_FAILED_JOB_LOG_NOTE)
         assert "attributions / AI attributions" in logs
         assert "every step passed" in logs
@@ -1472,7 +1473,7 @@ class TestGitHubClientCi:
             return True, ("" if "--log-failed" in args else "every step passed"), ""
 
         client._run = fake_run
-        logs = client.get_ci_failure_logs("abc")
+        logs, _ = client.get_ci_failure_logs("abc")
         assert logs.startswith(gm.NO_FAILED_JOB_LOG_NOTE)
         assert "every step passed" in logs
 
@@ -3065,15 +3066,27 @@ class TestADeclinedFixIsNotRetried:
     def test_ci_fix_stops_at_the_first_decline(self, repo_path, default_config):
         maintainer = make_maintainer(repo_path, default_config, dry_run=False, push_changes=True)
         maintainer.git.is_workdir_clean = MagicMock(return_value=True)
-        maintainer.github.get_ci_failure_logs = MagicMock(return_value="boom")
+        maintainer.github.get_ci_failure_logs = MagicMock(return_value=("boom", 1))
         maintainer.fix_ci_failure = MagicMock(return_value=gm.FIX_DECLINED)
         assert maintainer.fix_ci_with_retries() is False
         maintainer.fix_ci_failure.assert_called_once()
 
+    def test_the_run_the_agent_reads_is_named(self, repo_path, default_config, caplog):
+        # A commit that fails several workflows has more than one failed run,
+        # and the URL the failure was reported under is only the newest
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False, push_changes=True)
+        maintainer.git.is_workdir_clean = MagicMock(return_value=True)
+        maintainer.github.get_ci_failure_logs = MagicMock(return_value=("boom", 99))
+        maintainer.github.get_ci_run_url = MagicMock(return_value="https://example.com/actions/runs/99")
+        maintainer.fix_ci_failure = MagicMock(return_value=gm.FIX_DECLINED)
+        with caplog.at_level(logging.INFO):
+            maintainer.fix_ci_with_retries()
+        assert "https://example.com/actions/runs/99" in caplog.text
+
     def test_ci_fix_retries_a_fix_that_did_not_hold(self, repo_path, default_config):
         maintainer = make_maintainer(repo_path, default_config, dry_run=False, push_changes=True)
         maintainer.git.is_workdir_clean = MagicMock(return_value=True)
-        maintainer.github.get_ci_failure_logs = MagicMock(return_value="boom")
+        maintainer.github.get_ci_failure_logs = MagicMock(return_value=("boom", 1))
         maintainer.fix_ci_failure = MagicMock(return_value=gm.FIX_FAILED)
         assert maintainer.fix_ci_with_retries() is False
         assert maintainer.fix_ci_failure.call_count == default_config.max_fix_attempts
@@ -3721,7 +3734,7 @@ class TestEveryFailureVerdictIsActionable:
             tmp_path,
             [{"databaseId": 1, "status": "completed", "conclusion": "failure", "headSha": "abc"}],
         )
-        assert client.get_ci_failure_logs("abc") == "boom"
+        assert client.get_ci_failure_logs("abc") == ("boom", 1)
 
     def test_a_failed_run_from_a_chained_workflow(self, tmp_path):
         # Not push-triggered, so an event-filtered listing would miss it
@@ -3732,7 +3745,7 @@ class TestEveryFailureVerdictIsActionable:
                 {"databaseId": 7, "status": "completed", "conclusion": "failure", "headSha": "abc"},
             ],
         )
-        assert client.get_ci_failure_logs("abc") == "boom"
+        assert client.get_ci_failure_logs("abc") == ("boom", 7)
 
     @pytest.mark.parametrize("conclusion", gm.FAILING_CHECK_CONCLUSIONS)
     def test_every_conclusion_the_verdict_calls_a_failure(self, tmp_path, conclusion):
@@ -3742,7 +3755,7 @@ class TestEveryFailureVerdictIsActionable:
             tmp_path,
             [{"databaseId": 1, "status": "completed", "conclusion": conclusion, "headSha": "abc"}],
         )
-        assert client.get_ci_failure_logs("abc") == "boom"
+        assert client.get_ci_failure_logs("abc") == ("boom", 1)
 
     def test_a_workflow_that_failed_before_running_a_job(self, tmp_path):
         # No job means no log, so the fault has to be described instead
@@ -3751,8 +3764,9 @@ class TestEveryFailureVerdictIsActionable:
             [{"databaseId": 4, "conclusion": "startup_failure", "headSha": "abc", "workflowName": "Release"}],
             stdout="",
         )
-        logs = client.get_ci_failure_logs("abc")
+        logs, run_id = client.get_ci_failure_logs("abc")
         assert logs
+        assert run_id is None
         assert "Release" in logs
         assert ".github/workflows/" in logs
 
@@ -3790,7 +3804,7 @@ class TestEveryFailureVerdictIsActionable:
             tmp_path,
             [{"databaseId": 9, "status": "completed", "conclusion": "failure", "headSha": "older"}],
         )
-        assert client.get_ci_failure_logs("abc") == "boom"
+        assert client.get_ci_failure_logs("abc") == ("boom", 9)
 
     def test_the_one_deliberate_exception(self, tmp_path):
         # The commit ran and nothing failed, yet a check reports failure: the
@@ -3804,7 +3818,7 @@ class TestEveryFailureVerdictIsActionable:
                 {"databaseId": 9, "status": "completed", "conclusion": "failure", "headSha": "older"},
             ],
         )
-        assert client.get_ci_failure_logs("abc") is None
+        assert client.get_ci_failure_logs("abc") == (None, None)
 
 
 class TestRunnerGuardCoversEveryProjectType:

@@ -59,6 +59,7 @@ class OutdatedReport(NamedTuple):
 
 MergeResult = list[int]  # merged_pr_numbers
 RepoResult = tuple[str, bool]  # (status, had_changes); status is a STATUS_* value
+CiFailureLogs = tuple[str | None, int | None]  # (log text, the run it was read from)
 TestResult = tuple[str, str]  # (TESTS_* value, output)
 VerifiedPR = tuple[int, str]  # (pr_number, verified_head_sha)
 
@@ -1235,8 +1236,13 @@ class GitHubClient:
         bodies = [c.get("body", "") for c in data.get("comments", [])]
         return bodies[-limit:]
 
-    def get_ci_failure_logs(self, head_sha: str | None = None) -> str | None:
+    def get_ci_failure_logs(self, head_sha: str | None = None) -> CiFailureLogs:
         """The failing jobs' logs from the commit's failed CI runs.
+
+        Returns (log text, the run it was read from). The run is reported so
+        the caller can say which one the agent is reading: a commit that fails
+        several workflows has more than one failed run, and the one named in
+        the summary need not be the one whose log answered here.
 
         Every failed run is asked, because a run can fail through a job whose
         log it does not hold: a called reusable workflow's job is reported on
@@ -1253,7 +1259,7 @@ class GitHubClient:
         for run_id in run_ids:
             success, stdout, _ = self._run(["gh", "run", "view", str(run_id), "--log-failed"])
             if success and stdout:
-                return truncate_ci_log(stdout)
+                return truncate_ci_log(stdout), run_id
         if run_ids:
             success, stdout, _ = self._run(["gh", "run", "view", str(run_ids[0]), "--log"])
             if success and stdout:
@@ -1261,7 +1267,7 @@ class GitHubClient:
                 failing = self._failing_check_names(head_sha) if head_sha else []
                 if failing:
                     note += f" The checks that failed on this commit are: {', '.join(failing)}."
-                return truncate_ci_log(f"{note}\n{stdout}")
+                return truncate_ci_log(f"{note}\n{stdout}"), run_ids[0]
         if head_sha:
             # A workflow that failed to start ran no job, so there is no log
             # to fetch. Describe it instead: the fault is in the workflow file
@@ -1274,8 +1280,8 @@ class GitHubClient:
                     f"job ran and no job log exists: {', '.join(names)}. "
                     "Inspect the files under .github/workflows/ for invalid "
                     "YAML or an invalid workflow schema."
-                )
-        return None
+                ), None
+        return None, None
 
     def _failing_check_names(self, head_sha: str) -> list[str]:
         """Names of the commit's failing checks, for a log that lacks theirs.
@@ -2134,7 +2140,7 @@ class Maintainer:
             if self._out_of_time("CI fix attempts"):
                 return False
 
-            logs = self.github.get_ci_failure_logs(self.git.get_head_sha())
+            logs, log_run_id = self.github.get_ci_failure_logs(self.git.get_head_sha())
             if not logs:
                 # The verdict comes from the commit's checks, which include
                 # ones no workflow run backs (a required external status, a
@@ -2143,7 +2149,13 @@ class Maintainer:
                 self.logger.error(f"[{self.repo_name}] Could not get CI failure logs")
                 return False
 
-            self.logger.info(f"[{self.repo_name}] CI fix attempt {attempt}/{max_attempts}")
+            # Name the run the agent is reading. A commit that fails several
+            # workflows has more than one failed run, and the URL the failure
+            # was reported under is only the newest of them.
+            source = self.github.get_ci_run_url(log_run_id) or ""
+            self.logger.info(
+                f"[{self.repo_name}] CI fix attempt {attempt}/{max_attempts}{f' from {source}' if source else ''}"
+            )
             outcome = self.fix_ci_failure(logs)
             if outcome == FIX_DECLINED:
                 # The tree is back as it was and the logs come from the same
