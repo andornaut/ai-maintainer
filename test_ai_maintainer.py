@@ -40,6 +40,7 @@ def default_config():
         dependency_min_age_days=30,
         dry_run=True,
         exclude=frozenset(),
+        lint_timeout_seconds=180,
         max_fix_attempts=4,
         push_changes=False,
         repo_timeout_minutes=60,
@@ -1005,6 +1006,33 @@ class TestLintRunsBesideTheSuite:
         (repo_path / "package.json").write_text('{"scripts": {"test": "jest"}}')
         self._shell(monkeypatch)
         assert gm.Maintainer(repo_path, default_config).detect_lint_command() is None
+
+    def test_a_second_linter_is_tried_when_the_first_will_not_resolve(self, repo_path, default_config, monkeypatch):
+        # Reporting no linter for a repository that has a runnable one leaves
+        # it unlinted for the sake of the one that is missing
+        (repo_path / "package.json").write_text('{"scripts": {"lint": "eslint ."}}')
+        (repo_path / "ruff.toml").write_text("\n")
+        monkeypatch.setattr(
+            gm,
+            "run_shell_command",
+            lambda cmd, *a, **k: (not cmd.endswith("which npm"), "", ""),
+        )
+        assert gm.Maintainer(repo_path, default_config).detect_lint_command() == "ruff check ."
+
+    def test_the_lint_timeout_is_its_own(self, repo_path, default_config, monkeypatch):
+        # Sharing the suite's would put twice that inside one run_tests call
+        (repo_path / "package.json").write_text('{"scripts": {"lint": "eslint .", "test": "jest"}}')
+        timeouts = {}
+
+        def fake(cmd, cwd, *a, timeout=None, **k):
+            if not cmd.startswith("which "):
+                timeouts[cmd] = timeout
+            return True, "", ""
+
+        monkeypatch.setattr(gm, "run_shell_command", fake)
+        config = gm.Config(**{**default_config.__dict__, "lint_timeout_seconds": 30, "test_timeout_seconds": 600})
+        gm.Maintainer(repo_path, config).run_tests()
+        assert timeouts == {"npm run lint": 30, "npm test": 600}
 
     def test_a_commented_out_ruff_table_is_not_a_declaration(self, repo_path, default_config, monkeypatch):
         # ruff run on a project that dropped it fails over its default rules,

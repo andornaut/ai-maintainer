@@ -114,7 +114,7 @@ Step 5 runs the project's linter and then its test suite. Lint goes first: it is
 | `.rubocop.yml` or `.rubocop.yaml` | `bundle exec rubocop`, or a bare `rubocop` where there is no `Gemfile` |
 | `ruff.toml`, `.ruff.toml` or `[tool.ruff]` | `ruff check .` |
 
-Only a declaration counts, never a guess: a linter chosen for a project that did not ask for one would fail the run over a style the project never adopted.
+Only a declaration counts, never a guess: a linter chosen for a project that did not ask for one would fail the run over a style the project never adopted. A declaration whose runner does not resolve falls through to the next, so a repository declaring two linters is linted by whichever of them is runnable.
 
 - A lint failure is a test failure. CI fails on it either way, and it is the cheapest failure for the agent to fix.
 - A linter that passes is not a suite that passed. A repository with no test command is still reported as unverified, never as passing.
@@ -156,6 +156,7 @@ Each attempt names the run whose log the agent is reading. A commit that fails s
 | `--agent-command CMD` | AI agent executable (default: `claude`) |
 | `--agent-flags FLAGS` | Flags passed to the agent (default: `--dangerously-skip-permissions`) |
 | `--agent-timeout N` | Seconds per agent invocation (default: 300) |
+| `--lint-timeout N` | Seconds for the linter, budgeted apart from the suite (default: 180) |
 | `--test-timeout N` | Seconds for the test suite and hook-firing git ops (default: 600) |
 | `--command-timeout N` | Seconds for git, gh and other shell commands (default: 120) |
 | `--ci-timeout N` | Minutes to wait for CI (default: 10) |

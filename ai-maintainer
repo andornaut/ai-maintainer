@@ -112,6 +112,10 @@ DEFAULT_CI_TIMEOUT_MINUTES = 10
 DEFAULT_DEPENDENCY_MIN_AGE_DAYS = 0
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 120
 DEFAULT_TEST_TIMEOUT_SECONDS = 600
+# Lint gets its own budget rather than sharing the suite's. A linter reads the
+# tree and reports; one still running after this is hung, not slow, and giving
+# it the suite's timeout puts twice that inside a single run_tests call.
+DEFAULT_LINT_TIMEOUT_SECONDS = 180
 DEFAULT_MAX_FIX_ATTEMPTS = 4
 DEFAULT_REPO_TIMEOUT_MINUTES = 60
 
@@ -314,6 +318,7 @@ class Config:
     dependency_min_age_days: int
     dry_run: bool
     exclude: frozenset[str]
+    lint_timeout_seconds: int
     max_fix_attempts: int
     push_changes: bool
     repo_timeout_minutes: int
@@ -1981,18 +1986,24 @@ class Maintainer:
         return command
 
     def _lint_command(self) -> str | None:
-        """The linter each declaration calls for, or None when none matches."""
+        """The linter the first resolvable declaration calls for, or None.
+
+        A declaration whose runner does not resolve falls through to the next
+        rather than ending the search: a repository declaring two linters, one
+        of them runnable here, is linted rather than reported as having none.
+        """
         p = self.repo_path
-
-        if self._npm_script("lint"):
-            return self._test_command("npm", "run lint")
-
-        if (p / ".rubocop.yml").exists() or (p / ".rubocop.yaml").exists():
-            return self._ruby_test_command("rubocop")
-
-        if self._has_ruff_config():
-            return self._test_command("ruff", "check .")
-
+        declared = (
+            (self._npm_script("lint"), lambda: self._test_command("npm", "run lint")),
+            (
+                (p / ".rubocop.yml").exists() or (p / ".rubocop.yaml").exists(),
+                lambda: self._ruby_test_command("rubocop"),
+            ),
+            (self._has_ruff_config(), lambda: self._test_command("ruff", "check .")),
+        )
+        for declares, resolve in declared:
+            if declares and (command := resolve()):
+                return command
         return None
 
     def _test_command(self, tool: str, args: str = "", declared: bool = True) -> str | None:
@@ -2849,14 +2860,15 @@ class Maintainer:
             return TESTS_BLOCKED, message
 
         outputs = []
-        for label, command in (("Lint", lint_cmd), ("Tests", test_cmd)):
+        for label, command, timeout in (
+            ("Lint", lint_cmd, self.config.lint_timeout_seconds),
+            ("Tests", test_cmd, self.config.test_timeout_seconds),
+        ):
             if not command:
                 continue
             self.logger.debug(f"[{self.repo_name}] Running {label.lower()}: {command}")
             # Always run through a shell: env runner prefixes use shell syntax
-            success, stdout, stderr = run_shell_command(
-                command, self.repo_path, timeout=self.config.test_timeout_seconds
-            )
+            success, stdout, stderr = run_shell_command(command, self.repo_path, timeout=timeout)
             outputs.append(f"Command: {command}\n\nSTDOUT:\n{stdout}\n\nSTDERR:\n{stderr}")
             if not success:
                 self.logger.error(f"[{self.repo_name}] {label} failed: {command}")
@@ -3690,6 +3702,15 @@ Examples:
     )
     parser.add_argument("--no-run-tests", action="store_true", help="Skip running tests")
     parser.add_argument(
+        "--lint-timeout",
+        type=positive_int,
+        default=DEFAULT_LINT_TIMEOUT_SECONDS,
+        help=(
+            "Timeout in seconds for running the linter, which runs before the "
+            f"test suite and is budgeted apart from it (default: {DEFAULT_LINT_TIMEOUT_SECONDS})"
+        ),
+    )
+    parser.add_argument(
         "--test-timeout",
         type=positive_int,
         default=DEFAULT_TEST_TIMEOUT_SECONDS,
@@ -3786,6 +3807,7 @@ def main():
         dependency_min_age_days=args.dependency_min_age_days,
         dry_run=args.dry_run,
         exclude=frozenset(args.exclude),
+        lint_timeout_seconds=args.lint_timeout,
         max_fix_attempts=args.max_fix_attempts,
         push_changes=not args.no_push,
         repo_timeout_minutes=args.repo_timeout,
@@ -3804,6 +3826,7 @@ def main():
     repo_budget = f"{config.repo_timeout_minutes}m" if config.repo_timeout_minutes else "none"
     logger.info(
         f"Timeouts: agent={config.agent_timeout_seconds}s, "
+        f"lint={config.lint_timeout_seconds}s, "
         f"test={config.test_timeout_seconds}s, "
         f"command={config.command_timeout_seconds}s, "
         f"ci={config.ci_timeout_minutes}m, "
