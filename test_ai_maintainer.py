@@ -1452,6 +1452,21 @@ class TestGitHubClientCi:
     def test_a_full_run_log_says_it_is_not_a_failing_job_log(self, tmp_path):
         client = self._client(tmp_path)
         client.get_failed_run_ids = MagicMock(return_value=[77])
+        client.get_check_runs = MagicMock(return_value=[completed("failure", "attributions / AI attributions")])
+
+        def fake_run(args):
+            return True, ("" if "--log-failed" in args else "every step passed"), ""
+
+        client._run = fake_run
+        logs = client.get_ci_failure_logs("abc")
+        assert logs.startswith(gm.NO_FAILED_JOB_LOG_NOTE)
+        assert "attributions / AI attributions" in logs
+        assert "every step passed" in logs
+
+    def test_a_full_run_log_stands_without_the_check_names(self, tmp_path):
+        client = self._client(tmp_path)
+        client.get_failed_run_ids = MagicMock(return_value=[77])
+        client.get_check_runs = MagicMock(return_value=None)
 
         def fake_run(args):
             return True, ("" if "--log-failed" in args else "every step passed"), ""

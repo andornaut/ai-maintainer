@@ -122,7 +122,7 @@ A failing verdict is returned at once. A non-failing one is held back until the 
 
 Every failed run on the commit is asked for its failing jobs' logs, and the first that answers is what the agent is given. One push commonly fails more than one workflow, and the run reporting a failure need not hold its log: a job run by a called reusable workflow is reported on the calling run while its log belongs to its own.
 
-When no run yields a failing job's log, a full run log is passed instead, prefixed with a note saying so. A run whose own jobs all passed logs nothing but successful output, and offered as a failure log it sends the agent looking for an error that is not in the text.
+When no run yields a failing job's log, a full run log is passed instead, prefixed with a note that says so and names the commit's failing checks. A run whose own jobs all passed logs nothing but successful output, and offered as a failure log it sends the agent looking for an error that is not in the text.
 
 `--max-fix-attempts` bounds the retries, but an agent that reads the failure and declines to fix it ends them immediately. The tree is reset and the logs come from the same commit, so a further attempt asks the identical question and spends the agent timeout on the identical answer. A fix that was made and did not hold is retried as normal.
 

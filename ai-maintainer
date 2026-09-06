@@ -1257,7 +1257,11 @@ class GitHubClient:
         if run_ids:
             success, stdout, _ = self._run(["gh", "run", "view", str(run_ids[0]), "--log"])
             if success and stdout:
-                return truncate_ci_log(f"{NO_FAILED_JOB_LOG_NOTE}\n{stdout}")
+                note = NO_FAILED_JOB_LOG_NOTE
+                failing = self._failing_check_names(head_sha) if head_sha else []
+                if failing:
+                    note += f" The checks that failed on this commit are: {', '.join(failing)}."
+                return truncate_ci_log(f"{note}\n{stdout}")
         if head_sha:
             # A workflow that failed to start ran no job, so there is no log
             # to fetch. Describe it instead: the fault is in the workflow file
@@ -1272,6 +1276,20 @@ class GitHubClient:
                     "YAML or an invalid workflow schema."
                 )
         return None
+
+    def _failing_check_names(self, head_sha: str) -> list[str]:
+        """Names of the commit's failing checks, for a log that lacks theirs.
+
+        The verdict already came from these checks, so a fallback log that
+        names them points the agent at the job that failed instead of leaving
+        it to infer which of the repository's workflows to look in.
+        """
+        checks = self.get_check_runs(head_sha) or []
+        return [
+            name
+            for check in checks
+            if check.get("conclusion") in FAILING_CHECK_CONCLUSIONS and (name := check.get("name"))
+        ]
 
     def get_dependabot_prs(self) -> list[dict[str, Any]]:
         """Get open dependabot PRs targeting the current branch."""
