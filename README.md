@@ -111,7 +111,7 @@ Step 5 runs the project's linter and then its test suite. Lint goes first: it is
 | Manifest | Linted with |
 | --- | --- |
 | `package.json` with a `lint` script | `npm run lint` |
-| `.rubocop.yml` with rubocop in `Gemfile.lock` | `bundle exec rubocop` |
+| `.rubocop.yml` or `.rubocop.yaml` | `bundle exec rubocop`, or a bare `rubocop` where there is no `Gemfile` |
 | `ruff.toml`, `.ruff.toml` or `[tool.ruff]` | `ruff check .` |
 
 Only a declaration counts, never a guess: a linter chosen for a project that did not ask for one would fail the run over a style the project never adopted.
@@ -149,7 +149,7 @@ Each attempt names the run whose log the agent is reading. A commit that fails s
 | `-e`, `--exclude REPO` | Exclude a repository by name (repeatable) |
 | `--no-merge-dependabot` | Skip merging dependabot PRs |
 | `--no-update-dependencies` | Skip dependency updates |
-| `--no-run-tests` | Skip running tests |
+| `--no-run-tests` | Skip running the linter and the tests |
 | `--no-push` | Commit locally, do not push |
 | `--dependency-min-age-days N` | Skip dependencies newer than N days (default: 0) |
 | `--max-fix-attempts N` | Max agent fix attempts per repo (default: 4) |

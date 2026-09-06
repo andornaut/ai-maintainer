@@ -218,6 +218,11 @@ MAX_LOGGED_STAGED_FILES = 20
 # newlines and shell metacharacters.
 RUBY_VERSION_RE = re.compile(r"^[A-Za-z0-9._+-]+$")
 
+# A ruff table opening a line in pyproject.toml, which is what declares ruff.
+# Anchored: a commented-out or quoted mention is not a declaration, and ruff
+# run on a project that dropped it fails over rules it never adopted.
+RUFF_CONFIG_SECTION = re.compile(r"^\[tool\.ruff", re.MULTILINE)
+
 # Directories a project-local virtualenv is conventionally created in
 VENV_DIRS = (".venv", "venv", ".env", "env")
 
@@ -1749,10 +1754,11 @@ class Maintainer:
         self._pypi_feeds: dict[str, list[tuple[str, datetime]] | None] = {}
         # Why a declared test or lint runner would not resolve; see run_tests
         self._unresolved_runner: str | None = None
-        # Whether the last run_tests found a test command. A repository that
-        # never had a suite is verified by its linter alone, and _try_fix_tests
-        # has to tell that apart from a suite that went missing under a fix
+        # What the last run_tests found. A repository that never had a suite is
+        # verified by its linter alone, and _try_fix_tests has to tell that
+        # apart from a suite or a linter that went missing under a fix
         self._suite_detected = False
+        self._lint_detected = False
         # Wall-clock ceiling for this repository; see _start_deadline
         self._deadline: float | None = None
 
@@ -1924,13 +1930,33 @@ class Maintainer:
                 pass
         return False
 
+    def _npm_script(self, name: str) -> bool:
+        """Whether package.json declares this npm script.
+
+        An unreadable or malformed package.json declares nothing rather than
+        raising: the file is untrusted input, and "scripts": null is valid
+        JSON whose lookup is not.
+        """
+        path = self.repo_path / "package.json"
+        try:
+            pkg = safe_json_parse(path.read_text(), default={})
+        except (OSError, UnicodeDecodeError):
+            return False
+        scripts = pkg.get("scripts") if isinstance(pkg, dict) else None
+        return bool(isinstance(scripts, dict) and scripts.get(name))
+
     def _has_ruff_config(self) -> bool:
-        """Whether the project configures ruff, whichever file it uses."""
+        """Whether the project configures ruff, whichever file it uses.
+
+        The pyproject table has to start a line: a commented-out "# [tool.ruff]"
+        left behind by a project that dropped ruff would otherwise run it with
+        its default rules, which the project never adopted.
+        """
         if (self.repo_path / "ruff.toml").exists() or (self.repo_path / ".ruff.toml").exists():
             return True
         path = self.repo_path / "pyproject.toml"
         try:
-            return path.exists() and "[tool.ruff" in path.read_text()
+            return RUFF_CONFIG_SECTION.search(path.read_text()) is not None
         except (OSError, UnicodeDecodeError):
             return False
 
@@ -1958,13 +1984,8 @@ class Maintainer:
         """The linter each declaration calls for, or None when none matches."""
         p = self.repo_path
 
-        if (p / "package.json").exists():
-            try:
-                pkg = safe_json_parse((p / "package.json").read_text(), default={})
-                if pkg.get("scripts", {}).get("lint"):
-                    return self._test_command("npm", "run lint")
-            except OSError:
-                pass
+        if self._npm_script("lint"):
+            return self._test_command("npm", "run lint")
 
         if (p / ".rubocop.yml").exists() or (p / ".rubocop.yaml").exists():
             return self._ruby_test_command("rubocop")
@@ -2087,14 +2108,8 @@ class Maintainer:
         p = self.repo_path
 
         # Node.js - check for npm test script
-        if (p / "package.json").exists():
-            try:
-                pkg_text = (p / "package.json").read_text()
-                pkg = safe_json_parse(pkg_text, default={})
-                if pkg.get("scripts", {}).get("test"):
-                    return self._test_command("npm", "test")
-            except OSError:
-                pass
+        if self._npm_script("test"):
+            return self._test_command("npm", "test")
 
         # Python - declared by a config file or by packaging metadata
         if (p / "tox.ini").exists():
@@ -2254,10 +2269,17 @@ class Maintainer:
         # tests" is the passing answer there. Where a suite did run, the same
         # answer means it went missing under the fix, which is not a pass.
         had_suite = self._suite_detected
+        had_lint = self._lint_detected
 
+        # The output names the command that failed, and the linter runs first,
+        # so what failed here is as often lint as it is the suite. A prompt
+        # that says "tests" sends the agent to run the suite, watch it pass,
+        # and report that it found nothing wrong.
         outcome, changes = self._ask_ai_to_fix(
-            "Tests failed after updating dependencies. Analyze the output, identify the error, "
-            "and fix the code (do NOT revert dependencies). Run tests to verify. "
+            "A verification command failed after updating dependencies; its command line and "
+            "output are below. Analyze the output, identify the error, and fix the code (do NOT "
+            "revert dependencies, and do NOT remove or weaken the project's test or lint "
+            "configuration). Re-run that same command to verify. "
             f"{COMMIT_MESSAGE_INSTRUCTIONS}"
             'Return JSON: {"fixed": <bool>, "changes_made": "<desc>", "reasoning": "<why>"}',
             {"test_output": test_output},
@@ -2269,12 +2291,24 @@ class Maintainer:
         self.logger.info(f"[{self.repo_name}] AI fix: {changes}")
 
         verdict = self.run_tests()[0]
+        # Removing what checks the code is a way of making it pass, not a pass.
+        # run_tests has just re-detected both, so a check that was there before
+        # the fix and is gone after it was taken out by the fix.
+        for what, before, after in (
+            ("test suite", had_suite, self._suite_detected),
+            ("lint configuration", had_lint, self._lint_detected),
+        ):
+            if before and not after:
+                self.logger.error(f"[{self.repo_name}] The fix removed this project's {what}")
+                self._reset_changes()
+                return FIX_FAILED
+
         if verdict != TESTS_PASSED and not (verdict == TESTS_NOT_RUN and not had_suite):
-            self.logger.error(f"[{self.repo_name}] Tests still failing after fix")
+            self.logger.error(f"[{self.repo_name}] Verification still failing after fix")
             self._reset_changes()
             return FIX_FAILED
 
-        self.logger.info(f"[{self.repo_name}] Tests passing after AI fix")
+        self.logger.info(f"[{self.repo_name}] Verification passing after AI fix")
         return FIX_RESOLVED
 
     def fix_test_with_retries(self, test_output: str) -> bool:
@@ -2705,7 +2739,7 @@ class Maintainer:
                 log = self.logger.info if not self.config.run_tests else self.logger.warning
                 log(f"[{self.repo_name}] Changes not verified: {test_output}")
             elif tests_status == TESTS_FAILED:
-                self.logger.warning(f"[{self.repo_name}] Tests failed, asking AI to fix...")
+                self.logger.warning(f"[{self.repo_name}] Verification failed, asking AI to fix...")
                 if self.fix_test_with_retries(test_output):
                     self.logger.info(f"[{self.repo_name}] Tests fixed by AI")
                 else:
@@ -2801,12 +2835,14 @@ class Maintainer:
         """
         if not self.config.run_tests:
             self._suite_detected = False
+            self._lint_detected = False
             return TESTS_NOT_RUN, "Tests skipped (disabled in config)"
 
         self._unresolved_runner = None
         lint_cmd = self.detect_lint_command()
         test_cmd = self.detect_test_command()
         self._suite_detected = test_cmd is not None
+        self._lint_detected = lint_cmd is not None
         if not test_cmd and self._unresolved_runner:
             message = f"This project declares a test suite but {self._unresolved_runner}"
             self.logger.error(f"[{self.repo_name}] {message}")

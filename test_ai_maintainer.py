@@ -1006,6 +1006,32 @@ class TestLintRunsBesideTheSuite:
         self._shell(monkeypatch)
         assert gm.Maintainer(repo_path, default_config).detect_lint_command() is None
 
+    def test_a_commented_out_ruff_table_is_not_a_declaration(self, repo_path, default_config, monkeypatch):
+        # ruff run on a project that dropped it fails over its default rules,
+        # which the project never adopted
+        (repo_path / "pyproject.toml").write_text("# [tool.ruff]\n# line-length = 120\n")
+        self._shell(monkeypatch)
+        assert gm.Maintainer(repo_path, default_config).detect_lint_command() is None
+
+    @pytest.mark.parametrize(
+        "content",
+        ['{"scripts": null}', "{not json", '{"scripts": "lint"}', "[]"],
+        ids=["null scripts", "malformed", "scripts not an object", "not an object"],
+    )
+    def test_an_unreadable_package_json_declares_nothing(self, repo_path, default_config, monkeypatch, content):
+        # package.json is untrusted input, and a lookup that raises out of
+        # run_tests would abort the repository rather than skip the linter
+        (repo_path / "package.json").write_text(content)
+        self._shell(monkeypatch)
+        maintainer = gm.Maintainer(repo_path, default_config)
+        assert maintainer.detect_lint_command() is None
+        assert maintainer.detect_test_command() is None
+
+    def test_a_package_json_that_is_not_utf8_declares_nothing(self, repo_path, default_config, monkeypatch):
+        (repo_path / "package.json").write_bytes(b'{"scripts": {"lint": "\xff\xfe"}}')
+        self._shell(monkeypatch)
+        assert gm.Maintainer(repo_path, default_config).detect_lint_command() is None
+
 
 class TestRunGit:
     """Tests for the run_git helper."""
@@ -3178,6 +3204,45 @@ class TestALintOnlyFixIsAccepted:
         maintainer.run_tests = MagicMock(return_value=(gm.TESTS_NOT_RUN, "No test command detected"))
         assert maintainer._try_fix_tests("boom") == gm.FIX_FAILED
         maintainer.git.reset_changes.assert_called_once()
+
+    def test_a_linter_that_went_missing_under_the_fix(self, repo_path, default_config):
+        # Deleting ruff.toml is not a way to make ruff pass, and the suite
+        # passing alongside it must not cover for that
+        maintainer = self._maintainer(repo_path, default_config)
+        maintainer._suite_detected = True
+        maintainer._lint_detected = True
+
+        def run_tests():
+            maintainer._lint_detected = False
+            return gm.TESTS_PASSED, "ok"
+
+        maintainer.run_tests = MagicMock(side_effect=run_tests)
+        assert maintainer._try_fix_tests("lint failed") == gm.FIX_FAILED
+        maintainer.git.reset_changes.assert_called_once()
+
+    def test_a_linter_that_survives_the_fix(self, repo_path, default_config):
+        maintainer = self._maintainer(repo_path, default_config)
+        maintainer._suite_detected = False
+        maintainer._lint_detected = True
+
+        def run_tests():
+            maintainer._lint_detected = True
+            return gm.TESTS_NOT_RUN, "No test command detected; the linter passed"
+
+        maintainer.run_tests = MagicMock(side_effect=run_tests)
+        assert maintainer._try_fix_tests("lint failed") == gm.FIX_RESOLVED
+        maintainer.git.reset_changes.assert_not_called()
+
+    def test_the_prompt_does_not_call_a_lint_failure_a_test_failure(self, repo_path, default_config):
+        # The linter runs first, so what failed is as often lint as the suite;
+        # a prompt saying "tests" sends the agent to watch the suite pass
+        maintainer = self._maintainer(repo_path, default_config)
+        maintainer._suite_detected = False
+        maintainer.run_tests = MagicMock(return_value=(gm.TESTS_NOT_RUN, "ok"))
+        maintainer._try_fix_tests("Command: npm run lint")
+        prompt = maintainer._ask_ai_to_fix.call_args[0][0]
+        assert "Tests failed" not in prompt
+        assert "verification command failed" in prompt
 
 
 class TestADeclinedFixIsNotRetried:
