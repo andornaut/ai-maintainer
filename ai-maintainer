@@ -2173,10 +2173,12 @@ class Maintainer:
             return FIX_FAILED
 
         self.logger.info(f"[{self.repo_name}] Asking AI to fix CI failure...")
+        before = self._detected_checks()
 
         outcome, changes = self._ask_ai_to_fix(
             "CI build failed. Analyze the logs, identify the build error, and fix it. "
-            "Run tests locally to verify. "
+            "Run tests locally to verify. Do NOT remove or weaken the project's test or "
+            "lint configuration. "
             f"{COMMIT_MESSAGE_INSTRUCTIONS}"
             'Return JSON: {"fixed": <bool>, "changes_made": "<desc>", "reasoning": "<why>"}',
             {"ci_logs": logs},
@@ -2189,8 +2191,12 @@ class Maintainer:
 
         # TESTS_NOT_RUN is not a rejection: CI is the thing being fixed and
         # will judge the fix. A failing or unstartable suite contradicts it.
-        if self.run_tests()[0] in (TESTS_FAILED, TESTS_BLOCKED):
-            self.logger.error(f"[{self.repo_name}] Tests still failing after fix")
+        verdict = self.run_tests()[0]
+        if self._removed_a_check(before):
+            self._reset_changes()
+            return FIX_FAILED
+        if verdict in (TESTS_FAILED, TESTS_BLOCKED):
+            self.logger.error(f"[{self.repo_name}] Verification still failing after fix")
             self._reset_changes()
             return FIX_FAILED
 
@@ -2265,6 +2271,29 @@ class Maintainer:
 
         return False
 
+    def _detected_checks(self) -> tuple[bool, bool]:
+        """Whether this project declares a test suite and a linter, right now.
+
+        Asked rather than read off _suite_detected, which describes whichever
+        run_tests ran last and may describe a different stage of the run, or
+        no run at all.
+        """
+        return self.detect_test_command() is not None, self.detect_lint_command() is not None
+
+    def _removed_a_check(self, before: tuple[bool, bool]) -> bool:
+        """Whether a fix took out a check that was there before it.
+
+        Removing what checks the code is a way of making it pass, not a pass,
+        and both fix paths commit whatever they find.
+        """
+        for what, was_there, still_there in zip(
+            ("test suite", "lint configuration"), before, (self._suite_detected, self._lint_detected), strict=True
+        ):
+            if was_there and not still_there:
+                self.logger.error(f"[{self.repo_name}] The fix removed this project's {what}")
+                return True
+        return False
+
     def _try_fix_tests(self, test_output: str) -> str:
         """Ask AI to fix a test failure and verify.
 
@@ -2279,8 +2308,7 @@ class Maintainer:
         # A project with no suite is verified by its linter alone, so "no
         # tests" is the passing answer there. Where a suite did run, the same
         # answer means it went missing under the fix, which is not a pass.
-        had_suite = self._suite_detected
-        had_lint = self._lint_detected
+        had_suite, had_lint = self._detected_checks()
 
         # The output names the command that failed, and the linter runs first,
         # so what failed here is as often lint as it is the suite. A prompt
@@ -2301,18 +2329,12 @@ class Maintainer:
 
         self.logger.info(f"[{self.repo_name}] AI fix: {changes}")
 
+        # run_tests re-detects both, so this leaves _suite_detected and
+        # _lint_detected describing the tree the fix produced
         verdict = self.run_tests()[0]
-        # Removing what checks the code is a way of making it pass, not a pass.
-        # run_tests has just re-detected both, so a check that was there before
-        # the fix and is gone after it was taken out by the fix.
-        for what, before, after in (
-            ("test suite", had_suite, self._suite_detected),
-            ("lint configuration", had_lint, self._lint_detected),
-        ):
-            if before and not after:
-                self.logger.error(f"[{self.repo_name}] The fix removed this project's {what}")
-                self._reset_changes()
-                return FIX_FAILED
+        if self._removed_a_check((had_suite, had_lint)):
+            self._reset_changes()
+            return FIX_FAILED
 
         if verdict != TESTS_PASSED and not (verdict == TESTS_NOT_RUN and not had_suite):
             self.logger.error(f"[{self.repo_name}] Verification still failing after fix")

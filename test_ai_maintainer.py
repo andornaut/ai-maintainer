@@ -3208,69 +3208,82 @@ class TestFixTestWithRetriesStash:
         maintainer.git.stash_drop.assert_called_once()
 
 
-class TestALintOnlyFixIsAccepted:
+class TestAFixMayNotRemoveWhatChecksTheCode:
     """A project with no suite is verified by its linter alone, so "no tests"
-    is the passing answer there and only there."""
+    is the passing answer there and only there. Taking a check out is never
+    one: both fix paths commit whatever they find."""
 
-    def _maintainer(self, repo_path, default_config):
-        maintainer = make_maintainer(repo_path, default_config, dry_run=False)
+    def _maintainer(self, repo_path, default_config, before, after, verdict):
+        """A maintainer whose checks go from `before` to `after` over the fix."""
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False, push_changes=True)
         maintainer.git.reset_changes = MagicMock(return_value=True)
+        # Clean when the CI fix path checks it may run, dirty afterwards, so
+        # the only thing that can stop the commit is the guard under test
+        maintainer.git.is_workdir_clean = MagicMock(side_effect=[True, *[False] * 8])
+        maintainer.commit_and_push = MagicMock(return_value=(True, True))
         maintainer._ask_ai_to_fix = MagicMock(return_value=(gm.FIX_RESOLVED, "reformatted"))
+        maintainer._detected_checks = MagicMock(return_value=before)
+
+        def run_tests():
+            maintainer._suite_detected, maintainer._lint_detected = after
+            return verdict, "output"
+
+        maintainer.run_tests = MagicMock(side_effect=run_tests)
         return maintainer
 
     def test_a_project_that_never_had_a_suite(self, repo_path, default_config):
-        maintainer = self._maintainer(repo_path, default_config)
-        maintainer._suite_detected = False
-        maintainer.run_tests = MagicMock(return_value=(gm.TESTS_NOT_RUN, "No test command detected"))
+        maintainer = self._maintainer(repo_path, default_config, (False, True), (False, True), gm.TESTS_NOT_RUN)
         assert maintainer._try_fix_tests("lint failed") == gm.FIX_RESOLVED
         maintainer.git.reset_changes.assert_not_called()
 
     def test_a_suite_that_went_missing_under_the_fix(self, repo_path, default_config):
         # Deleting the suite is not a way to make it pass
-        maintainer = self._maintainer(repo_path, default_config)
-        maintainer._suite_detected = True
-        maintainer.run_tests = MagicMock(return_value=(gm.TESTS_NOT_RUN, "No test command detected"))
+        maintainer = self._maintainer(repo_path, default_config, (True, False), (False, False), gm.TESTS_NOT_RUN)
         assert maintainer._try_fix_tests("boom") == gm.FIX_FAILED
         maintainer.git.reset_changes.assert_called_once()
 
     def test_a_linter_that_went_missing_under_the_fix(self, repo_path, default_config):
         # Deleting ruff.toml is not a way to make ruff pass, and the suite
         # passing alongside it must not cover for that
-        maintainer = self._maintainer(repo_path, default_config)
-        maintainer._suite_detected = True
-        maintainer._lint_detected = True
-
-        def run_tests():
-            maintainer._lint_detected = False
-            return gm.TESTS_PASSED, "ok"
-
-        maintainer.run_tests = MagicMock(side_effect=run_tests)
+        maintainer = self._maintainer(repo_path, default_config, (True, True), (True, False), gm.TESTS_PASSED)
         assert maintainer._try_fix_tests("lint failed") == gm.FIX_FAILED
         maintainer.git.reset_changes.assert_called_once()
 
-    def test_a_linter_that_survives_the_fix(self, repo_path, default_config):
-        maintainer = self._maintainer(repo_path, default_config)
+    def test_the_ci_fix_path_guards_the_same_way(self, repo_path, default_config):
+        # It commits and pushes whatever it finds, so it needs the same guard
+        maintainer = self._maintainer(repo_path, default_config, (True, True), (True, False), gm.TESTS_NOT_RUN)
+        assert maintainer.fix_ci_failure("boom") == gm.FIX_FAILED
+        maintainer.commit_and_push.assert_not_called()
+
+    def test_the_ci_fix_path_commits_a_fix_that_kept_them(self, repo_path, default_config):
+        maintainer = self._maintainer(repo_path, default_config, (True, True), (True, True), gm.TESTS_NOT_RUN)
+        assert maintainer.fix_ci_failure("boom") == gm.FIX_RESOLVED
+        maintainer.commit_and_push.assert_called_once()
+
+    def test_the_baseline_is_asked_for_not_read_off_an_earlier_stage(self, repo_path, default_config):
+        # _suite_detected describes whichever run_tests ran last, which in the
+        # CI fix path can be a different stage of the run or no run at all
+        maintainer = self._maintainer(repo_path, default_config, (True, True), (True, True), gm.TESTS_NOT_RUN)
         maintainer._suite_detected = False
-        maintainer._lint_detected = True
-
-        def run_tests():
-            maintainer._lint_detected = True
-            return gm.TESTS_NOT_RUN, "No test command detected; the linter passed"
-
-        maintainer.run_tests = MagicMock(side_effect=run_tests)
-        assert maintainer._try_fix_tests("lint failed") == gm.FIX_RESOLVED
-        maintainer.git.reset_changes.assert_not_called()
+        maintainer._lint_detected = False
+        maintainer.fix_ci_failure("boom")
+        maintainer._detected_checks.assert_called_once()
 
     def test_the_prompt_does_not_call_a_lint_failure_a_test_failure(self, repo_path, default_config):
         # The linter runs first, so what failed is as often lint as the suite;
         # a prompt saying "tests" sends the agent to watch the suite pass
-        maintainer = self._maintainer(repo_path, default_config)
-        maintainer._suite_detected = False
-        maintainer.run_tests = MagicMock(return_value=(gm.TESTS_NOT_RUN, "ok"))
+        maintainer = self._maintainer(repo_path, default_config, (False, True), (False, True), gm.TESTS_NOT_RUN)
         maintainer._try_fix_tests("Command: npm run lint")
         prompt = maintainer._ask_ai_to_fix.call_args[0][0]
         assert "Tests failed" not in prompt
         assert "verification command failed" in prompt
+
+    def test_both_prompts_forbid_removing_the_checks(self, repo_path, default_config):
+        maintainer = self._maintainer(repo_path, default_config, (True, True), (True, True), gm.TESTS_PASSED)
+        maintainer._try_fix_tests("boom")
+        maintainer.fix_ci_failure("boom")
+        for call in maintainer._ask_ai_to_fix.call_args_list:
+            assert "do NOT remove or weaken" in call[0][0].replace("Do NOT", "do NOT")
 
 
 class TestADeclinedFixIsNotRetried:

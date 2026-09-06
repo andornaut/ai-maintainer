@@ -118,6 +118,7 @@ Only a declaration counts, never a guess: a linter chosen for a project that did
 
 - A lint failure is a test failure. CI fails on it either way, and it is the cheapest failure for the agent to fix.
 - A linter that passes is not a suite that passed. A repository with no test command is still reported as unverified, never as passing.
+- A fix that removes the test suite or the lint configuration is rejected, in both fix paths. Taking out what checks the code is a way of making it pass, not a pass.
 - A repository whose declared test runner will not start is abandoned rather than committed to. A linter that will not start is warned about and skipped: not being able to run it is ignorance rather than a failure, and abandoning a repository whose tests pass because a linter is missing trades a working update for nothing.
 - `--repo-timeout` bounds each repository's total wall clock, CI waits included, so one repository cannot stall the rest of the run.
 
