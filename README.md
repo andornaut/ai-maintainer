@@ -51,7 +51,7 @@ Each repository is taken through these steps in order:
 | 2 | Check CI, and fix a failure left by an earlier run |
 | 3 | Merge dependabot PRs on GitHub, then pull |
 | 4 | Ask the agent to update direct dependencies |
-| 5 | Run the tests, and ask the agent to fix failures |
+| 5 | Run the linter and the tests, and ask the agent to fix failures |
 | 6 | Commit what the agent changed, and push |
 | 7 | Wait for CI, and fix a build this run broke |
 
@@ -106,8 +106,19 @@ Step 6 pushes any unpushed commit on the branch, not only its own, so a dependab
 
 ### Verification
 
-- A repository with no detectable test command is reported as unverified, never as passing.
-- A repository whose declared test runner will not start is abandoned rather than committed to.
+Step 5 runs the project's linter and then its test suite. Lint goes first: it is the faster of the two and the more likely to break under a dependency update, so failing there spares the suite's wall clock and hands the agent the smaller failure.
+
+| Manifest | Linted with |
+| --- | --- |
+| `package.json` with a `lint` script | `npm run lint` |
+| `.rubocop.yml` with rubocop in `Gemfile.lock` | `bundle exec rubocop` |
+| `ruff.toml`, `.ruff.toml` or `[tool.ruff]` | `ruff check .` |
+
+Only a declaration counts, never a guess: a linter chosen for a project that did not ask for one would fail the run over a style the project never adopted.
+
+- A lint failure is a test failure. CI fails on it either way, and it is the cheapest failure for the agent to fix.
+- A linter that passes is not a suite that passed. A repository with no test command is still reported as unverified, never as passing.
+- A repository whose declared test runner will not start is abandoned rather than committed to. A linter that will not start is warned about and skipped: not being able to run it is ignorance rather than a failure, and abandoning a repository whose tests pass because a linter is missing trades a working update for nothing.
 - `--repo-timeout` bounds each repository's total wall clock, CI waits included, so one repository cannot stall the rest of the run.
 
 ### CI verdicts

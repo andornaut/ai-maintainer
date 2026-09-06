@@ -1747,8 +1747,12 @@ class Maintainer:
         # _pypi_releases. Reading one answers both what is newest and when it
         # was published, so the second question must not fetch it again
         self._pypi_feeds: dict[str, list[tuple[str, datetime]] | None] = {}
-        # Why a declared test runner would not resolve; see run_tests
+        # Why a declared test or lint runner would not resolve; see run_tests
         self._unresolved_runner: str | None = None
+        # Whether the last run_tests found a test command. A repository that
+        # never had a suite is verified by its linter alone, and _try_fix_tests
+        # has to tell that apart from a suite that went missing under a fix
+        self._suite_detected = False
         # Wall-clock ceiling for this repository; see _start_deadline
         self._deadline: float | None = None
 
@@ -1919,6 +1923,56 @@ class Maintainer:
             except (OSError, UnicodeDecodeError):
                 pass
         return False
+
+    def _has_ruff_config(self) -> bool:
+        """Whether the project configures ruff, whichever file it uses."""
+        if (self.repo_path / "ruff.toml").exists() or (self.repo_path / ".ruff.toml").exists():
+            return True
+        path = self.repo_path / "pyproject.toml"
+        try:
+            return path.exists() and "[tool.ruff" in path.read_text()
+        except (OSError, UnicodeDecodeError):
+            return False
+
+    def detect_lint_command(self) -> str | None:
+        """How to run this project's linter, if it declares one.
+
+        Only a declaration counts, never a guess. A linter this tool chose for
+        a project that did not ask for one would fail the run over a style the
+        project never adopted, and there would be nothing to fix.
+
+        A linter that will not resolve is warned about and skipped, never
+        TESTS_BLOCKED. Not being able to run it is ignorance, not a failure,
+        and the suite it runs beside is usually fine: abandoning a repository
+        whose tests pass because a linter is missing trades a working update
+        for nothing. A declared suite is the opposite, and stays blocking.
+        """
+        unresolved_before = self._unresolved_runner
+        command = self._lint_command()
+        if not command and self._unresolved_runner != unresolved_before:
+            self.logger.warning(f"[{self.repo_name}] Skipping this project's linter: {self._unresolved_runner}")
+            self._unresolved_runner = unresolved_before
+        return command
+
+    def _lint_command(self) -> str | None:
+        """The linter each declaration calls for, or None when none matches."""
+        p = self.repo_path
+
+        if (p / "package.json").exists():
+            try:
+                pkg = safe_json_parse((p / "package.json").read_text(), default={})
+                if pkg.get("scripts", {}).get("lint"):
+                    return self._test_command("npm", "run lint")
+            except OSError:
+                pass
+
+        if (p / ".rubocop.yml").exists() or (p / ".rubocop.yaml").exists():
+            return self._ruby_test_command("rubocop")
+
+        if self._has_ruff_config():
+            return self._test_command("ruff", "check .")
+
+        return None
 
     def _test_command(self, tool: str, args: str = "", declared: bool = True) -> str | None:
         """The command for a test runner, if that runner resolves here.
@@ -2196,6 +2250,11 @@ class Maintainer:
         """
         self.logger.info(f"[{self.repo_name}] Asking AI to fix test failure...")
 
+        # A project with no suite is verified by its linter alone, so "no
+        # tests" is the passing answer there. Where a suite did run, the same
+        # answer means it went missing under the fix, which is not a pass.
+        had_suite = self._suite_detected
+
         outcome, changes = self._ask_ai_to_fix(
             "Tests failed after updating dependencies. Analyze the output, identify the error, "
             "and fix the code (do NOT revert dependencies). Run tests to verify. "
@@ -2209,7 +2268,8 @@ class Maintainer:
 
         self.logger.info(f"[{self.repo_name}] AI fix: {changes}")
 
-        if self.run_tests()[0] != TESTS_PASSED:
+        verdict = self.run_tests()[0]
+        if verdict != TESTS_PASSED and not (verdict == TESTS_NOT_RUN and not had_suite):
             self.logger.error(f"[{self.repo_name}] Tests still failing after fix")
             self._reset_changes()
             return FIX_FAILED
@@ -2719,37 +2779,60 @@ class Maintainer:
         return self._merge_prs_on_github(safe_prs)
 
     def run_tests(self) -> TestResult:
-        """Run tests if available.
+        """Run the project's linter, then its test suite.
 
         Returns (TESTS_* value, output). TESTS_NOT_RUN is distinct from
         TESTS_PASSED: nothing was verified, and callers about to commit on the
         strength of a test run need to be able to tell the two apart.
         TESTS_BLOCKED is distinct from both: a suite exists and could not be
         started, which is a repository to abandon rather than commit to.
+
+        A declared linter runs whether or not a suite exists, and its failure
+        is TESTS_FAILED like any other: CI fails on it either way, and it is
+        the cheapest failure for the agent to fix. A linter that passes is not
+        a suite that passed, though, so a project with no tests still reports
+        TESTS_NOT_RUN and is never committed to as verified. A linter that
+        will not resolve is skipped rather than blocking; see
+        detect_lint_command.
+
+        Lint runs first. It is the faster of the two and the more likely to
+        break under a dependency update, so failing there spares the suite's
+        wall clock and hands the agent the smaller failure.
         """
         if not self.config.run_tests:
+            self._suite_detected = False
             return TESTS_NOT_RUN, "Tests skipped (disabled in config)"
 
         self._unresolved_runner = None
+        lint_cmd = self.detect_lint_command()
         test_cmd = self.detect_test_command()
+        self._suite_detected = test_cmd is not None
+        if not test_cmd and self._unresolved_runner:
+            message = f"This project declares a test suite but {self._unresolved_runner}"
+            self.logger.error(f"[{self.repo_name}] {message}")
+            return TESTS_BLOCKED, message
+
+        outputs = []
+        for label, command in (("Lint", lint_cmd), ("Tests", test_cmd)):
+            if not command:
+                continue
+            self.logger.debug(f"[{self.repo_name}] Running {label.lower()}: {command}")
+            # Always run through a shell: env runner prefixes use shell syntax
+            success, stdout, stderr = run_shell_command(
+                command, self.repo_path, timeout=self.config.test_timeout_seconds
+            )
+            outputs.append(f"Command: {command}\n\nSTDOUT:\n{stdout}\n\nSTDERR:\n{stderr}")
+            if not success:
+                self.logger.error(f"[{self.repo_name}] {label} failed: {command}")
+                return TESTS_FAILED, "\n\n".join(outputs)
+
         if not test_cmd:
-            if self._unresolved_runner:
-                message = f"This project declares a test suite but {self._unresolved_runner}"
-                self.logger.error(f"[{self.repo_name}] {message}")
-                return TESTS_BLOCKED, message
             self.logger.debug(f"[{self.repo_name}] No test command detected")
-            return TESTS_NOT_RUN, "No test command detected"
+            passed = "; the linter passed" if lint_cmd else ""
+            return TESTS_NOT_RUN, f"No test command detected{passed}"
 
-        self.logger.debug(f"[{self.repo_name}] Running tests: {test_cmd}")
-        # Always run through a shell: env runner prefixes use shell syntax
-        success, stdout, stderr = run_shell_command(test_cmd, self.repo_path, timeout=self.config.test_timeout_seconds)
-        output = f"Command: {test_cmd}\n\nSTDOUT:\n{stdout}\n\nSTDERR:\n{stderr}"
-
-        if success:
-            self.logger.debug(f"[{self.repo_name}] Tests passed")
-            return TESTS_PASSED, output
-        self.logger.error(f"[{self.repo_name}] Tests failed: {test_cmd}")
-        return TESTS_FAILED, output
+        self.logger.debug(f"[{self.repo_name}] Tests passed")
+        return TESTS_PASSED, "\n\n".join(outputs)
 
     def _quiet_env_prefix(self) -> str:
         """The toolchain activation prefix, with the prefix's own output discarded.

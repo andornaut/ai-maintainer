@@ -911,6 +911,102 @@ class TestCommitAndPushEnvRunner:
         assert commit_calls == [["git", "commit", "-m", "fix: bump deps"]]
 
 
+class TestLintRunsBesideTheSuite:
+    """A declared linter runs whether or not a suite exists. Its failure is a
+    failure, but its passing is not a suite that passed."""
+
+    def _shell(self, monkeypatch, failing=()):
+        """Resolve every runner, and fail the commands naming a marker."""
+        calls = []
+
+        def fake(cmd, cwd, *a, **k):
+            calls.append(cmd)
+            if cmd.startswith("which "):
+                return True, "", ""
+            return not any(marker in cmd for marker in failing), "output", ""
+
+        monkeypatch.setattr(gm, "run_shell_command", fake)
+        return calls
+
+    def test_a_lint_only_project_is_still_unverified(self, repo_path, default_config, monkeypatch):
+        # The linter is not a suite. Reporting a pass here would commit code
+        # that nothing tested
+        (repo_path / "package.json").write_text('{"scripts": {"lint": "prettier --check ."}}')
+        self._shell(monkeypatch)
+        verdict, output = gm.Maintainer(repo_path, default_config).run_tests()
+        assert verdict == gm.TESTS_NOT_RUN
+        assert "the linter passed" in output
+
+    def test_a_lint_failure_fails_the_run(self, repo_path, default_config, monkeypatch):
+        (repo_path / "package.json").write_text('{"scripts": {"lint": "prettier --check ."}}')
+        self._shell(monkeypatch, failing=("run lint",))
+        verdict, _ = gm.Maintainer(repo_path, default_config).run_tests()
+        assert verdict == gm.TESTS_FAILED
+
+    def test_lint_runs_before_the_suite(self, repo_path, default_config, monkeypatch):
+        # The faster of the two, so failing there spares the suite's wall clock
+        (repo_path / "package.json").write_text('{"scripts": {"lint": "eslint .", "test": "jest"}}')
+        calls = self._shell(monkeypatch, failing=("run lint",))
+        assert gm.Maintainer(repo_path, default_config).run_tests()[0] == gm.TESTS_FAILED
+        assert [c for c in calls if not c.startswith("which ")] == ["npm run lint"]
+
+    def test_both_run_when_lint_passes(self, repo_path, default_config, monkeypatch):
+        (repo_path / "package.json").write_text('{"scripts": {"lint": "eslint .", "test": "jest"}}')
+        calls = self._shell(monkeypatch)
+        assert gm.Maintainer(repo_path, default_config).run_tests()[0] == gm.TESTS_PASSED
+        assert [c for c in calls if not c.startswith("which ")] == ["npm run lint", "npm test"]
+
+    def test_a_linter_that_will_not_resolve_is_skipped_not_blocking(self, repo_path, default_config, monkeypatch):
+        # Abandoning a repository whose tests pass because a linter is not
+        # installed trades a working update for nothing
+        (repo_path / "ruff.toml").write_text("\n")
+        monkeypatch.setattr(gm, "run_shell_command", lambda *a, **k: (False, "", "not found"))
+        maintainer = gm.Maintainer(repo_path, default_config)
+        verdict, _ = maintainer.run_tests()
+        assert verdict == gm.TESTS_NOT_RUN
+        assert maintainer._unresolved_runner is None
+
+    def test_a_declared_suite_still_blocks_beside_an_unresolved_linter(self, repo_path, default_config, monkeypatch):
+        # The linter's own failure to resolve must not be mistaken for the
+        # suite's, nor mask it
+        (repo_path / "ruff.toml").write_text("\n")
+        (repo_path / "pytest.ini").write_text("[pytest]\n")
+        monkeypatch.setattr(gm, "run_shell_command", lambda *a, **k: (False, "", "not found"))
+        verdict, output = gm.Maintainer(repo_path, default_config).run_tests()
+        assert verdict == gm.TESTS_BLOCKED
+        assert "declares a test suite" in output
+        assert "pytest" in output
+
+    def test_rubocop_goes_through_the_bundle(self, repo_path, default_config, monkeypatch):
+        (repo_path / ".rubocop.yml").write_text("\n")
+        (repo_path / "Gemfile").write_text("\n")
+        (repo_path / "Gemfile.lock").write_text("    rubocop (1.90.0)\n")
+        self._shell(monkeypatch)
+        assert gm.Maintainer(repo_path, default_config).detect_lint_command() == "bundle exec rubocop"
+
+    def test_rubocop_the_bundle_does_not_carry_is_not_run(self, repo_path, default_config, monkeypatch):
+        # A bare rubocop would exit non-zero exactly like a failing lint
+        (repo_path / ".rubocop.yml").write_text("\n")
+        (repo_path / "Gemfile").write_text("\n")
+        (repo_path / "Gemfile.lock").write_text("    rake (13.0.0)\n")
+        self._shell(monkeypatch)
+        assert gm.Maintainer(repo_path, default_config).detect_lint_command() is None
+
+    @pytest.mark.parametrize(
+        ("name", "content"),
+        [("ruff.toml", "line-length = 120\n"), (".ruff.toml", "\n"), ("pyproject.toml", "[tool.ruff]\n")],
+    )
+    def test_ruff_is_found_wherever_it_is_configured(self, repo_path, default_config, monkeypatch, name, content):
+        (repo_path / name).write_text(content)
+        self._shell(monkeypatch)
+        assert gm.Maintainer(repo_path, default_config).detect_lint_command() == "ruff check ."
+
+    def test_a_project_declaring_no_linter_runs_none(self, repo_path, default_config, monkeypatch):
+        (repo_path / "package.json").write_text('{"scripts": {"test": "jest"}}')
+        self._shell(monkeypatch)
+        assert gm.Maintainer(repo_path, default_config).detect_lint_command() is None
+
+
 class TestRunGit:
     """Tests for the run_git helper."""
 
@@ -3056,6 +3152,32 @@ class TestFixTestWithRetriesStash:
         assert maintainer.fix_test_with_retries("boom") is True
         maintainer.git.stash_apply.assert_called_once()
         maintainer.git.stash_drop.assert_called_once()
+
+
+class TestALintOnlyFixIsAccepted:
+    """A project with no suite is verified by its linter alone, so "no tests"
+    is the passing answer there and only there."""
+
+    def _maintainer(self, repo_path, default_config):
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False)
+        maintainer.git.reset_changes = MagicMock(return_value=True)
+        maintainer._ask_ai_to_fix = MagicMock(return_value=(gm.FIX_RESOLVED, "reformatted"))
+        return maintainer
+
+    def test_a_project_that_never_had_a_suite(self, repo_path, default_config):
+        maintainer = self._maintainer(repo_path, default_config)
+        maintainer._suite_detected = False
+        maintainer.run_tests = MagicMock(return_value=(gm.TESTS_NOT_RUN, "No test command detected"))
+        assert maintainer._try_fix_tests("lint failed") == gm.FIX_RESOLVED
+        maintainer.git.reset_changes.assert_not_called()
+
+    def test_a_suite_that_went_missing_under_the_fix(self, repo_path, default_config):
+        # Deleting the suite is not a way to make it pass
+        maintainer = self._maintainer(repo_path, default_config)
+        maintainer._suite_detected = True
+        maintainer.run_tests = MagicMock(return_value=(gm.TESTS_NOT_RUN, "No test command detected"))
+        assert maintainer._try_fix_tests("boom") == gm.FIX_FAILED
+        maintainer.git.reset_changes.assert_called_once()
 
 
 class TestADeclinedFixIsNotRetried:
