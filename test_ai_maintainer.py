@@ -203,6 +203,30 @@ class TestProjectEnvironment:
             'export PATH="/usr/local/go/bin:$HOME/go/bin:$PATH" && source .venv/bin/activate &&'
         )
 
+    def test_every_declared_toolchain_is_activated(self, tmp_path, monkeypatch):
+        # A Go repo with an .nvmrc for its tooling needs both: the first
+        # toolchain found must not displace the rest, or `go` never resolves
+        # wherever it is not already on PATH
+        (tmp_path / ".nvmrc").write_text("18.0.0")
+        (tmp_path / "go.mod").write_text("module example.com/foo\n")
+        monkeypatch.setattr(gm.shutil, "which", lambda name: None)
+        nvm_sh = Path("~/.nvm/nvm.sh").expanduser()
+        self._installed(monkeypatch, tmp_path, nvm_sh, Path("/usr/local/go/bin/go"))
+        assert gm.ProjectEnvironment(tmp_path).env_runner == (
+            f'source {shlex.quote(str(nvm_sh))} && nvm use && export PATH="/usr/local/go/bin:$HOME/go/bin:$PATH" &&'
+        )
+
+    def test_a_python_manager_closes_the_chain(self, tmp_path, monkeypatch):
+        # `poetry run` prepends a command rather than ending in `&&`, so it
+        # can only come last; the toolchains ahead of it still chain
+        (tmp_path / "go.mod").write_text("module example.com/foo\n")
+        (tmp_path / "poetry.lock").write_text("")
+        monkeypatch.setattr(gm.shutil, "which", lambda name: None)
+        self._installed(monkeypatch, tmp_path, Path("/usr/local/go/bin/go"))
+        assert gm.ProjectEnvironment(tmp_path).env_runner == (
+            'export PATH="/usr/local/go/bin:$HOME/go/bin:$PATH" && poetry run'
+        )
+
     def test_venv_is_used_when_the_toolchain_needs_no_activation(self, tmp_path, monkeypatch):
         # A maturin-style repo: Cargo.toml plus a venv the Python tests need.
         # cargo is already on PATH, so _detect_cargo_runner has nothing to
@@ -779,9 +803,19 @@ class TestDetectTestCommand:
             lambda cmd, *a, **k: (probes.append(cmd), (True, "", ""))[1],
         )
         maintainer = gm.Maintainer(repo_path, default_config)
-        assert maintainer.detect_test_command() == "bundle exec rspec"
+        assert maintainer.detect_test_command() == f"{gm.BUNDLE_INSTALL_COMMAND} && bundle exec rspec"
         # Bundler is what has to resolve; rspec need not exist outside the bundle
         assert probes == ["which bundle"]
+
+    def test_the_bundle_is_installed_from_the_lockfile_first(self, repo_path, default_config):
+        # A pull that moved Gemfile.lock leaves the installed gems behind it,
+        # and `bundle exec` then refuses to start, which reads as a failing
+        # suite. Frozen, so the install can match the lockfile but never
+        # rewrite it: a rewritten lockfile would be committed as this run's own
+        (repo_path / "Gemfile").write_text("source 'https://rubygems.org'\n")
+        (repo_path / "spec").mkdir()
+        command = gm.Maintainer(repo_path, default_config).detect_test_command()
+        assert command == "BUNDLE_FROZEN=true bundle install --quiet && bundle exec rspec"
 
     def test_a_runner_the_lockfile_does_not_carry_is_unresolved(self, repo_path, default_config):
         # Resolving bundler leaves the runner unchecked: `bundle exec rspec`
@@ -799,7 +833,7 @@ class TestDetectTestCommand:
         (repo_path / "Gemfile.lock").write_text("GEM\n  specs:\n    rspec (3.13.0)\n")
         (repo_path / "spec").mkdir()
         maintainer = gm.Maintainer(repo_path, default_config)
-        assert maintainer.detect_test_command() == "bundle exec rspec"
+        assert maintainer.detect_test_command().endswith("bundle exec rspec")
 
     def test_no_lockfile_is_not_an_absent_runner(self, repo_path, default_config):
         # "We could not ask" is not "there is nothing": a project with no
@@ -807,7 +841,7 @@ class TestDetectTestCommand:
         (repo_path / "Gemfile").write_text("source 'https://rubygems.org'\n")
         (repo_path / "spec").mkdir()
         maintainer = gm.Maintainer(repo_path, default_config)
-        assert maintainer.detect_test_command() == "bundle exec rspec"
+        assert maintainer.detect_test_command().endswith("bundle exec rspec")
 
     def test_ruby_without_a_gemfile_runs_the_runner_directly(self, repo_path, default_config):
         # No Gemfile is no bundle, and `bundle exec` would fail outright
@@ -983,7 +1017,9 @@ class TestLintRunsBesideTheSuite:
         (repo_path / "Gemfile").write_text("\n")
         (repo_path / "Gemfile.lock").write_text("    rubocop (1.90.0)\n")
         self._shell(monkeypatch)
-        assert gm.Maintainer(repo_path, default_config).detect_lint_command() == "bundle exec rubocop"
+        assert gm.Maintainer(repo_path, default_config).detect_lint_command() == (
+            f"{gm.BUNDLE_INSTALL_COMMAND} && bundle exec rubocop"
+        )
 
     def test_rubocop_the_bundle_does_not_carry_is_not_run(self, repo_path, default_config, monkeypatch):
         # A bare rubocop would exit non-zero exactly like a failing lint
@@ -2219,6 +2255,9 @@ class TestPypiReleases:
     def test_the_report_names_the_requirements_file(self, repo_path, default_config, monkeypatch):
         maintainer, _ = self._maintainer(repo_path, default_config, monkeypatch)
         (repo_path / "requirements-dev.txt").write_text("ruff==0.16.3\n")
+        # Dated against the clock rather than by the feed's fixed date, which
+        # the 30 day limit would otherwise pass once the suite is old enough
+        maintainer._release_date = MagicMock(return_value=datetime.now(UTC) - timedelta(days=3))
         monkeypatch.setattr(gm, "run_shell_command", lambda cmd, cwd, timeout=None: (True, "", ""))
         report = maintainer._outdated_report(["requirements-dev.txt"])
         assert report.answered == ["requirements-dev.txt"]

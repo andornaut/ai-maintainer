@@ -63,7 +63,7 @@ A repository with no dependency files is not skipped. Its tests still run and it
 
 ### Toolchain activation
 
-Each project's toolchain is detected and activated before tests and git operations, so hooks such as husky `pre-commit` use the project's runtime rather than the ambient PATH. The same activation prefix is given to the agent, so its package-manager commands resolve the same runtime.
+Each project's toolchain is detected and activated before tests and git operations, so hooks such as husky `pre-commit` use the project's runtime rather than the ambient PATH. The same activation prefix is given to the agent, so its package-manager commands resolve the same runtime. A project that declares more than one toolchain (a Go module with an `.nvmrc` for its tooling) has every one of them activated.
 
 | Language | Detected from | Activated with |
 | --- | --- | --- |
@@ -113,6 +113,8 @@ Step 5 runs the project's linter and then its test suite. Lint goes first: it is
 | `package.json` with a `lint` script | `npm run lint` |
 | `.rubocop.yml` or `.rubocop.yaml` | `bundle exec rubocop`, or a bare `rubocop` where there is no `Gemfile` |
 | `ruff.toml`, `.ruff.toml` or `[tool.ruff]` | `ruff check .` |
+
+A `Gemfile` project first installs the bundle from its lockfile (`BUNDLE_FROZEN=true bundle install`), because a pull that moved `Gemfile.lock` leaves the installed gems behind it and `bundle exec` then refuses to start. Frozen, the install can match the lockfile but never rewrite it.
 
 Only a declaration counts, never a guess: a linter chosen for a project that did not ask for one would fail the run over a style the project never adopted. A declaration whose runner does not resolve falls through to the next, so a repository declaring two linters is linted by whichever of them is runnable.
 

@@ -186,6 +186,10 @@ UNWRITABLE_REASONS = ("archived", "read-only", "permission")
 # must not hold back a commit whose other jobs passed.
 PASSING_CHECK_CONCLUSIONS = ("success", "neutral", "skipped")
 
+# Installs the gems Gemfile.lock names and nothing else: frozen refuses a
+# lockfile change, and a bundle that already matches is left alone.
+BUNDLE_INSTALL_COMMAND = "BUNDLE_FROZEN=true bundle install --quiet"
+
 # Polls a commit's set of checks must be unchanged for, counted from when its
 # verdict first became terminal, before a non-failing verdict is accepted;
 # see wait_for_ci
@@ -475,38 +479,37 @@ class ProjectEnvironment:
         self._detect()
 
     def _detect(self):
-        """Detect project type and configure environment."""
-        toolchain = self._detect_toolchain_runner()
-        venv = self._detect_venv_runner()
-        # One repo can need both (maturin ships a Cargo.toml beside a venv; a
-        # Go repo may keep one for pre-commit), so the two compose rather than
-        # one displacing the other. Only a prefix ending in `&&` can be chained
-        # onto: `pipenv run`/`poetry run` prepend a command instead, and they
-        # manage their own virtualenv, so there is nothing to compose there.
-        if toolchain and venv and toolchain.endswith("&&"):
-            self._env_runner = f"{toolchain} {venv}"
-        else:
-            self._env_runner = toolchain or venv
+        """Detect project type and configure environment.
 
-    def _detect_toolchain_runner(self) -> str | None:
-        """Detect the version manager or toolchain PATH for the project type."""
+        One repo can declare several toolchains (a Go repo with an `.nvmrc`
+        for its tooling, maturin's Cargo.toml beside a venv), and each of them
+        has to be activated, so every prefix the repo declares is chained
+        rather than the first one found displacing the rest. Only a prefix
+        ending in `&&` can be chained onto: `pipenv run`/`poetry run` prepend
+        a command instead, so a Python manager closes the chain, and it
+        manages its own virtualenv, so a venv is used only without one.
+        """
+        toolchains = self._detect_toolchain_runners()
+        python = self._detect_python_runner() or self._detect_venv_runner()
+        if python:
+            toolchains.append(python)
+        self._env_runner = " ".join(toolchains) or None
+
+    def _detect_toolchain_runners(self) -> list[str]:
+        """Every version manager or toolchain PATH the project declares, in
+        the order they are chained. Each ends in `&&`."""
         p = self.repo_path
-        # Node.js projects (.nvmrc)
-        if (p / ".nvmrc").exists():
-            return self._detect_node_runner()
-        # Ruby projects (Gemfile or .ruby-version)
-        if (p / "Gemfile").exists() or (p / ".ruby-version").exists():
-            return self._detect_ruby_runner()
-        # Python projects (pipenv or poetry)
-        if (p / "Pipfile").exists() or (p / "poetry.lock").exists():
-            return self._detect_python_runner()
-        # Go projects (go.mod)
-        if (p / "go.mod").exists():
-            return self._detect_go_runner()
-        # Rust projects (Cargo.toml)
-        if (p / "Cargo.toml").exists():
-            return self._detect_cargo_runner()
-        return None
+        runners = [
+            # Node.js projects (.nvmrc)
+            self._detect_node_runner() if (p / ".nvmrc").exists() else None,
+            # Ruby projects (Gemfile or .ruby-version)
+            self._detect_ruby_runner() if (p / "Gemfile").exists() or (p / ".ruby-version").exists() else None,
+            # Go projects (go.mod)
+            self._detect_go_runner() if (p / "go.mod").exists() else None,
+            # Rust projects (Cargo.toml)
+            self._detect_cargo_runner() if (p / "Cargo.toml").exists() else None,
+        ]
+        return [runner for runner in runners if runner]
 
     def _detect_node_runner(self) -> str | None:
         """Detect Node.js version manager (nvm or fnm)."""
@@ -530,8 +533,8 @@ class ProjectEnvironment:
     def _detect_python_runner(self) -> str | None:
         """Detect the Python dependency manager (pipenv or poetry).
 
-        A bare virtualenv is handled by _detect's fall-through, not here, so
-        pipenv and poetry (which manage their own virtualenv) take precedence.
+        A bare virtualenv is handled by _detect, not here, so pipenv and
+        poetry (which manage their own virtualenv) take precedence.
         """
         p = self.repo_path
 
@@ -2006,8 +2009,11 @@ class Maintainer:
                 return command
         return None
 
-    def _test_command(self, tool: str, args: str = "", declared: bool = True) -> str | None:
+    def _test_command(self, tool: str, args: str = "", declared: bool = True, setup: str = "") -> str | None:
         """The command for a test runner, if that runner resolves here.
+
+        setup is a command run ahead of the runner, inside the same
+        environment, on every invocation.
 
         A runner that is not installed exits non-zero exactly like a failing
         suite, which would send the AI fix loop after a suite that never ran.
@@ -2044,6 +2050,8 @@ class Maintainer:
                     f"'{tool}' could not be resolved in this project's environment{toolchain}{detail}"
                 )
             return None
+        if setup:
+            prefix = f"{prefix}{setup} && "
         return f"{prefix}{tool} {args}".rstrip()
 
     def _ruby_test_command(self, tool: str, args: str = "") -> str | None:
@@ -2063,6 +2071,14 @@ class Maintainer:
         answers for it: a `spec` directory whose Gemfile never asked for rspec
         would otherwise reach `bundle exec rspec` and exit like a failing
         suite, which is what sends the fix loop after a suite that never ran.
+
+        The bundle is installed from the lockfile before the runner runs. A
+        pull that moved Gemfile.lock (a merged dependabot PR) leaves the
+        installed gems behind it, and `bundle exec` then refuses to start
+        rather than run against the wrong versions, which reads as a failing
+        lint and sends the agent to run `bundle install`. Frozen, so the
+        install can only ever match the lockfile, never rewrite it: a
+        rewritten lockfile would be staged as this run's own change.
         """
         if not (self.repo_path / "Gemfile").exists():
             return self._test_command(tool, args)
@@ -2071,7 +2087,7 @@ class Maintainer:
             self.logger.debug(f"[{self.repo_name}] {detail}")
             self._unresolved_runner = detail
             return None
-        return self._test_command("bundle", f"exec {tool} {args}".rstrip())
+        return self._test_command("bundle", f"exec {tool} {args}".rstrip(), setup=BUNDLE_INSTALL_COMMAND)
 
     def _bundle_resolves(self, gem: str) -> bool | None:
         """Whether Gemfile.lock resolves `gem`, or None when it cannot say.
