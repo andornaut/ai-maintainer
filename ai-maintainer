@@ -2571,11 +2571,11 @@ class Maintainer:
                         "but push is disabled so a fix cannot be delivered; continuing"
                     )
                     return True, False
-                self.logger.warning(
+                self.logger.info(
                     f"[{self.repo_name}] CI is failing from a previous ai-maintainer run, will attempt to fix"
                 )
                 if self.fix_ci_with_retries():
-                    self.logger.info(f"[{self.repo_name}] Previous CI failure fixed")
+                    self.logger.warning(f"[{self.repo_name}] Previous CI failure fixed by AI")
                     return True, True
                 self.logger.warning(f"[{self.repo_name}] Could not fix previous CI failure, skipping repo")
                 return False, False
@@ -2647,10 +2647,11 @@ class Maintainer:
             return True
 
         # We broke CI - try to fix it
-        self.logger.warning(f"[{self.repo_name}] CI failed after push{ci_url_suffix}, attempting to fix...")
+        # Progress at INFO, outcome at WARNING, so the event counts once.
+        self.logger.info(f"[{self.repo_name}] CI failed after push{ci_url_suffix}, attempting to fix...")
         if self.fix_ci_with_retries():
             ci_url_suffix = self._ci_url_suffix("success", head_sha)
-            self.logger.info(f"[{self.repo_name}] CI failure fixed{ci_url_suffix}")
+            self.logger.warning(f"[{self.repo_name}] CI failure fixed by AI{ci_url_suffix}")
             return True
 
         # Nothing this run pushed is undone: rewriting the branch would force
@@ -2786,9 +2787,9 @@ class Maintainer:
                 log = self.logger.info if not self.config.run_tests else self.logger.warning
                 log(f"[{self.repo_name}] Changes not verified: {test_output}")
             elif tests_status == TESTS_FAILED:
-                self.logger.warning(f"[{self.repo_name}] Verification failed, asking AI to fix...")
+                self.logger.info(f"[{self.repo_name}] Verification failed, asking AI to fix...")
                 if self.fix_test_with_retries(test_output):
-                    self.logger.info(f"[{self.repo_name}] Tests fixed by AI")
+                    self.logger.warning(f"[{self.repo_name}] Tests fixed by AI")
                 else:
                     self.logger.warning(f"[{self.repo_name}] Could not fix test failures, not committing changes")
                     self._reset_changes()
@@ -2907,7 +2908,8 @@ class Maintainer:
             success, stdout, stderr = run_shell_command(command, self.repo_path, timeout=timeout)
             outputs.append(f"Command: {command}\n\nSTDOUT:\n{stdout}\n\nSTDERR:\n{stderr}")
             if not success:
-                self.logger.warning(f"[{self.repo_name}] {label} failed: {command}")
+                # The caller warns with the outcome: fixed, or not committed.
+                self.logger.info(f"[{self.repo_name}] {label} failed: {command}")
                 return TESTS_FAILED, "\n\n".join(outputs)
 
         if not test_cmd:

@@ -983,11 +983,15 @@ class TestLintRunsBesideTheSuite:
         assert verdict == gm.TESTS_NOT_RUN
         assert "the linter passed" in output
 
-    def test_a_lint_failure_fails_the_run(self, repo_path, default_config, monkeypatch):
+    def test_a_lint_failure_fails_the_run(self, repo_path, default_config, monkeypatch, caplog):
         (repo_path / "package.json").write_text('{"scripts": {"lint": "prettier --check ."}}')
         self._shell(monkeypatch, failing=("run lint",))
-        verdict, _ = gm.Maintainer(repo_path, default_config).run_tests()
+        with caplog.at_level(logging.INFO):
+            verdict, _ = gm.Maintainer(repo_path, default_config).run_tests()
         assert verdict == gm.TESTS_FAILED
+        # The caller reports the outcome, so a failure the agent fixes is not a warning
+        assert "Lint failed" in caplog.text
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
     def test_lint_runs_before_the_suite(self, repo_path, default_config, monkeypatch):
         # The faster of the two, so failing there spares the suite's wall clock
@@ -2570,6 +2574,20 @@ class TestMaintainMergedPrCiMonitoring:
         status, _ = maintainer.maintain()
         assert status == gm.STATUS_FAILED
         maintainer._handle_post_push_ci.assert_called_once_with(True, "base123")
+
+    def test_a_failure_the_agent_fixes_is_one_warning(self, repo_path, default_config, caplog):
+        # The failure is progress; the pushed agent fix is the outcome to report
+        maintainer = self._maintainer(repo_path, default_config)
+        maintainer.update_dependencies = MagicMock(return_value=(True, True))
+        maintainer.run_tests = MagicMock(return_value=(gm.TESTS_FAILED, "boom"))
+        maintainer.fix_test_with_retries = MagicMock(return_value=True)
+        maintainer.commit_and_push = MagicMock(return_value=(True, True))
+        maintainer._handle_post_push_ci = MagicMock(return_value=True)
+        with caplog.at_level(logging.INFO):
+            status, _ = maintainer.maintain()
+        assert status == gm.STATUS_SUCCESS
+        warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings == [f"[{repo_path.name}] Tests fixed by AI"]
 
     def test_failed_dependency_update_still_monitors_ci(self, repo_path, default_config):
         maintainer = self._maintainer(repo_path, default_config)
