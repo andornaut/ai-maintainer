@@ -1898,7 +1898,7 @@ class Maintainer:
             self.logger.error(f"[{self.repo_name}] Command failed: git push\n{stderr}")
             if committed and pre_commit_sha:
                 # Undo all unpushed commits since we couldn't push them
-                self.logger.warning(f"[{self.repo_name}] Undoing commits since push failed")
+                self.logger.info(f"[{self.repo_name}] Undoing commits since push failed")
                 reset_success, _, reset_stderr = self.git.reset_hard(pre_commit_sha)
                 if not reset_success:
                     self.logger.error(f"[{self.repo_name}] Failed to undo commits after push failure\n{reset_stderr}")
@@ -2283,7 +2283,7 @@ class Maintainer:
             if ci_status != "failure":
                 self.logger.error(f"[{self.repo_name}] Could not determine CI status")
                 return False
-            self.logger.warning(f"[{self.repo_name}] CI still failing after attempt {attempt}")
+            self.logger.info(f"[{self.repo_name}] CI still failing after attempt {attempt}")
 
         return False
 
@@ -2650,7 +2650,7 @@ class Maintainer:
             return True
 
         # We broke CI - try to fix it
-        self.logger.warning(f"[{self.repo_name}] CI failed after push{ci_url_suffix}, attempting to fix...")
+        self.logger.info(f"[{self.repo_name}] CI failed after push{ci_url_suffix}, attempting to fix...")
         if self.fix_ci_with_retries():
             ci_url_suffix = self._ci_url_suffix("success", head_sha)
             self.logger.info(f"[{self.repo_name}] CI failure fixed{ci_url_suffix}")
@@ -2788,7 +2788,7 @@ class Maintainer:
                 log = self.logger.info if not self.config.run_tests else self.logger.warning
                 log(f"[{self.repo_name}] Changes not verified: {test_output}")
             elif tests_status == TESTS_FAILED:
-                self.logger.warning(f"[{self.repo_name}] Verification failed, asking AI to fix...")
+                self.logger.info(f"[{self.repo_name}] Verification failed, asking AI to fix...")
                 if self.fix_test_with_retries(test_output):
                     self.logger.info(f"[{self.repo_name}] Tests fixed by AI")
                 else:
@@ -3570,29 +3570,41 @@ def format_issue_counts(counts: Counter) -> str:
     return ", ".join(parts)
 
 
+class QuietFilter(logging.Filter):
+    """Passes warnings, errors and summary records; drops everything else.
+
+    Applied to the output handler rather than set as the logger's level, so
+    --quiet keeps the summary without logging it above its own level.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno >= logging.WARNING or getattr(record, "is_summary", False)
+
+
 def setup_logging(verbose: bool, quiet: bool) -> tuple[logging.Logger, IssueTracker]:
     """Setup logging configuration.
 
     Returns the logger and the IssueTracker attached to the root logger, which
     records every warning and error for the end-of-run summary.
     """
-    if quiet:
-        level = logging.WARNING
-    elif verbose:
-        level = logging.DEBUG
-    else:
-        level = logging.INFO
+    level = logging.DEBUG if verbose and not quiet else logging.INFO
 
     logging.basicConfig(
         level=level,
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
 
-    # Drop a tracker from an earlier call so repeated setup does not leave
-    # handlers counting into a summary that nothing will report.
+    # Drop a tracker or filter from an earlier call so repeated setup does not
+    # leave handlers counting into a summary that nothing will report.
     root = logging.getLogger()
+    root.setLevel(level)
     for handler in [h for h in root.handlers if isinstance(h, IssueTracker)]:
         root.removeHandler(handler)
+    for handler in root.handlers:
+        for existing in [f for f in handler.filters if isinstance(f, QuietFilter)]:
+            handler.removeFilter(existing)
+        if quiet:
+            handler.addFilter(QuietFilter())
 
     tracker = IssueTracker()
     root.addHandler(tracker)
@@ -3806,7 +3818,7 @@ Examples:
 
     # Logging
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output (debug level)")
-    parser.add_argument("--quiet", "-q", action="store_true", help="Quiet mode (warnings and errors only)")
+    parser.add_argument("--quiet", "-q", action="store_true", help="Quiet mode (warnings, errors and the summary only)")
 
     return parser.parse_args()
 
@@ -3896,8 +3908,8 @@ def main():
     fail_count = 0
     error_count = 0
     # Named rather than counted: a quiet run prints only the repositories that
-    # logged something, so a repository this run changed cleanly would leave
-    # nothing behind saying which one it was.
+    # logged something, so the summary is the only record naming a repository
+    # this run changed cleanly.
     changed_repos: list[str] = []
     interrupted = False
 
@@ -3941,12 +3953,12 @@ def main():
                 issues.repo = None
 
             # A repository that logged a warning or an error reports its
-            # outcome at WARNING, so a quiet run says how the repository whose
-            # warnings it just printed ended up.
+            # outcome as a summary record, so a quiet run says how the
+            # repository whose warnings it just printed ended up.
             repo_issues = issues.counts.get(repo_path.name)
             if repo_issues:
                 changes = " with changes" if had_changes else ""
-                logger.warning(
+                logger.info(
                     f"[{repo_path.name}] Result: {outcome}{changes} ({format_issue_counts(repo_issues)})",
                     extra=SUMMARY_EXTRA,
                 )
@@ -3954,15 +3966,11 @@ def main():
         logger.warning("Interrupted by user")
         interrupted = True
 
-    # Summary. Reported at WARNING when the run logged anything at that level
-    # or above, so a quiet run that printed warnings also says how it ended,
-    # and when the run changed a repository, which is the only record naming
-    # which one it was. A quiet run that did neither stays quiet.
+    # Summary records pass the --quiet filter, so every run reports how it ended.
     totals = issues.totals()
-    level = logging.WARNING if issues.total or changed_repos else logging.INFO
 
     def report(message: str) -> None:
-        logger.log(level, message, extra=SUMMARY_EXTRA)
+        logger.info(message, extra=SUMMARY_EXTRA)
 
     report("=" * 80)
     report("Maintenance complete" + (" (interrupted)" if interrupted else ""))

@@ -165,7 +165,7 @@ Each attempt names the run whose log the agent is reading. A commit that fails s
 | `--ci-timeout N` | Minutes to wait for CI (default: 10) |
 | `--repo-timeout N` | Minutes per repository, 0 for no limit (default: 60) |
 | `-v`, `--verbose` | Debug output |
-| `-q`, `--quiet` | Warnings and errors only |
+| `-q`, `--quiet` | Warnings, errors and the end-of-run summary only |
 
 ## Security
 

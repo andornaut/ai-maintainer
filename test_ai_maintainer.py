@@ -4347,6 +4347,38 @@ class TestIssueTracker:
         assert gm.format_issue_counts(gm.Counter({"warning": 1})) == "1 warning"
         assert gm.format_issue_counts(gm.Counter()) == ""
 
+    def test_quiet_prints_warnings_and_the_summary_only(self):
+        root = logging.getLogger()
+        before, level = list(root.handlers), root.level
+        stream = io.StringIO()
+        root.handlers = [logging.StreamHandler(stream)]
+        try:
+            logger, _ = gm.setup_logging(verbose=False, quiet=True)
+            logger.info("progress")
+            logger.warning("problem")
+            logger.info("Maintenance complete", extra=gm.SUMMARY_EXTRA)
+        finally:
+            root.handlers = before
+            root.setLevel(level)
+        output = stream.getvalue()
+        assert "progress" not in output
+        assert "problem" in output
+        assert "Maintenance complete" in output
+
+    def test_setup_logging_does_not_stack_quiet_filters(self):
+        root = logging.getLogger()
+        before, level = list(root.handlers), root.level
+        root.handlers = [logging.StreamHandler(io.StringIO())]
+        try:
+            gm.setup_logging(verbose=False, quiet=True)
+            gm.setup_logging(verbose=False, quiet=True)
+            assert sum(isinstance(f, gm.QuietFilter) for f in root.handlers[0].filters) == 1
+            gm.setup_logging(verbose=False, quiet=False)
+            assert not root.handlers[0].filters
+        finally:
+            root.handlers = before
+            root.setLevel(level)
+
     def test_setup_logging_does_not_stack_trackers(self):
         root = logging.getLogger()
         before = list(root.handlers)
@@ -4360,8 +4392,12 @@ class TestIssueTracker:
 
 
 class TestARunReportsWhatItLogged:
-    """A quiet run prints only warnings and errors. Without a summary at that
-    level, the log says what went wrong but never whether it was resolved."""
+    """A quiet run prints warnings, errors and summary records. Without the
+    summary, the log says what went wrong but never whether it was resolved."""
+
+    @staticmethod
+    def _summary(caplog):
+        return [r.message for r in caplog.records if getattr(r, "is_summary", False)]
 
     def _run_main(self, monkeypatch, repo_path, maintain, argv=()):
         maintainer = MagicMock()
@@ -4385,27 +4421,28 @@ class TestARunReportsWhatItLogged:
 
         return maintain
 
-    def test_a_warned_repo_reports_its_outcome_at_warning(self, repo_path, monkeypatch, caplog):
+    def test_a_warned_repo_reports_its_outcome_in_the_summary(self, repo_path, monkeypatch, caplog):
         with caplog.at_level(logging.INFO):
             self._run_main(
                 monkeypatch,
                 repo_path,
                 self._warned_maintain(gm.STATUS_SUCCESS, True),
             )
-        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
-        assert any(f"[{repo_path.name}] Result: success with changes (1 warning)" == m for m in warnings)
+        assert f"[{repo_path.name}] Result: success with changes (1 warning)" in self._summary(caplog)
 
-    def test_the_final_summary_is_elevated_when_anything_was_logged(self, repo_path, monkeypatch, caplog):
+    def test_the_summary_counts_what_was_logged_at_info(self, repo_path, monkeypatch, caplog):
         with caplog.at_level(logging.INFO):
             self._run_main(
                 monkeypatch,
                 repo_path,
                 self._warned_maintain(gm.STATUS_SUCCESS, False),
             )
-        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
-        assert "Maintenance complete" in warnings
-        assert "Logged: 1 warning" in warnings
-        assert f"  {repo_path.name}: 1 warning" in warnings
+        summary = [r for r in caplog.records if getattr(r, "is_summary", False)]
+        assert {r.levelno for r in summary} == {logging.INFO}
+        messages = [r.message for r in summary]
+        assert "Maintenance complete" in messages
+        assert "Logged: 1 warning" in messages
+        assert f"  {repo_path.name}: 1 warning" in messages
 
     def test_a_failing_repo_is_named_in_the_summary(self, repo_path, monkeypatch, caplog):
         def maintain():
@@ -4415,9 +4452,9 @@ class TestARunReportsWhatItLogged:
 
         with caplog.at_level(logging.INFO):
             assert self._run_main(monkeypatch, repo_path, maintain) == 1
-        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
-        assert f"[{repo_path.name}] Result: failed with changes (1 error, 1 warning)" in warnings
-        assert f"  {repo_path.name}: 1 error, 1 warning" in warnings
+        summary = self._summary(caplog)
+        assert f"[{repo_path.name}] Result: failed with changes (1 error, 1 warning)" in summary
+        assert f"  {repo_path.name}: 1 error, 1 warning" in summary
 
     def test_a_repo_that_changed_quietly_is_still_named(self, repo_path, monkeypatch, caplog):
         # A repository that changed and logged nothing prints no line of its
@@ -4434,15 +4471,6 @@ class TestARunReportsWhatItLogged:
         assert "With changes: 0" in caplog.text
         assert f"  {repo_path.name}" not in caplog.text
 
-    def test_a_run_that_changed_something_reports_at_warning(self, repo_path, monkeypatch, caplog):
-        # The names are the only record of which repository moved, and --quiet
-        # would drop the whole summary if it stayed at INFO
-        with caplog.at_level(logging.INFO):
-            self._run_main(monkeypatch, repo_path, lambda: (gm.STATUS_SUCCESS, True))
-        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
-        assert "With changes: 1" in warnings
-        assert f"  {repo_path.name}" in warnings
-
     def test_a_clean_run_says_nothing_at_warning(self, repo_path, monkeypatch, caplog):
         with caplog.at_level(logging.INFO):
             assert (
@@ -4454,7 +4482,7 @@ class TestARunReportsWhatItLogged:
                 == 0
             )
         assert [r.message for r in caplog.records if r.levelno >= logging.WARNING] == []
-        assert "Maintenance complete" in caplog.text
+        assert "Maintenance complete" in self._summary(caplog)
 
     def test_an_unexpected_exception_is_reported_for_the_repo(self, repo_path, monkeypatch, caplog):
         # maintain() never returned, so the summary line has to be built by
@@ -4464,8 +4492,7 @@ class TestARunReportsWhatItLogged:
 
         with caplog.at_level(logging.INFO):
             assert self._run_main(monkeypatch, repo_path, maintain) == 1
-        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
-        assert f"[{repo_path.name}] Result: error (1 error)" in warnings
+        assert f"[{repo_path.name}] Result: error (1 error)" in self._summary(caplog)
         assert "Errors: 1" in caplog.text
         assert "Failed: 0" in caplog.text
 
@@ -4486,9 +4513,9 @@ class TestARunReportsWhatItLogged:
         monkeypatch.setattr(sys, "argv", ["ai-maintainer", "--base-dir", str(repo_path)])
         with caplog.at_level(logging.INFO):
             gm.main()
-        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
-        assert f"[{repo_path.name}] Result: success (1 warning)" in warnings
-        assert f"  {repo_path.name}: 1 warning" in warnings
+        summary = self._summary(caplog)
+        assert f"[{repo_path.name}] Result: success (1 warning)" in summary
+        assert f"  {repo_path.name}: 1 warning" in summary
         assert "outside any repository" not in caplog.text
 
 
