@@ -3176,9 +3176,9 @@ class TestAgentClientAsk:
         client = gm.AgentClient(tmp_path, "test-repo", default_config, logger)
         self._capture(monkeypatch, self._TimingOutProc("x" * gm.AGENT_OUTPUT_TAIL + "the last thing it said"))
         assert client.ask("do something") is None
-        errors = " ".join(str(c.args[0]) for c in logger.error.call_args_list)
+        warnings = " ".join(str(c.args[0]) for c in logger.warning.call_args_list)
         debug = " ".join(str(c.args[0]) for c in logger.debug.call_args_list)
-        assert f"timed out after {default_config.agent_timeout_seconds}s" in errors
+        assert f"timed out after {default_config.agent_timeout_seconds}s" in warnings
         assert "the last thing it said" in debug
         # Bounded: an agent that wrote megabytes must not put them in the log
         assert len(debug) < 2 * gm.AGENT_OUTPUT_TAIL
@@ -3375,7 +3375,7 @@ class TestADeclinedFixIsNotRetried:
         maintainer.github.get_ci_failure_logs = MagicMock(return_value=("boom", 1))
         maintainer.fix_ci_failure = MagicMock(return_value=gm.FIX_RESOLVED)
         maintainer._wait_for_ci = MagicMock(return_value="failure")
-        with caplog.at_level(logging.ERROR):
+        with caplog.at_level(logging.WARNING):
             assert maintainer.fix_ci_with_retries() is False
         assert f"Exhausted all {default_config.max_fix_attempts} fix attempts" in caplog.text
 
@@ -3759,7 +3759,7 @@ class TestRepoTimeBudget:
         # The summary line does not guess at a cause; _out_of_time reports it
         maintainer = self._maintainer(repo_path, default_config)
         maintainer._deadline = 0
-        with caplog.at_level("ERROR"):
+        with caplog.at_level("WARNING"):
             assert maintainer._out_of_time("CI fix attempts") is True
         assert "Time budget" in caplog.text
         assert "CI fix attempts" in caplog.text
@@ -3767,7 +3767,7 @@ class TestRepoTimeBudget:
     def test_an_unfixable_failure_is_summarised_without_a_cause(self, repo_path, default_config, caplog):
         maintainer = self._unfixable_ci(repo_path, default_config)
         maintainer._deadline = 0
-        with caplog.at_level("ERROR"):
+        with caplog.at_level("WARNING"):
             assert maintainer._handle_post_push_ci(True, "head") is False
         assert "Failed to fix CI failure" in caplog.text
 
@@ -4449,7 +4449,7 @@ class TestARunReportsWhatItLogged:
 
     def test_a_failing_repo_is_named_in_the_summary(self, repo_path, monkeypatch, caplog):
         def maintain():
-            logging.getLogger(gm.__name__).error("CI timed out after 10 minutes")
+            logging.getLogger(gm.__name__).error("Empty agent command")
             logging.getLogger(gm.__name__).warning("CI outcome not confirmed")
             return gm.STATUS_FAILED, True
 

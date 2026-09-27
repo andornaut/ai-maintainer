@@ -786,7 +786,7 @@ Respond with ONLY a JSON object. No explanations, no markdown outside the JSON.
                 stdout, stderr = proc.communicate(timeout=self.config.agent_timeout_seconds)
             except subprocess.TimeoutExpired:
                 drained, stdout, stderr = self._kill_agent(proc)
-                self.logger.error(f"[{self.repo_name}] Agent timed out after {self.config.agent_timeout_seconds}s")
+                self.logger.warning(f"[{self.repo_name}] Agent timed out after {self.config.agent_timeout_seconds}s")
                 if drained and (stdout.strip() or stderr.strip()):
                     tail = f"STDOUT:\n{stdout[-AGENT_OUTPUT_TAIL:]}\n\nSTDERR:\n{stderr[-AGENT_OUTPUT_TAIL:]}"
                     self.logger.debug(f"[{self.repo_name}] Agent output before the timeout:\n{tail}")
@@ -798,7 +798,7 @@ Respond with ONLY a JSON object. No explanations, no markdown outside the JSON.
         except KeyboardInterrupt:
             raise
         except (subprocess.SubprocessError, OSError) as e:
-            self.logger.error(f"[{self.repo_name}] Agent error: {e}")
+            self.logger.warning(f"[{self.repo_name}] Agent error: {e}")
             return None
 
         if proc.returncode == 0:
@@ -809,7 +809,7 @@ Respond with ONLY a JSON object. No explanations, no markdown outside the JSON.
             error_parts.append(f"stderr: {stderr.strip()}")
         if stdout.strip():
             error_parts.append(f"stdout: {stdout.strip()[:500]}")
-        self.logger.error(f"[{self.repo_name}] Agent failed: {'; '.join(error_parts)}")
+        self.logger.warning(f"[{self.repo_name}] Agent failed: {'; '.join(error_parts)}")
         return None
 
     def ask_json(self, prompt: str, context: dict[str, Any] | None = None) -> dict[str, Any] | None:
@@ -824,7 +824,7 @@ Respond with ONLY a JSON object. No explanations, no markdown outside the JSON.
         decision = self.parse_json(response)
         if decision is None:
             self.logger.debug(f"[{self.repo_name}] Agent response: {response}")
-            self.logger.error(f"[{self.repo_name}] No JSON object in agent response")
+            self.logger.warning(f"[{self.repo_name}] No JSON object in agent response")
         return decision
 
     def parse_json(self, response: str) -> dict[str, Any] | None:
@@ -1038,7 +1038,7 @@ class GitClient:
         # project's toolchain instead of the ambient PATH.
         success, _, stderr = run_git(["pull"], self.repo_path, self.env_runner, self.hook_timeout)
         if not success:
-            self.logger.error(f"[{self.repo_name}] Command failed: git pull\n{stderr}")
+            self.logger.warning(f"[{self.repo_name}] Command failed: git pull\n{stderr}")
         return success
 
     def is_writable(self) -> bool:
@@ -1072,13 +1072,13 @@ class GitClient:
             self.logger.warning(f"[{self.repo_name}] git checkout -- . failed, trying git reset --hard\n{stderr}")
             success, _, stderr = self.reset_hard("HEAD")
             if not success:
-                self.logger.error(f"[{self.repo_name}] Command failed: git reset --hard HEAD\n{stderr}")
+                self.logger.warning(f"[{self.repo_name}] Command failed: git reset --hard HEAD\n{stderr}")
                 return False
         # Remove untracked files. -x is deliberately omitted: it would delete
         # ignored build state (.venv, node_modules) the project needs.
         success, _, stderr = self._run(["git", "clean", "-ffd"])
         if not success:
-            self.logger.error(f"[{self.repo_name}] Command failed: git clean -ffd\n{stderr}")
+            self.logger.warning(f"[{self.repo_name}] Command failed: git clean -ffd\n{stderr}")
             return False
         self.logger.debug(f"[{self.repo_name}] Working directory reset")
         return True
@@ -1655,7 +1655,7 @@ class GitHubClient:
             )
             return last_terminal
 
-        self.logger.error(f"[{repo_name}] CI timed out after {timeout_minutes} minutes")
+        self.logger.warning(f"[{repo_name}] CI timed out after {timeout_minutes} minutes")
         return None
 
     @staticmethod
@@ -1795,7 +1795,7 @@ class Maintainer:
         """Whether the repository's time budget is spent, logging if it is."""
         if self._deadline is None or time.monotonic() < self._deadline:
             return False
-        self.logger.error(
+        self.logger.warning(
             f"[{self.repo_name}] Time budget of "
             f"{self.config.repo_timeout_minutes} minutes exhausted, "
             f"giving up on {what}"
@@ -1847,7 +1847,7 @@ class Maintainer:
             # Stage all changes (including new files created by AI)
             success, _, stderr = self.git.stage_all()
             if not success:
-                self.logger.error(f"[{self.repo_name}] Command failed: git add -A\n{stderr}")
+                self.logger.warning(f"[{self.repo_name}] Command failed: git add -A\n{stderr}")
                 return False, False
 
             # Check if anything was actually staged
@@ -1869,7 +1869,7 @@ class Maintainer:
                     self.git.hook_timeout,
                 )
                 if not success:
-                    self.logger.error(f"[{self.repo_name}] Command failed: git commit\n{stderr}")
+                    self.logger.warning(f"[{self.repo_name}] Command failed: git commit\n{stderr}")
                     return False, False
                 committed = True
 
@@ -1894,13 +1894,13 @@ class Maintainer:
         # the project's toolchain instead of the ambient PATH.
         success, _, stderr = run_git(["push"], self.repo_path, self.git.env_runner, self.git.hook_timeout)
         if not success:
-            self.logger.error(f"[{self.repo_name}] Command failed: git push\n{stderr}")
+            self.logger.warning(f"[{self.repo_name}] Command failed: git push\n{stderr}")
             if committed and pre_commit_sha:
                 # Undo all unpushed commits since we couldn't push them
                 self.logger.warning(f"[{self.repo_name}] Undoing commits since push failed")
                 reset_success, _, reset_stderr = self.git.reset_hard(pre_commit_sha)
                 if not reset_success:
-                    self.logger.error(f"[{self.repo_name}] Failed to undo commits after push failure\n{reset_stderr}")
+                    self.logger.warning(f"[{self.repo_name}] Failed to undo commits after push failure\n{reset_stderr}")
             return False, False
 
         self.pushed_head = True
@@ -2211,12 +2211,12 @@ class Maintainer:
             self._reset_changes()
             return FIX_FAILED
         if verdict in (TESTS_FAILED, TESTS_BLOCKED):
-            self.logger.error(f"[{self.repo_name}] Verification still failing after fix")
+            self.logger.warning(f"[{self.repo_name}] Verification still failing after fix")
             self._reset_changes()
             return FIX_FAILED
 
         if self.git.is_workdir_clean():
-            self.logger.error(f"[{self.repo_name}] AI claimed to fix but no changes made")
+            self.logger.warning(f"[{self.repo_name}] AI claimed to fix but no changes made")
             return FIX_FAILED
 
         success, _ = self.commit_and_push(self.build_commit_message(False, is_fix=True))
@@ -2247,7 +2247,7 @@ class Maintainer:
                 # ones no workflow run backs (a required external status, a
                 # non-Actions app). Those have no log to fetch, so the failure
                 # is real but cannot be fixed from here.
-                self.logger.error(f"[{self.repo_name}] Could not get CI failure logs")
+                self.logger.warning(f"[{self.repo_name}] Could not get CI failure logs")
                 return False
 
             # Name the run the agent is reading. A commit that fails several
@@ -2262,7 +2262,7 @@ class Maintainer:
                 # The tree is back as it was and the logs come from the same
                 # commit, so every further attempt puts the identical question
                 # to the agent and spends its timeout on the same answer.
-                self.logger.error(
+                self.logger.warning(
                     f"[{self.repo_name}] The agent will not fix this failure; "
                     "the remaining attempts would ask the same question"
                 )
@@ -2277,11 +2277,11 @@ class Maintainer:
                 self.logger.info(f"[{self.repo_name}] CI passed after {attempt} fix attempt(s)")
                 return True
             if ci_status != "failure":
-                self.logger.error(f"[{self.repo_name}] Could not determine CI status")
+                self.logger.warning(f"[{self.repo_name}] Could not determine CI status")
                 return False
             self.logger.info(f"[{self.repo_name}] CI still failing after attempt {attempt}")
 
-        self.logger.error(f"[{self.repo_name}] Exhausted all {max_attempts} fix attempts")
+        self.logger.warning(f"[{self.repo_name}] Exhausted all {max_attempts} fix attempts")
         return False
 
     def _detected_checks(self) -> tuple[bool, bool]:
@@ -2303,7 +2303,7 @@ class Maintainer:
             ("test suite", "lint configuration"), before, (self._suite_detected, self._lint_detected), strict=True
         ):
             if was_there and not still_there:
-                self.logger.error(f"[{self.repo_name}] The fix removed this project's {what}")
+                self.logger.warning(f"[{self.repo_name}] The fix removed this project's {what}")
                 return True
         return False
 
@@ -2350,7 +2350,7 @@ class Maintainer:
             return FIX_FAILED
 
         if verdict != TESTS_PASSED and not (verdict == TESTS_NOT_RUN and not had_suite):
-            self.logger.error(f"[{self.repo_name}] Verification still failing after fix")
+            self.logger.warning(f"[{self.repo_name}] Verification still failing after fix")
             self._reset_changes()
             return FIX_FAILED
 
@@ -2373,7 +2373,7 @@ class Maintainer:
             stash_ref_before = self.git.get_stash_ref()
             success, _, _ = self.git.stash_push("ai-maintainer: dependency updates")
             if not success:
-                self.logger.error(f"[{self.repo_name}] Failed to stash changes before fix attempts")
+                self.logger.warning(f"[{self.repo_name}] Failed to stash changes before fix attempts")
                 return False
             # `git stash push` exits 0 without creating an entry when it has
             # nothing it can save. Confirm a new entry actually appeared before
@@ -2383,7 +2383,7 @@ class Maintainer:
                 # Either no entry was created, or refs/stash could not be read.
                 # Both are unsafe to guess at, so claim nothing and say where
                 # the changes may be.
-                self.logger.error(
+                self.logger.warning(
                     f"[{self.repo_name}] Could not confirm a new stash entry; "
                     "skipping fix attempts. If the stash did succeed, the "
                     "dependency updates are in `git stash list`"
@@ -2408,7 +2408,7 @@ class Maintainer:
                     if not success:
                         # Keep the stash: the reset below leaves it holding the
                         # only copy of the dependency updates, so say where it is
-                        self.logger.error(
+                        self.logger.warning(
                             f"[{self.repo_name}] Failed to restore dependency "
                             f"updates: {stderr}. They are kept in `git stash list`"
                         )
@@ -2424,7 +2424,7 @@ class Maintainer:
                     # The tree is back to the same dependency updates and the
                     # suite would fail the same way, so every further attempt
                     # puts the identical question to the agent.
-                    self.logger.error(
+                    self.logger.warning(
                         f"[{self.repo_name}] The agent will not fix this failure; "
                         "the remaining attempts would ask the same question"
                     )
@@ -2440,7 +2440,7 @@ class Maintainer:
                             # Without the updates restored, run_tests would
                             # describe a tree the next attempt is not fixing.
                             # Keep the stash, and say where it is.
-                            self.logger.error(
+                            self.logger.warning(
                                 f"[{self.repo_name}] Failed to restore "
                                 f"dependency updates: {stderr}. They are kept "
                                 "in `git stash list`"
@@ -2452,7 +2452,7 @@ class Maintainer:
                     if has_stash:
                         self._reset_changes()
 
-            self.logger.error(f"[{self.repo_name}] Exhausted all {max_attempts} fix attempts")
+            self.logger.warning(f"[{self.repo_name}] Exhausted all {max_attempts} fix attempts")
             self._reset_changes()
             return False
         except WorkingTreeError:
@@ -2577,7 +2577,7 @@ class Maintainer:
                 if self.fix_ci_with_retries():
                     self.logger.info(f"[{self.repo_name}] Previous CI failure fixed")
                     return True, True
-                self.logger.error(f"[{self.repo_name}] Could not fix previous CI failure, skipping repo")
+                self.logger.warning(f"[{self.repo_name}] Could not fix previous CI failure, skipping repo")
                 return False, False
             self.logger.warning(
                 f"[{self.repo_name}] CI is already failing (not from ai-maintainer), will not attempt fixes"
@@ -2661,7 +2661,7 @@ class Maintainer:
         # A summary line, with no guess at the cause. fix_ci_with_retries
         # fails for several reasons - budget spent, attempts exhausted, a
         # dirty tree, no logs to fetch - and each already logs itself above.
-        self.logger.error(f"[{self.repo_name}] Failed to fix CI failure{ci_url_suffix}")
+        self.logger.warning(f"[{self.repo_name}] Failed to fix CI failure{ci_url_suffix}")
         return False
 
     def maintain(self) -> RepoResult:
@@ -2676,7 +2676,7 @@ class Maintainer:
         try:
             status, had_changes = self._maintain()
         except WorkingTreeError as e:
-            self.logger.error(f"[{self.repo_name}] {e}")
+            self.logger.warning(f"[{self.repo_name}] {e}")
             status, had_changes = STATUS_FAILED, False
         # A failed repository can still have a merged dependabot PR or a
         # pushed commit on the remote, and nothing this run pushed is ever
@@ -2708,7 +2708,7 @@ class Maintainer:
         remote_sha = None
         if merged_prs and not self.config.dry_run:
             if not self.git.pull_changes():
-                self.logger.error(f"[{self.repo_name}] Failed to pull after merging dependabot PRs")
+                self.logger.warning(f"[{self.repo_name}] Failed to pull after merging dependabot PRs")
                 # The PRs are merged on GitHub with CI already running.
                 # Refresh the tracking ref (the pull may have failed before
                 # fetching) so the merge commit can still be monitored.
@@ -2755,7 +2755,7 @@ class Maintainer:
         # Update dependencies
         success, had_dep_updates = self.update_dependencies()
         if not success:
-            self.logger.error(f"[{self.repo_name}] Failed to update dependencies")
+            self.logger.warning(f"[{self.repo_name}] Failed to update dependencies")
             self._reset_changes()
             # Merged dependabot PRs are already on the remote and have
             # triggered CI; monitor it even though this run is aborting.
@@ -2790,7 +2790,7 @@ class Maintainer:
                 if self.fix_test_with_retries(test_output):
                     self.logger.info(f"[{self.repo_name}] Tests fixed by AI")
                 else:
-                    self.logger.error(f"[{self.repo_name}] Could not fix test failures, not committing changes")
+                    self.logger.warning(f"[{self.repo_name}] Could not fix test failures, not committing changes")
                     self._reset_changes()
                     # Merged dependabot PRs are already on the remote and
                     # have triggered CI; monitor it, and fix it if we broke
@@ -2892,7 +2892,7 @@ class Maintainer:
         self._lint_detected = lint_cmd is not None
         if not test_cmd and self._unresolved_runner:
             message = f"This project declares a test suite but {self._unresolved_runner}"
-            self.logger.error(f"[{self.repo_name}] {message}")
+            self.logger.warning(f"[{self.repo_name}] {message}")
             return TESTS_BLOCKED, message
 
         outputs = []
@@ -2907,7 +2907,7 @@ class Maintainer:
             success, stdout, stderr = run_shell_command(command, self.repo_path, timeout=timeout)
             outputs.append(f"Command: {command}\n\nSTDOUT:\n{stdout}\n\nSTDERR:\n{stderr}")
             if not success:
-                self.logger.error(f"[{self.repo_name}] {label} failed: {command}")
+                self.logger.warning(f"[{self.repo_name}] {label} failed: {command}")
                 return TESTS_FAILED, "\n\n".join(outputs)
 
         if not test_cmd:
@@ -3283,7 +3283,7 @@ class Maintainer:
         """
         if self.git.is_workdir_clean():
             return True
-        self.logger.error(
+        self.logger.warning(
             f"[{self.repo_name}] Working directory is not clean; refusing to "
             "attempt a CI fix that would commit its contents"
         )
@@ -3470,11 +3470,11 @@ class Maintainer:
         """
         head_sha = head_sha or self.git.get_head_sha()
         if not head_sha:
-            self.logger.error(f"[{self.repo_name}] Could not get HEAD SHA")
+            self.logger.warning(f"[{self.repo_name}] Could not get HEAD SHA")
             return None
         timeout_minutes = self._budget_limited(timeout_minutes)
         if timeout_minutes <= 0:
-            self.logger.error(f"[{self.repo_name}] Time budget exhausted; not waiting for CI")
+            self.logger.warning(f"[{self.repo_name}] Time budget exhausted; not waiting for CI")
             return None
         self.logger.debug(f"[{self.repo_name}] Waiting for CI on commit {head_sha[:7]}...")
         return self.github.wait_for_ci(head_sha, timeout_minutes)
@@ -3512,7 +3512,7 @@ def find_repos(base_dir: Path, logger: logging.Logger) -> list[Path]:
                 ):
                     repos.append(item)
             except PermissionError:
-                logger.error(f"Permission denied: {item}")
+                logger.warning(f"Permission denied: {item}")
     except PermissionError:
         logger.error(f"Permission denied: {base_dir}")
         return []
