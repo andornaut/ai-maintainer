@@ -72,9 +72,8 @@ class WorkingTreeError(Exception):
     """
 
 
-# Marks a record as summary output, which IssueTracker does not count: the
-# summary reports the warnings and errors of the run, so counting it would
-# make the totals depend on whether they had been reported yet.
+# Marks a record as summary output, which QuietFilter passes at INFO so a
+# --quiet run still reports how it ended.
 SUMMARY_EXTRA = {"is_summary": True}
 
 # Per-repository maintenance outcomes
@@ -1898,7 +1897,7 @@ class Maintainer:
             self.logger.error(f"[{self.repo_name}] Command failed: git push\n{stderr}")
             if committed and pre_commit_sha:
                 # Undo all unpushed commits since we couldn't push them
-                self.logger.info(f"[{self.repo_name}] Undoing commits since push failed")
+                self.logger.warning(f"[{self.repo_name}] Undoing commits since push failed")
                 reset_success, _, reset_stderr = self.git.reset_hard(pre_commit_sha)
                 if not reset_success:
                     self.logger.error(f"[{self.repo_name}] Failed to undo commits after push failure\n{reset_stderr}")
@@ -2269,9 +2268,6 @@ class Maintainer:
                 )
                 return False
             if outcome != FIX_RESOLVED:
-                if attempt >= max_attempts:
-                    self.logger.error(f"[{self.repo_name}] Exhausted all {max_attempts} fix attempts")
-                    return False
                 continue
 
             self.logger.info(f"[{self.repo_name}] Waiting for CI after fix...")
@@ -2285,6 +2281,7 @@ class Maintainer:
                 return False
             self.logger.info(f"[{self.repo_name}] CI still failing after attempt {attempt}")
 
+        self.logger.error(f"[{self.repo_name}] Exhausted all {max_attempts} fix attempts")
         return False
 
     def _detected_checks(self) -> tuple[bool, bool]:
@@ -2650,7 +2647,7 @@ class Maintainer:
             return True
 
         # We broke CI - try to fix it
-        self.logger.info(f"[{self.repo_name}] CI failed after push{ci_url_suffix}, attempting to fix...")
+        self.logger.warning(f"[{self.repo_name}] CI failed after push{ci_url_suffix}, attempting to fix...")
         if self.fix_ci_with_retries():
             ci_url_suffix = self._ci_url_suffix("success", head_sha)
             self.logger.info(f"[{self.repo_name}] CI failure fixed{ci_url_suffix}")
@@ -2775,7 +2772,8 @@ class Maintainer:
                 # A suite exists and could not be started, so nothing here has
                 # been verified and the agent has nothing to fix. Abandon the
                 # repository rather than pushing on an untested tree.
-                self.logger.error(f"[{self.repo_name}] Not committing: {test_output}")
+                # run_tests already warned with the cause.
+                self.logger.info(f"[{self.repo_name}] Not committing: the test suite could not start")
                 self._reset_changes()
                 if remote_sha:
                     self._handle_post_push_ci(ci_was_passing, remote_sha)
@@ -2788,7 +2786,7 @@ class Maintainer:
                 log = self.logger.info if not self.config.run_tests else self.logger.warning
                 log(f"[{self.repo_name}] Changes not verified: {test_output}")
             elif tests_status == TESTS_FAILED:
-                self.logger.info(f"[{self.repo_name}] Verification failed, asking AI to fix...")
+                self.logger.warning(f"[{self.repo_name}] Verification failed, asking AI to fix...")
                 if self.fix_test_with_retries(test_output):
                     self.logger.info(f"[{self.repo_name}] Tests fixed by AI")
                 else:
@@ -3531,9 +3529,7 @@ class IssueTracker(logging.Handler):
 
     Records are attributed to whichever repository is being processed when they
     are logged; the caller sets `repo` around each repository. Records logged
-    outside that window (startup checks, the summary itself) bucket under None.
-    Summary output carries SUMMARY_EXTRA so reporting the counts does not
-    change them.
+    outside that window (startup checks, an interrupt) bucket under None.
     """
 
     def __init__(self) -> None:
@@ -3542,8 +3538,6 @@ class IssueTracker(logging.Handler):
         self.counts: dict[str | None, Counter] = {}
 
     def emit(self, record: logging.LogRecord) -> None:
-        if getattr(record, "is_summary", False):
-            return
         kind = "error" if record.levelno >= logging.ERROR else "warning"
         self.counts.setdefault(self.repo, Counter())[kind] += 1
 
@@ -3581,30 +3575,32 @@ class QuietFilter(logging.Filter):
         return record.levelno >= logging.WARNING or getattr(record, "is_summary", False)
 
 
+class OutputHandler(logging.StreamHandler):
+    """The stderr handler setup_logging owns, told apart from any other."""
+
+
 def setup_logging(verbose: bool, quiet: bool) -> tuple[logging.Logger, IssueTracker]:
     """Setup logging configuration.
 
     Returns the logger and the IssueTracker attached to the root logger, which
     records every warning and error for the end-of-run summary.
     """
-    level = logging.DEBUG if verbose and not quiet else logging.INFO
-
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-    )
-
-    # Drop a tracker or filter from an earlier call so repeated setup does not
-    # leave handlers counting into a summary that nothing will report.
     root = logging.getLogger()
-    root.setLevel(level)
-    for handler in [h for h in root.handlers if isinstance(h, IssueTracker)]:
+    root.setLevel(logging.DEBUG if verbose and not quiet else logging.INFO)
+
+    # Drop the handlers of an earlier call so repeated setup neither prints
+    # twice nor leaves a tracker counting into a summary nothing will report.
+    for handler in [h for h in root.handlers if isinstance(h, (OutputHandler, IssueTracker))]:
         root.removeHandler(handler)
-    for handler in root.handlers:
-        for existing in [f for f in handler.filters if isinstance(f, QuietFilter)]:
-            handler.removeFilter(existing)
-        if quiet:
-            handler.addFilter(QuietFilter())
+        handler.close()
+
+    # The quiet filter goes on this handler only, so a handler someone else
+    # attached to the root logger keeps receiving every record.
+    output = OutputHandler()
+    output.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    if quiet:
+        output.addFilter(QuietFilter())
+    root.addHandler(output)
 
     tracker = IssueTracker()
     root.addHandler(tracker)

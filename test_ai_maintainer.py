@@ -50,6 +50,17 @@ def default_config():
 
 
 @pytest.fixture(autouse=True)
+def restore_root_logger():
+    """setup_logging sets the root level and adds handlers; a test that calls
+    main() must not change what later tests capture."""
+    root = logging.getLogger()
+    handlers, level = list(root.handlers), root.level
+    yield
+    root.handlers = handlers
+    root.setLevel(level)
+
+
+@pytest.fixture(autouse=True)
 def no_real_sleeping(monkeypatch):
     """No test spends real time in a poll loop.
 
@@ -3358,6 +3369,16 @@ class TestADeclinedFixIsNotRetried:
         assert maintainer.fix_ci_with_retries() is False
         assert maintainer.fix_ci_failure.call_count == default_config.max_fix_attempts
 
+    def test_pushed_fixes_that_leave_ci_red_say_the_attempts_ran_out(self, repo_path, default_config, caplog):
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False, push_changes=True)
+        maintainer.git.is_workdir_clean = MagicMock(return_value=True)
+        maintainer.github.get_ci_failure_logs = MagicMock(return_value=("boom", 1))
+        maintainer.fix_ci_failure = MagicMock(return_value=gm.FIX_RESOLVED)
+        maintainer._wait_for_ci = MagicMock(return_value="failure")
+        with caplog.at_level(logging.ERROR):
+            assert maintainer.fix_ci_with_retries() is False
+        assert f"Exhausted all {default_config.max_fix_attempts} fix attempts" in caplog.text
+
     def test_test_fix_stops_at_the_first_decline(self, repo_path, default_config):
         maintainer = make_maintainer(repo_path, default_config, dry_run=False)
         maintainer.git.is_workdir_clean = MagicMock(return_value=True)
@@ -4332,63 +4353,45 @@ class TestIssueTracker:
         assert tracker.counts == {}
         assert tracker.total == 0
 
-    def test_summary_records_do_not_count_themselves(self):
-        # The summary reports the counts, so counting it would make the totals
-        # depend on whether they had been reported yet
-        tracker = gm.IssueTracker()
-        logger = self._logger(tracker, "issue-tracker-summary")
-        logger.warning("real problem")
-        logger.warning("Errors: 0", extra=gm.SUMMARY_EXTRA)
-        assert tracker.total == 1
-
     def test_counts_are_rendered_with_the_error_first(self):
         counts = gm.Counter({"warning": 2, "error": 1})
         assert gm.format_issue_counts(counts) == "1 error, 2 warnings"
         assert gm.format_issue_counts(gm.Counter({"warning": 1})) == "1 warning"
         assert gm.format_issue_counts(gm.Counter()) == ""
 
-    def test_quiet_prints_warnings_and_the_summary_only(self):
-        root = logging.getLogger()
-        before, level = list(root.handlers), root.level
-        stream = io.StringIO()
-        root.handlers = [logging.StreamHandler(stream)]
-        try:
-            logger, _ = gm.setup_logging(verbose=False, quiet=True)
-            logger.info("progress")
-            logger.warning("problem")
-            logger.info("Maintenance complete", extra=gm.SUMMARY_EXTRA)
-        finally:
-            root.handlers = before
-            root.setLevel(level)
-        output = stream.getvalue()
+    def test_quiet_prints_warnings_and_the_summary_only(self, capsys):
+        logger, _ = gm.setup_logging(verbose=False, quiet=True)
+        logger.info("progress")
+        logger.warning("problem")
+        logger.info("Maintenance complete", extra=gm.SUMMARY_EXTRA)
+        output = capsys.readouterr().err
         assert "progress" not in output
         assert "problem" in output
         assert "Maintenance complete" in output
 
-    def test_setup_logging_does_not_stack_quiet_filters(self):
+    def test_quiet_leaves_other_handlers_unfiltered(self):
         root = logging.getLogger()
-        before, level = list(root.handlers), root.level
-        root.handlers = [logging.StreamHandler(io.StringIO())]
-        try:
-            gm.setup_logging(verbose=False, quiet=True)
-            gm.setup_logging(verbose=False, quiet=True)
-            assert sum(isinstance(f, gm.QuietFilter) for f in root.handlers[0].filters) == 1
-            gm.setup_logging(verbose=False, quiet=False)
-            assert not root.handlers[0].filters
-        finally:
-            root.handlers = before
-            root.setLevel(level)
+        other = logging.StreamHandler(io.StringIO())
+        root.addHandler(other)
+        gm.setup_logging(verbose=False, quiet=True)
+        logging.getLogger(gm.__name__).info("progress")
+        assert not other.filters
+        assert "progress" in other.stream.getvalue()
+
+    def test_setup_logging_does_not_stack_output_handlers(self):
+        root = logging.getLogger()
+        gm.setup_logging(verbose=False, quiet=True)
+        gm.setup_logging(verbose=False, quiet=False)
+        outputs = [h for h in root.handlers if isinstance(h, gm.OutputHandler)]
+        assert len(outputs) == 1
+        assert not outputs[0].filters
 
     def test_setup_logging_does_not_stack_trackers(self):
         root = logging.getLogger()
-        before = list(root.handlers)
-        try:
-            gm.setup_logging(verbose=False, quiet=False)
-            gm.setup_logging(verbose=False, quiet=False)
-            trackers = [h for h in root.handlers if isinstance(h, gm.IssueTracker)]
-            assert len(trackers) == 1
-        finally:
-            root.handlers = before
+        gm.setup_logging(verbose=False, quiet=False)
+        gm.setup_logging(verbose=False, quiet=False)
+        trackers = [h for h in root.handlers if isinstance(h, gm.IssueTracker)]
+        assert len(trackers) == 1
 
 
 class TestARunReportsWhatItLogged:
@@ -4464,6 +4467,20 @@ class TestARunReportsWhatItLogged:
             self._run_main(monkeypatch, repo_path, lambda: (gm.STATUS_SUCCESS, True))
         assert "With changes: 1" in caplog.text
         assert f"  {repo_path.name}" in caplog.text
+
+    def test_a_quiet_run_prints_the_result_and_summary(self, repo_path, monkeypatch, capsys):
+        self._run_main(
+            monkeypatch,
+            repo_path,
+            self._warned_maintain(gm.STATUS_SUCCESS, True),
+            argv=("--quiet",),
+        )
+        output = capsys.readouterr().err
+        assert "Base directory:" not in output
+        assert "Changes not verified" in output
+        assert f"[{repo_path.name}] Result: success with changes (1 warning)" in output
+        assert "Maintenance complete" in output
+        assert f"  {repo_path.name}\n" in output
 
     def test_an_unchanged_repo_is_not_named(self, repo_path, monkeypatch, caplog):
         with caplog.at_level(logging.INFO):
