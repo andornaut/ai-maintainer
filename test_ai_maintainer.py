@@ -1650,6 +1650,34 @@ class TestGitHubClientCi:
         assert [a for a in calls if "--log" in a] == []
         assert "88" in calls[-1]
 
+    def test_failing_job_logs_are_read_from_the_api_when_gh_prints_none(self, tmp_path):
+        """An archive without per-step files leaves --log-failed empty."""
+        client = self._client(tmp_path)
+        client.get_failed_run_ids = MagicMock(return_value=[77])
+        jobs = {
+            "jobs": [
+                {"databaseId": 1, "name": "Lint", "conclusion": "success"},
+                {"databaseId": 2, "name": "Drift", "conclusion": "failure"},
+            ]
+        }
+        calls = []
+
+        def fake_run(args):
+            calls.append(args)
+            if "--log-failed" in args:
+                return True, "", ""
+            if "--json" in args:
+                return True, json.dumps(jobs), ""
+            if args[:2] == ["gh", "api"]:
+                return True, f"log of {args[2]}", ""
+            return True, "every step passed", ""
+
+        client._run = fake_run
+        logs, run_id = client.get_ci_failure_logs("abc")
+        assert run_id == 77
+        assert logs == "===== Drift\nlog of repos/owner/repo/actions/jobs/2/logs"
+        assert [a for a in calls if "--log" in a] == []
+
     def test_a_full_run_log_says_it_is_not_a_failing_job_log(self, tmp_path):
         client = self._client(tmp_path)
         client.get_failed_run_ids = MagicMock(return_value=[77])

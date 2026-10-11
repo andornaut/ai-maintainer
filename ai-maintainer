@@ -1262,6 +1262,9 @@ class GitHubClient:
         returns nothing for it. The run holding the log answers even when the
         run reporting the failure cannot.
 
+        Where `--log-failed` answers for no run, each failing job's log is read
+        from the API instead (_failed_job_logs).
+
         Only when no run yields a failing job's log does this fall back to a
         full run log, and it says so. A run whose own jobs all passed logs
         nothing but successful output, and handed over as a failure log it
@@ -1272,6 +1275,9 @@ class GitHubClient:
             success, stdout, _ = self._run(["gh", "run", "view", str(run_id), "--log-failed"])
             if success and stdout:
                 return truncate_ci_log(stdout), run_id
+        for run_id in run_ids:
+            if logs := self._failed_job_logs(run_id):
+                return truncate_ci_log(logs), run_id
         if run_ids:
             success, stdout, _ = self._run(["gh", "run", "view", str(run_ids[0]), "--log"])
             if success and stdout:
@@ -1294,6 +1300,31 @@ class GitHubClient:
                     "YAML or an invalid workflow schema."
                 ), None
         return None, None
+
+    def _failed_job_logs(self, run_id: int) -> str:
+        """A run's failing jobs' logs, read job by job from the API.
+
+        `gh run view --log` and `--log-failed` build their output from the
+        per-step files in the run's log archive, and GitHub can serve an
+        archive holding only each job's combined log. gh then prints nothing
+        and exits 0, though the job's log is there to be read.
+        """
+        if not self.owner_repo:
+            return ""
+        success, stdout, _ = self._run(["gh", "run", "view", str(run_id), "--json", "jobs"])
+        if not success:
+            return ""
+        data = safe_json_parse(stdout, default={})
+        jobs = data.get("jobs", []) if isinstance(data, dict) else []
+        logs = []
+        for job in jobs:
+            job_id = job.get("databaseId")
+            if job.get("conclusion") not in FAILING_CHECK_CONCLUSIONS or job_id is None:
+                continue
+            success, stdout, _ = self._run(["gh", "api", f"repos/{self.owner_repo}/actions/jobs/{job_id}/logs"])
+            if success and stdout:
+                logs.append(f"===== {job.get('name', job_id)}\n{stdout}")
+        return "\n".join(logs)
 
     def _failing_check_names(self, head_sha: str) -> list[str]:
         """Names of the commit's failing checks, for a log that lacks theirs.

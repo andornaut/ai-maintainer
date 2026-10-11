@@ -136,6 +136,8 @@ A failing verdict is returned at once. A non-failing one is held back until the 
 
 Every failed run on the commit is asked for its failing jobs' logs, and the first that answers is what the agent is given. One push commonly fails more than one workflow, and the run reporting a failure need not hold its log: a job run by a called reusable workflow is reported on the calling run while its log belongs to its own.
 
+Where `gh run view --log-failed` prints nothing for every run, each failing job's log is read from `repos/{owner}/{repo}/actions/jobs/{id}/logs` instead. gh builds its output from the per-step files in the run's log archive, and GitHub can serve an archive holding only each job's combined log.
+
 When no run yields a failing job's log, a full run log is passed instead, prefixed with a note that says so and names the commit's failing checks. A run whose own jobs all passed logs nothing but successful output, and offered as a failure log it sends the agent looking for an error that is not in the text.
 
 Each attempt names the run whose log the agent is reading. A commit that fails several workflows has more than one failed run, so the URL the failure was reported under is only the newest of them and need not be the one that answered.
