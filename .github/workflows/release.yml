@@ -67,7 +67,7 @@ jobs:
           persist-credentials: false
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: ai-maintainer
           path: ai-maintainer
