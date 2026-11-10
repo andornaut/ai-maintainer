@@ -1,0 +1,29 @@
+#!/bin/sh
+set -eu
+
+category=${1:-check}
+if [ "$#" -gt 0 ]; then shift; fi
+case "${category}" in
+    check)
+        for category in ${CHECK_TASKS}; do /opt/check/run "${category}"; done
+        ;;
+    lint)
+        ruff check .
+        ruff format --check .
+        markdownlint-cli2
+        ;;
+    test)
+        python -m pytest -v -p no:cacheprovider --basetemp=/scratch/pytest "$@"
+        ;;
+    build)
+        python -m py_compile ai-maintainer test_ai_maintainer.py
+        ;;
+    exec)
+        if [ "$#" -gt 0 ]; then exec "$@"; fi
+        exec sh -ec "${COMMAND:?COMMAND is required}"
+        ;;
+    *)
+        printf 'Unknown check category: %s\n' "${category}" >&2
+        exit 2
+        ;;
+esac
