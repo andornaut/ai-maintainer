@@ -1,9 +1,12 @@
 ARG PYTHON_VERSION=3.12
+FROM koalaman/shellcheck:v0.11.0 AS shellcheck
+
 FROM node:24.22.2 AS markdown
 RUN npm install --prefix /opt/markdown --no-audit --no-fund --ignore-scripts markdownlint-cli2@0.24.0
 
 FROM python:${PYTHON_VERSION}
 
+COPY --from=shellcheck /bin/shellcheck /usr/local/bin/shellcheck
 COPY --from=markdown /usr/local/bin/node /usr/local/bin/node
 COPY --from=markdown /opt/markdown /opt/markdown
 COPY .python-version requirements-dev.txt /opt/check/
