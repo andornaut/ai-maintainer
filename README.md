@@ -10,7 +10,7 @@ Automated GitHub repository maintenance with AI-powered dependency updates, test
 | | |
 | --- | --- |
 | Python | 3.12 or newer |
-| Tools | Git, [GitHub CLI](https://cli.github.com/) |
+| Tools | Git, GNU Make, [GitHub CLI](https://cli.github.com/), and each project's container tooling |
 | AI agent | [Claude Code CLI](https://code.claude.com/docs), or any command that reads a prompt on argv (e.g. [Ollama](https://ollama.com/)) |
 
 The GitHub CLI must be authenticated. ai-maintainer checks once at startup and exits if the check fails, because CI status, write-access detection and dependabot verification all go through the API, and a run without it would report success for work it never did.
@@ -51,7 +51,7 @@ Each repository is taken through these steps in order:
 | 2 | Check CI, and fix a failure left by an earlier run |
 | 3 | Merge dependabot PRs on GitHub, then pull |
 | 4 | Ask the agent to update direct dependencies |
-| 5 | Run the linter and the tests, and ask the agent to fix failures |
+| 5 | Run the full project verification gate, and ask the agent to fix failures |
 | 6 | Commit what the agent changed, and push |
 | 7 | Wait for CI, and fix a build this run broke |
 
@@ -59,19 +59,30 @@ Each repository is taken through these steps in order:
 
 A repository is skipped, not failed, when it is ai-maintainer itself, named in `--exclude`, not a git repository, not on its default branch (or the branch cannot be determined), has a dirty working tree before or after the pull, cannot be pulled, or is not writable because it is archived or read-only.
 
-A repository with no dependency files is not skipped. Its tests still run and its CI is still watched.
+A repository with no dependency files remains eligible. It must declare the verification interface below; its existing CI is still checked.
 
-### Toolchain activation
+### Project execution contract
 
-Each project's toolchain is detected and activated before tests and git operations, so hooks such as husky `pre-commit` use the project's runtime rather than the ambient PATH. The same activation prefix is given to the agent, so its package-manager commands resolve the same runtime. A project that declares more than one toolchain (a Go module with an `.nvmrc` for its tooling) has every one of them activated.
+Each maintained repository owns its container launcher and exposes these Make targets:
 
-| Language | Detected from | Activated with |
-| --- | --- | --- |
-| Node | `.nvmrc` | nvm, fnm |
-| Python | `Pipfile`, `poetry.lock`, a venv directory | pipenv, poetry, venv |
-| Ruby | `Gemfile`, `.ruby-version` | chruby, rbenv |
-| Rust | `Cargo.toml` | cargo |
-| Go | `go.mod` | the Go toolchain |
+| Target | Contract |
+| --- | --- |
+| `make check-info` | Print only versioned JSON describing the full gate |
+| `make check` | Run every declared category once in containers |
+| `make lint`, `make test`, `make build` | Run the corresponding declared subset |
+| `make exec COMMAND='...'` | Run a dependency query, install, update or other project command in its container |
+
+For example, a project with all three categories returns:
+
+```json
+{"version":1,"checks":["lint","test","build"]}
+```
+
+`checks` is a nonempty unique subset of `lint`, `test` and `build`. The metadata and full gate derive from the same project task list. Missing, unreadable, malformed or unsupported metadata blocks maintenance before the pull. The interface is checked again after pulling and before dependency updates. There is no language detection, guessed suite, host runner probe or fallback for unmigrated repositories.
+
+The project's thin Make orchestration is trusted. Its launcher owns runtime versions, dependency setup, container isolation and cleanup, including cleanup when Make receives a termination signal. Native task-runner aliases call the same project targets. Git retains its existing host authentication and fires the project's actual hooks, which must use those container-backed targets. The AI agent is instructed to use Make for every project operation; this is command discipline, not an adversarial sandbox around its host process.
+
+Dependency queries also use `make exec`. Make wrappers freeze raw command and test-argument values with `override COMMAND := $(value COMMAND)` and `override TEST_ARGS := $(value TEST_ARGS)`, then export them as data. The consumer passes command text unchanged: dollar signs, shell substitutions and Make-like expressions must not expand in host Make or its orchestration shell. The project container interprets the command. Dry runs read metadata but do not pull, run push-probe hooks, update dependencies or invoke the verification gate.
 
 ### Dependency updates
 
@@ -106,23 +117,15 @@ Step 6 pushes any unpushed commit on the branch, not only its own, so a dependab
 
 ### Verification
 
-Step 5 runs the project's linter and then its test suite. Lint goes first: it is the faster of the two and the more likely to break under a dependency update, so failing there spares the suite's wall clock and hands the agent the smaller failure.
+Step 5 invokes `make check` once after dependency changes or merges. The project determines the order of its lint, test and build tasks. The gate receives the sum of `--lint-timeout` and `--test-timeout` once, rather than separate invocations that repeat its work.
 
-| Manifest | Linted with |
-| --- | --- |
-| `package.json` with a `lint` script | `npm run lint` |
-| `.rubocop.yml` or `.rubocop.yaml` | `bundle exec rubocop`, or a bare `rubocop` where there is no `Gemfile` |
-| `ruff.toml`, `.ruff.toml` or `[tool.ruff]` | `ruff check .` |
-
-A `Gemfile` project first installs the bundle from its lockfile (`BUNDLE_FROZEN=true bundle install`), because a pull that moved `Gemfile.lock` leaves the installed gems behind it and `bundle exec` then refuses to start. Frozen, the install can match the lockfile but never rewrite it.
-
-Only a declaration counts, never a guess: a linter chosen for a project that did not ask for one would fail the run over a style the project never adopted. A declaration whose runner does not resolve falls through to the next, so a repository declaring two linters is linted by whichever of them is runnable.
-
-- A lint failure is a test failure. CI fails on it either way, and it is the cheapest failure for the agent to fix.
-- A linter that passes is not a suite that passed. A repository with no test command is still reported as unverified, never as passing.
-- A fix that removes the test suite or the lint configuration is rejected, in both fix paths. Taking out what checks the code is a way of making it pass, not a pass.
-- A repository whose declared test runner will not start is abandoned rather than committed to. A linter that will not start is warned about and skipped: not being able to run it is ignorance rather than a failure, and abandoning a repository whose tests pass because a linter is missing trades a working update for nothing.
-- `--repo-timeout` bounds each repository's total wall clock, CI waits included, so one repository cannot stall the rest of the run.
+- A failed gate is a verification failure, whatever category failed.
+- A passing gate whose metadata omits `test` remains `TESTS_NOT_RUN`, with an explicit message that its declared checks passed without a suite.
+- Missing or unreadable metadata is `TESTS_BLOCKED`, never evidence that no suite exists, and blocks committing.
+- Dependency updates and both fix paths reject removal of any previously declared category, including builds.
+- Before and after the gate, the maintainer fingerprints HEAD, the index, working-tree status and changed-file contents. A changed or unreadable snapshot discards the result and preserves source changes and any pending stash. Credential-shaped paths and changed paths resolving outside the checkout are refused.
+- Commands run in bounded process groups. On timeout, the project launcher gets a termination signal and time to clean up before forced termination. Container lifecycle remains the project's responsibility.
+- `--repo-timeout` bounds each repository's total wall clock, CI waits included.
 
 ### CI verdicts
 
@@ -154,15 +157,15 @@ Each attempt names the run whose log the agent is reading. A commit that fails s
 | `-e`, `--exclude REPO` | Exclude a repository by name (repeatable) |
 | `--no-merge-dependabot` | Skip merging dependabot PRs |
 | `--no-update-dependencies` | Skip dependency updates |
-| `--no-run-tests` | Skip running the linter and the tests |
+| `--no-run-tests` | Skip the full `make check` gate |
 | `--no-push` | Commit locally, do not push |
 | `--dependency-min-age-days N` | Skip dependencies newer than N days (default: 0) |
 | `--max-fix-attempts N` | Max agent fix attempts per repo (default: 4) |
 | `--agent-command CMD` | AI agent executable (default: `claude`) |
 | `--agent-flags FLAGS` | Flags passed to the agent (default: `--dangerously-skip-permissions`) |
 | `--agent-timeout N` | Seconds per agent invocation (default: 300) |
-| `--lint-timeout N` | Seconds for the linter, budgeted apart from the suite (default: 180) |
-| `--test-timeout N` | Seconds for the test suite and hook-firing git ops (default: 600) |
+| `--lint-timeout N` | Seconds added to the aggregate gate budget (default: 180) |
+| `--test-timeout N` | Seconds added to the gate budget, and the budget for hook-firing Git operations (default: 600) |
 | `--command-timeout N` | Seconds for git, gh and other shell commands (default: 120) |
 | `--ci-timeout N` | Minutes to wait for CI (default: 10) |
 | `--repo-timeout N` | Minutes per repository, 0 for no limit (default: 60) |
@@ -187,7 +190,7 @@ What is trusted: the GitHub CLI's authentication, dependabot's identity as repor
 | Unverified package contents | Updates are checked for age, not legitimacy. A compromised upstream release is merged like any other. |
 | Data sent to the AI provider | CI logs (up to 20 KB), test output and dependency files leave your machine. CI logs can contain secrets a workflow echoed. |
 | Red default branch | An unfixable CI failure is left in place, deliberately (see below), so an unattended run can leave the branch broken. |
-| Unverified commits | A repository with no detectable test command is committed to on the agent's own report. |
+| Unverified commits | A repository declaring only lint or build checks is committed without a test-suite verdict. |
 
 ### Mitigations
 
@@ -215,16 +218,11 @@ Rewinding would mean force pushing away commits that are already on the remote, 
 
 ## Developing
 
-Checks require Docker and use the Python version in `.python-version`. The checkout
-is mounted read-only; pinned development dependencies, caches and temporary files
-stay in container scratch storage. `make check` compiles the Python sources, runs
-the suite, and checks lint and formatting.
-
 ```bash
 make check
-./scripts/test-in-container python -m pytest \
-  test_ai_maintainer.py::TestGitClient -v -p no:cacheprovider
 ```
+
+The project-owned launcher runs compilation, the full pytest suite, Ruff lint and formatting in an isolated container. Use the declared Make subset targets for narrower checks; native aliases use the same interface.
 
 ## License
 
