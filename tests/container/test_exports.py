@@ -259,6 +259,7 @@ def _launcher_fixture(monkeypatch: pytest.MonkeyPatch, checkout: Path, scratch: 
         f'run)\nprintf "%s\\n" docker-run >> {quoted_log}\nexporting=0\n'
         'while [ "$#" -gt 0 ]; do\nif [ "$1" = --cidfile ]; then shift; '
         f'printf "%s\\n" "{"1" * 64}" > "$1"; fi\n'
+        f'if [ "$1" = --tmpfs ]; then shift; printf "%s\\n" "$1" >> {shlex.quote(str(scratch / "mounts.log"))}; fi\n'
         'if [ "$1" = CHECK_EXPORT=1 ]; then exporting=1; fi\nshift\ndone\n'
         f'if [ "$exporting" = 1 ]; then tar --create --file - --directory {shlex.quote(str(reports))} coverage.txt; '
         'else printf "%s\\n" "command output"; fi\n;;\n'
@@ -274,6 +275,20 @@ def _launcher_fixture(monkeypatch: pytest.MonkeyPatch, checkout: Path, scratch: 
 
 
 class TestLaunchContracts:
+    def test_snapshot_workspace_is_owned_by_the_selected_runtime_identity(
+        self, export_context: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        checkout, scratch = export_context
+        launcher, _, _ = _launcher_fixture(monkeypatch, checkout, scratch)
+
+        result = _run(checkout, [str(launcher), "test"])
+
+        assert result.returncode == 0, result.stderr
+        workspace = next(
+            line for line in (scratch / "mounts.log").read_text().splitlines() if line.startswith("/work:")
+        )
+        assert ",uid=19001,gid=19001," in workspace
+
     def test_public_test_exports_declared_reports_with_replacement(
         self, export_context: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
     ) -> None:
