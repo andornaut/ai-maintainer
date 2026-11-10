@@ -74,8 +74,16 @@ def no_real_sleeping(monkeypatch):
 
 @pytest.fixture
 def repo_path(tmp_path):
-    """A directory that looks like a git repository."""
-    (tmp_path / ".git").mkdir()
+    """A repository with real local Git metadata and no configured credentials."""
+    gm.subprocess.run(
+        ["/usr/bin/git", "init", "--quiet", "--initial-branch=main", str(tmp_path)],
+        stdin=gm.subprocess.DEVNULL,
+        stdout=gm.subprocess.DEVNULL,
+        stderr=gm.subprocess.PIPE,
+        timeout=10,
+        check=True,
+        start_new_session=True,
+    )
     return tmp_path
 
 
@@ -412,6 +420,7 @@ class TestValidateRepo:
         maintainer.git.current_branch = "feature/wip"
         assert maintainer._validate_repo() is False
         maintainer.git.pull_changes.assert_not_called()
+        maintainer._detected_checks.assert_not_called()
 
     def test_a_dirty_working_directory_is_skipped(self, repo_path, default_config):
         # Uncommitted work here is someone else's; the AI fix paths commit the
@@ -420,6 +429,7 @@ class TestValidateRepo:
         maintainer.git.is_workdir_clean.return_value = False
         assert maintainer._validate_repo() is False
         maintainer.git.pull_changes.assert_not_called()
+        maintainer._detected_checks.assert_not_called()
 
     def test_a_tree_the_pull_dirtied_is_skipped(self, repo_path, default_config):
         # Merge conflicts leave conflict markers in the tree
@@ -4008,9 +4018,11 @@ class TestProjectCheckContract:
         maintainer = gm.Maintainer(repo_path, default_config)
         maintainer.git = MagicMock()
         maintainer.git.is_git_repo.return_value = True
+        maintainer.git.current_branch = "main"
+        maintainer.git.get_default_branch.return_value = "main"
         assert not maintainer._validate_repo()
         maintainer.git.pull_changes.assert_not_called()
-        maintainer.git.get_default_branch.assert_not_called()
+        maintainer.git.get_default_branch.assert_called_once_with(refresh=False)
         assert maintainer._verification_blocked
 
     def test_pull_must_preserve_the_interface_before_dependency_work(self, repo_path, default_config):
@@ -4188,3 +4200,102 @@ class TestVerificationSnapshot:
         monkeypatch.setattr(gm, "run_command", lambda *a, **k: (False, "", "unavailable"))
         with pytest.raises(gm.WorkingTreeError, match="preserve"):
             maintainer._verification_snapshot()
+
+
+class TestWritableContainerGuard:
+    def _marker(self, repo_path):
+        return repo_path / ".git" / "container-exec-active"
+
+    def test_marker_lookup_is_exact_metadata_only_git_query(self, repo_path, monkeypatch):
+        calls = []
+        marker = self._marker(repo_path)
+
+        def query(command, *args):
+            calls.append(command)
+            return True, str(marker) + "\n", ""
+
+        monkeypatch.setattr(gm, "_run_command_raw", query)
+        gm._assert_container_exec_idle(repo_path, 10)
+        assert calls == [
+            [
+                "git",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "container-exec-active",
+            ]
+        ]
+
+    @pytest.mark.parametrize("operation", ["reset_changes", "stash_drop", "stage_all"])
+    def test_active_marker_blocks_git_mutation_before_execution(self, repo_path, monkeypatch, operation):
+        marker = self._marker(repo_path)
+        marker.mkdir()
+        original = gm._run_command_raw
+        calls = []
+
+        def run(command, *args, **kwargs):
+            calls.append(command)
+            return original(command, *args, **kwargs)
+
+        monkeypatch.setattr(gm, "_run_command_raw", run)
+        git = gm.GitClient(repo_path, MagicMock())
+        with pytest.raises(gm.WorkingTreeError, match="cleanup is unconfirmed"):
+            getattr(git, operation)()
+        assert all("--git-path" in command for command in calls)
+        assert marker.exists()
+
+    @pytest.mark.parametrize("stderr", ["command failed", "Command timed out after 1s"])
+    def test_unconfirmed_marker_after_command_failure_preserves_state(self, repo_path, monkeypatch, stderr):
+        marker = self._marker(repo_path)
+
+        def run(command, *args):
+            if "--git-path" in command:
+                return True, str(marker), ""
+            marker.mkdir()
+            return False, "", stderr
+
+        monkeypatch.setattr(gm, "_run_command_raw", run)
+        with pytest.raises(gm.WorkingTreeError, match="preserve source and stash"):
+            gm.run_command(["make", "exec", "COMMAND=operation"], repo_path, 1)
+        assert marker.exists()
+
+    @pytest.mark.parametrize("response", ["response", None])
+    def test_agent_result_or_timeout_cannot_return_before_guard(self, repo_path, default_config, monkeypatch, response):
+        marker = self._marker(repo_path)
+        client = gm.AgentClient(repo_path, repo_path.name, default_config, MagicMock())
+
+        def ask(*args):
+            marker.mkdir()
+            return response
+
+        monkeypatch.setattr(client, "_ask", ask)
+        with pytest.raises(gm.WorkingTreeError, match="cleanup is unconfirmed"):
+            client.ask("update")
+        assert marker.exists()
+
+    def test_marker_contents_are_never_read_or_cleared(self, repo_path, monkeypatch):
+        marker = self._marker(repo_path)
+        marker.mkdir()
+        (marker / "state").write_text("launcher-owned metadata")
+        monkeypatch.setattr(Path, "read_text", lambda *a, **k: pytest.fail("marker contents read"))
+        monkeypatch.setattr(Path, "read_bytes", lambda *a, **k: pytest.fail("marker contents read"))
+        with pytest.raises(gm.WorkingTreeError, match="cleanup is unconfirmed"):
+            gm._assert_container_exec_idle(repo_path, 10)
+        assert (marker / "state").exists()
+
+    def test_unknown_marker_location_is_not_treated_as_idle(self, repo_path, monkeypatch):
+        monkeypatch.setattr(gm, "_run_command_raw", lambda *a, **k: (False, "", "Git unavailable"))
+        with pytest.raises(gm.WorkingTreeError, match="Cannot determine"):
+            gm.run_command(["git", "reset", "--hard"], repo_path, 10)
+
+    def test_unconfirmed_exec_prevents_commit_and_preserves_stash(self, repo_path, default_config):
+        self._marker(repo_path).mkdir()
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False)
+        with pytest.raises(gm.WorkingTreeError, match="cleanup is unconfirmed"):
+            maintainer.commit_and_push("fix: update")
+        with pytest.raises(gm.WorkingTreeError, match="cleanup is unconfirmed"):
+            maintainer.git.stash_drop()

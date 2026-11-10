@@ -220,6 +220,7 @@ NO_FAILED_JOB_LOG_NOTE = (
 MAX_LOGGED_STAGED_FILES = 20
 
 CHECK_CATEGORIES = frozenset({"lint", "test", "build"})
+CONTAINER_EXEC_ACTIVE_MARKER = "container-exec-active"
 
 # Dependency files to check for in repositories
 DEPENDENCY_FILES = (
@@ -332,7 +333,7 @@ def _stop_process_group(proc: subprocess.Popen) -> CommandResult:
     return False, "", ""
 
 
-def run_command(
+def _run_command_raw(
     cmd: list[str],
     cwd: Path,
     timeout: int | None = None,
@@ -364,6 +365,50 @@ def run_command(
         raise
     except (subprocess.SubprocessError, OSError) as error:
         return False, "", str(error)
+
+
+def _assert_container_exec_idle(cwd: Path, timeout: int) -> None:
+    """Require project-owned writable execution to confirm its own teardown."""
+    if not (cwd / ".git").exists():
+        return
+    success, output, stderr = _run_command_raw(
+        [
+            "git",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            CONTAINER_EXEC_ACTIVE_MARKER,
+        ],
+        cwd,
+        timeout,
+    )
+    if not success or not output.strip() or not Path(output.strip()).is_absolute():
+        raise WorkingTreeError(f"Cannot determine writable container state; preserve changes: {stderr.strip()}")
+    marker = Path(output.strip())
+    try:
+        marker.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise WorkingTreeError("Cannot read writable container state; preserve source and stash") from error
+    raise WorkingTreeError(f"Writable container cleanup is unconfirmed; preserve source and stash: {marker}")
+
+
+def run_command(
+    cmd: list[str],
+    cwd: Path,
+    timeout: int | None = None,
+) -> CommandResult:
+    timeout = DEFAULT_COMMAND_TIMEOUT_SECONDS if timeout is None else timeout
+    _assert_container_exec_idle(cwd, timeout)
+    try:
+        return _run_command_raw(cmd, cwd, timeout)
+    finally:
+        _assert_container_exec_idle(cwd, timeout)
 
 
 def run_shell_command(
@@ -489,6 +534,13 @@ class AgentClient:
         return _stop_process_group(proc)
 
     def ask(self, prompt: str, context: dict[str, Any] | None = None) -> str | None:
+        _assert_container_exec_idle(self.repo_path, self.config.command_timeout_seconds)
+        try:
+            return self._ask(prompt, context)
+        finally:
+            _assert_container_exec_idle(self.repo_path, self.config.command_timeout_seconds)
+
+    def _ask(self, prompt: str, context: dict[str, Any] | None = None) -> str | None:
         """Ask the AI agent for a decision.
 
         Returns the agent's raw response, or None if the agent could not be
@@ -2061,13 +2113,6 @@ class Maintainer:
             self.logger.debug(f"[{self.repo_name}] Not a git repository, skipping")
             return False
 
-        try:
-            self._detected_checks()
-        except CheckContractError as error:
-            self._verification_blocked = str(error)
-            self.logger.warning(f"[{self.repo_name}] Verification blocked before pull: {error}")
-            return False
-
         default_branch = self.git.get_default_branch(refresh=not self.config.dry_run)
         if not default_branch:
             self.logger.warning(f"[{self.repo_name}] Could not determine default branch, skipping")
@@ -2088,6 +2133,13 @@ class Maintainer:
         # Pull changes (requires clean working directory)
         if not self.git.is_workdir_clean():
             self.logger.warning(f"[{self.repo_name}] Working directory not clean, skipping")
+            return False
+
+        try:
+            self._detected_checks()
+        except CheckContractError as error:
+            self._verification_blocked = str(error)
+            self.logger.warning(f"[{self.repo_name}] Verification blocked before pull: {error}")
             return False
 
         if not self.config.dry_run and not self.git.pull_changes():
