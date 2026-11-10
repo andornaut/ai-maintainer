@@ -63,26 +63,13 @@ A repository with no dependency files remains eligible. It must declare the veri
 
 ### Project execution contract
 
-Each maintained repository owns its container launcher and exposes these Make targets:
+Each maintained repository exposes `make check`, which runs its complete verification gate in its project image. This is the only Make target the consumer requires. Native npm, Cargo, Rake and other task-runner commands remain host commands and do not delegate to Make. Native hooks retain their ordinary behavior, including staged-file autofixes.
 
-| Target | Contract |
-| --- | --- |
-| `make check-info` | Print only versioned JSON describing the full gate |
-| `make check` | Run every declared category once in containers |
-| `make lint`, `make test`, `make build` | Run the corresponding declared subset |
-| `make exec COMMAND='...'` | Run a dependency query, install, update or other project command in its container |
+Before pulling and before dependency work, the consumer requires a root `Makefile` and an available Make executable. It does not probe targets, read verification metadata, detect languages or infer an alternative command. A missing `check` target is reported when `make check` runs.
 
-For example, a project with all three categories returns:
+The project's thin Make orchestration is trusted. Its launcher owns runtime versions, dependency setup, container isolation and cleanup. Writable execution creates the per-worktree Git metadata marker `container-exec-active` before launching its container and removes it only after confirmed teardown. The consumer checks that marker around managed commands and agent calls. Unconfirmed or unreadable state preserves source changes and stashes, and prevents subsequent resets or commits; the consumer never manages Docker.
 
-```json
-{"version":1,"checks":["lint","test","build"]}
-```
-
-`checks` is a nonempty unique subset of `lint`, `test` and `build`. The metadata and full gate derive from the same project task list. Missing, unreadable, malformed or unsupported metadata blocks maintenance before the pull. The interface is checked again after pulling and before dependency updates. There is no language detection, guessed suite, host runner probe or fallback for unmigrated repositories.
-
-The project's thin Make orchestration is trusted. Its launcher owns runtime versions, dependency setup, container isolation and cleanup, including cleanup when Make receives a termination signal. Writable execution creates the per-worktree Git metadata marker `container-exec-active` before launching its container and removes it only after confirmed teardown. The consumer checks that marker around managed commands and agent calls. Unconfirmed or unreadable state preserves source changes and stashes, and prevents subsequent resets or commits; the consumer never manages Docker. Native task-runner aliases call the same project targets. Git retains its existing host authentication and fires the project's actual hooks, which must use those container-backed targets. The AI agent is instructed to use Make for every project operation; this is command discipline, not an adversarial sandbox around its host process.
-
-Dependency queries also use `make exec`. Make wrappers freeze raw command and test-argument values with `override COMMAND := $(value COMMAND)` and `override TEST_ARGS := $(value TEST_ARGS)`, then export them as data. The consumer passes command text unchanged: dollar signs, shell substitutions and Make-like expressions must not expand in host Make or its orchestration shell. The project container interprets the command. Dry runs read metadata but do not pull, run push-probe hooks, update dependencies or invoke the verification gate.
+Dependency queries, installs and updates use native project tools on the host. Git retains its existing host authentication and fires the project's actual hooks. The AI agent is instructed to verify with `make check` and preserve lint, test and build configuration. This instruction does not sandbox the agent's host process. Dry runs do not pull, run push-probe hooks, update dependencies or invoke the verification gate.
 
 ### Dependency updates
 
@@ -117,12 +104,12 @@ Step 6 pushes any unpushed commit on the branch, not only its own, so a dependab
 
 ### Verification
 
-Step 5 invokes `make check` once after dependency changes or merges. The project determines the order of its lint, test and build tasks. The gate receives the sum of `--lint-timeout` and `--test-timeout` once, rather than separate invocations that repeat its work.
+Step 5 invokes `make check` once after dependency changes or merges. The project determines which checks its full gate runs and their order. The gate receives the sum of `--lint-timeout` and `--test-timeout` once, rather than separate invocations that repeat its work.
 
-- A failed gate is a verification failure, whatever category failed.
-- A passing gate whose metadata omits `test` remains `TESTS_NOT_RUN`, with an explicit message that its declared checks passed without a suite.
-- Missing or unreadable metadata is `TESTS_BLOCKED`, never evidence that no suite exists, and blocks committing.
-- Dependency updates and both fix paths reject removal of any previously declared category, including builds.
+- Exit zero means project verification passed. It does not establish that a test suite exists.
+- A nonzero gate, including a missing `check` target, is a verification failure with its command output. No native command or AI inference substitutes for the gate.
+- A missing Makefile or unavailable Make executable blocks verification and committing. Disabling verification with `--no-run-tests` reports changes as unverified.
+- Dependency updates and both fix paths reject a missing verification entrypoint. The agent is instructed not to remove or weaken checks; the consumer does not infer check categories.
 - Before and after the gate, the maintainer fingerprints HEAD, the index, working-tree status and changed-file contents. A changed or unreadable snapshot discards the result and preserves source changes and any pending stash. Credential-shaped paths and changed paths resolving outside the checkout are refused.
 - Commands run in bounded process groups. On timeout, the project launcher gets a termination signal and time to clean up before forced termination. Container lifecycle remains the project's responsibility.
 - `--repo-timeout` bounds each repository's total wall clock, CI waits included.
@@ -190,7 +177,7 @@ What is trusted: the GitHub CLI's authentication, dependabot's identity as repor
 | Unverified package contents | Updates are checked for age, not legitimacy. A compromised upstream release is merged like any other. |
 | Data sent to the AI provider | CI logs (up to 20 KB), test output and dependency files leave your machine. CI logs can contain secrets a workflow echoed. |
 | Red default branch | An unfixable CI failure is left in place, deliberately (see below), so an unattended run can leave the branch broken. |
-| Unverified commits | A repository declaring only lint or build checks is committed without a test-suite verdict. |
+| Unverified commits | A passing project gate does not establish that its checks include a test suite. |
 
 ### Mitigations
 
@@ -222,7 +209,7 @@ Rewinding would mean force pushing away commits that are already on the remote, 
 make check
 ```
 
-The project-owned launcher runs compilation, the full pytest suite, Ruff lint and formatting in an isolated container. Use the declared Make subset targets for narrower checks; native aliases use the same interface.
+The project-owned launcher runs compilation, the full pytest suite, Ruff lint and formatting in an isolated container.
 
 ## License
 
