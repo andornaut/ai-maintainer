@@ -2,7 +2,9 @@ ARG PYTHON_VERSION=3.12
 FROM koalaman/shellcheck:v0.11.0 AS shellcheck
 
 FROM node:24.22.2 AS markdown
-RUN npm install --prefix /opt/markdown --no-audit --no-fund --ignore-scripts markdownlint-cli2@0.24.0
+WORKDIR /opt/markdown
+COPY tests/container/package.json tests/container/package-lock.json ./
+RUN npm ci --ignore-scripts --no-audit --no-fund
 
 FROM python:${PYTHON_VERSION}
 
