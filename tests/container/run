@@ -34,7 +34,8 @@ if [[ ! ${limit} =~ ^[1-9][0-9]*$ ]]; then printf '%s\n' 'CHECK_TIMEOUT_SECONDS 
 scratch_size=${CHECK_SCRATCH_SIZE:-1g}
 work_size=${CHECK_WORK_SIZE:-2g}
 tmp_size=${CHECK_TMP_SIZE:-1g}
-for size in "${scratch_size}" "${work_size}" "${tmp_size}"; do
+memory_limit=${CHECK_MEMORY:-4g}
+for size in "${scratch_size}" "${work_size}" "${tmp_size}" "${memory_limit}"; do
     if [[ ! ${size} =~ ^[1-9][0-9]*[kKmMgG]?$ ]]; then printf 'Invalid container scratch size: %s\n' "${size}" >&2; exit 2; fi
 done
 container_user=19001:19001
@@ -76,7 +77,12 @@ contained() {
     if [[ ${resolved} == "${checkout}" ]]; then
         relative=$(basename -- "${path}")
     else
-        relative=${resolved#"${checkout}/"}/$(basename -- "${path}")
+        relative=${resolved#"${checkout}/"}
+        if excluded "${relative}" || excluded "${relative}/"; then
+            printf 'Source parent resolves to an excluded location: %s\n' "${path}" >&2
+            return 2
+        fi
+        relative+=/$(basename -- "${path}")
     fi
     if excluded "${relative}"; then printf 'Source path resolves to an excluded location: %s\n' "${path}" >&2; return 2; fi
 }
@@ -115,6 +121,7 @@ done < "${checkout}/tests/container/context" > "${scratch}/context.list"
 tar --create --file "${scratch}/context.tar" --directory "${checkout}" \
     --null --verbatim-files-from --no-recursion --files-from "${scratch}/context.list"
 revision=$(git -C "${checkout}" rev-parse HEAD)
+source_epoch=$(git -C "${checkout}" show -s --format=%ct HEAD)
 source_dirty=false
 if [[ -n $(git -C "${checkout}" status --porcelain=v1 --untracked-files=all) ]]; then source_dirty=true; fi
 source_hash=
@@ -130,8 +137,15 @@ for value in "${build_values[@]}"; do
     if [[ ! ${value} =~ ^[A-Za-z_][A-Za-z0-9_]*=.+$ ]]; then printf 'Invalid container build argument: %s\n' "${value}" >&2; exit 2; fi
     build_args+=(--build-arg "${value}")
 done
+build_help=$(docker build --help)
+if [[ ${build_help} != *--resource* || ${build_help} != *--ulimit* ]]; then
+    printf '%s\n' 'Docker build requires CPU, memory and nofile limit support; uncapped builds are disabled.' >&2
+    exit 2
+fi
 timeout --signal=TERM --kill-after=10 "${limit}" \
-    docker build --tag "${image}" --iidfile "${scratch}/image.id" --file tests/container/Dockerfile "${build_args[@]}" - \
+    docker build --resource cpu-period=100000 --resource cpu-quota=400000 \
+    --resource "memory=${memory_limit}" --ulimit nofile=256:256 \
+    --tag "${image}" --iidfile "${scratch}/image.id" --file tests/container/Dockerfile "${build_args[@]}" - \
     < "${scratch}/context.tar" >&2
 image=$(cat "${scratch}/image.id")
 read -r -a outputs <<< "${BUILD_OUTPUTS:-}"
@@ -167,14 +181,16 @@ run_category() {
     timeout --signal=TERM --kill-after=10 "${limit}" docker run \
         --cidfile "${cidfile}" --user "${container_user}" \
         --group-add "$(stat -c %g "${checkout}")" \
+        --cpus 4 --memory "${memory_limit}" --ulimit nofile=256:256 \
         --read-only --cap-drop ALL --security-opt no-new-privileges \
         --pids-limit 512 --network "${network}" \
         "${mounts[@]}" --tmpfs "/scratch:rw,exec,nosuid,size=${scratch_size},mode=1777" \
         --tmpfs "/tmp:rw,exec,nosuid,size=${tmp_size},mode=1777" \
-        --env HOME=/scratch/home --env TMPDIR=/scratch \
+        --env HOME=/tmp --env TMPDIR=/scratch \
         --env PYTHONPYCACHEPREFIX=/scratch/pycache --env RUFF_CACHE_DIR=/scratch/ruff \
         --env "CHECK_TASKS=${CHECK_TASKS:-}" --env "COMMAND=${COMMAND:-}" \
         --env "CHECK_REVISION=${revision}" --env "CHECK_SOURCE_SHA256=${source_hash}" --env "CHECK_SOURCE_DIRTY=${source_dirty}" \
+        --env "SOURCE_DATE_EPOCH=${source_epoch}" \
         --env "BUILD_OUTPUTS=${BUILD_OUTPUTS:-}" --env "CHECK_EXPORT=$([[ ${action} == build ]] && printf 1 || printf 0)" \
         --env "CHECK_WRITABLE=$([[ ${category} == exec ]] && printf 1 || printf 0)" \
         --entrypoint /bin/sh "${image}" -ec '
