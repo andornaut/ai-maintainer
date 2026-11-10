@@ -215,10 +215,15 @@ Rewinding would mean force pushing away commits that are already on the remote, 
 
 ## Developing
 
+Checks require Docker and use the Python version in `.python-version`. The checkout
+is mounted read-only; pinned development dependencies, caches and temporary files
+stay in container scratch storage. `make check` compiles the Python sources, runs
+the suite, and checks lint and formatting.
+
 ```bash
-python -m pytest test_ai_maintainer.py -v                 # the suite
-python -m pytest test_ai_maintainer.py::TestGitClient -v  # one class
-ruff check . && ruff format --check .
+make check
+./scripts/test-in-container python -m pytest \
+  test_ai_maintainer.py::TestGitClient -v -p no:cacheprovider
 ```
 
 ## License

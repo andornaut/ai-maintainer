@@ -1,0 +1,35 @@
+#!/bin/sh
+set -eu
+
+checkout=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+image="python:$(cat "${checkout}/.python-version")"
+
+docker run --rm \
+    --user 19001:19001 \
+    --group-add "$(stat -c %g "${checkout}")" \
+    --pids-limit 512 \
+    --read-only \
+    --cap-drop ALL \
+    --security-opt no-new-privileges \
+    --mount "type=bind,source=${checkout},target=/src,readonly" \
+    --tmpfs /scratch:rw,exec,nosuid,size=1g,mode=1777 \
+    --env HOME=/scratch \
+    --env TMPDIR=/scratch \
+    --env PYTHONPYCACHEPREFIX=/scratch/pycache \
+    --env RUFF_CACHE_DIR=/scratch/ruff \
+    --workdir /src \
+    "${image}" sh -c '
+        set -eu
+        python -m venv /scratch/venv
+        /scratch/venv/bin/python -m pip install --quiet --disable-pip-version-check \
+            -r /src/requirements-dev.txt
+        PATH="/scratch/venv/bin:${PATH}"
+        export PATH
+        if [ "$#" -gt 0 ]; then
+            exec "$@"
+        fi
+        python -m py_compile ai-maintainer test_ai_maintainer.py
+        python -m pytest -v -p no:cacheprovider --basetemp=/scratch/pytest
+        ruff check .
+        ruff format --check .
+    ' sh "$@"
