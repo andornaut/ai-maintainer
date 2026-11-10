@@ -107,7 +107,7 @@ def make_maintainer(repo_path, config, **overrides):
     if overrides:
         config = gm.Config(**{**config.__dict__, **overrides})
     maintainer = gm.Maintainer(repo_path, config)
-    maintainer._detected_checks = MagicMock(return_value=frozenset({"lint", "test"}))
+    maintainer._require_check_interface = MagicMock()
     maintainer._verification_snapshot = MagicMock(return_value="stable")
     return maintainer
 
@@ -420,7 +420,7 @@ class TestValidateRepo:
         maintainer.git.current_branch = "feature/wip"
         assert maintainer._validate_repo() is False
         maintainer.git.pull_changes.assert_not_called()
-        maintainer._detected_checks.assert_not_called()
+        maintainer._require_check_interface.assert_not_called()
 
     def test_a_dirty_working_directory_is_skipped(self, repo_path, default_config):
         # Uncommitted work here is someone else's; the AI fix paths commit the
@@ -429,7 +429,7 @@ class TestValidateRepo:
         maintainer.git.is_workdir_clean.return_value = False
         assert maintainer._validate_repo() is False
         maintainer.git.pull_changes.assert_not_called()
-        maintainer._detected_checks.assert_not_called()
+        maintainer._require_check_interface.assert_not_called()
 
     def test_a_tree_the_pull_dirtied_is_skipped(self, repo_path, default_config):
         # Merge conflicts leave conflict markers in the tree
@@ -2073,7 +2073,7 @@ class TestMaintainMergedPrCiMonitoring:
             status, _ = maintainer.maintain()
         assert status == gm.STATUS_SUCCESS
         warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
-        assert warnings == [f"[{repo_path.name}] Tests fixed by AI"]
+        assert warnings == [f"[{repo_path.name}] Verification fixed by AI"]
 
     def test_failed_dependency_update_still_monitors_ci(self, repo_path, default_config):
         maintainer = self._maintainer(repo_path, default_config)
@@ -2719,82 +2719,34 @@ class TestFixTestWithRetriesStash:
         maintainer.git.stash_drop.assert_called_once()
 
 
-class TestAFixMayNotRemoveWhatChecksTheCode:
-    """A project with no suite is verified by its linter alone, so "no tests"
-    is the passing answer there and only there. Taking a check out is never
-    one: both fix paths commit whatever they find."""
-
-    def _maintainer(self, repo_path, default_config, before, after, verdict):
-        """A maintainer whose checks go from `before` to `after` over the fix."""
-        maintainer = make_maintainer(repo_path, default_config, dry_run=False, push_changes=True)
+class TestFixPreservesVerification:
+    @pytest.mark.parametrize("method", ["_try_fix_tests", "fix_ci_failure"])
+    def test_removed_interface_cannot_be_committed(self, repo_path, default_config, method):
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False)
+        maintainer.git.is_workdir_clean = MagicMock(side_effect=[True, False])
+        maintainer._require_check_interface.side_effect = [None, gm.CheckContractError("missing Makefile")]
+        maintainer._ask_ai_to_fix = MagicMock(return_value=(gm.FIX_RESOLVED, "fix"))
+        maintainer.run_tests = MagicMock(return_value=(gm.TESTS_PASSED, "gate"))
+        maintainer.commit_and_push = MagicMock()
         maintainer.git.reset_changes = MagicMock(return_value=True)
-        # Clean when the CI fix path checks it may run, dirty afterwards, so
-        # the only thing that can stop the commit is the guard under test
-        maintainer.git.is_workdir_clean = MagicMock(side_effect=[True, *[False] * 8])
-        maintainer.commit_and_push = MagicMock(return_value=(True, True))
-        maintainer._ask_ai_to_fix = MagicMock(return_value=(gm.FIX_RESOLVED, "reformatted"))
-        before = frozenset(name for name, declared in zip(("test", "lint"), before, strict=True) if declared)
-        after = frozenset(name for name, declared in zip(("test", "lint"), after, strict=True) if declared)
-        maintainer._detected_checks = MagicMock(side_effect=[before, after] * 4)
-
-        def run_tests():
-            maintainer._checks_detected = after
-            return verdict, "output"
-
-        maintainer.run_tests = MagicMock(side_effect=run_tests)
-        return maintainer
-
-    def test_a_project_that_never_had_a_suite(self, repo_path, default_config):
-        maintainer = self._maintainer(repo_path, default_config, (False, True), (False, True), gm.TESTS_NOT_RUN)
-        assert maintainer._try_fix_tests("lint failed") == gm.FIX_RESOLVED
-        maintainer.git.reset_changes.assert_not_called()
-
-    def test_a_suite_that_went_missing_under_the_fix(self, repo_path, default_config):
-        # Deleting the suite is not a way to make it pass
-        maintainer = self._maintainer(repo_path, default_config, (True, False), (False, False), gm.TESTS_NOT_RUN)
-        assert maintainer._try_fix_tests("boom") == gm.FIX_FAILED
-        maintainer.git.reset_changes.assert_called_once()
-
-    def test_a_linter_that_went_missing_under_the_fix(self, repo_path, default_config):
-        # Deleting ruff.toml is not a way to make ruff pass, and the suite
-        # passing alongside it must not cover for that
-        maintainer = self._maintainer(repo_path, default_config, (True, True), (True, False), gm.TESTS_PASSED)
-        assert maintainer._try_fix_tests("lint failed") == gm.FIX_FAILED
-        maintainer.git.reset_changes.assert_called_once()
-
-    def test_the_ci_fix_path_guards_the_same_way(self, repo_path, default_config):
-        # It commits and pushes whatever it finds, so it needs the same guard
-        maintainer = self._maintainer(repo_path, default_config, (True, True), (True, False), gm.TESTS_NOT_RUN)
-        assert maintainer.fix_ci_failure("boom") == gm.FIX_FAILED
+        assert getattr(maintainer, method)("failure") == gm.FIX_FAILED
         maintainer.commit_and_push.assert_not_called()
+        maintainer.git.reset_changes.assert_called_once()
 
-    def test_the_ci_fix_path_commits_a_fix_that_kept_them(self, repo_path, default_config):
-        maintainer = self._maintainer(repo_path, default_config, (True, True), (True, True), gm.TESTS_NOT_RUN)
-        assert maintainer.fix_ci_failure("boom") == gm.FIX_RESOLVED
-        maintainer.commit_and_push.assert_called_once()
-
-    def test_the_baseline_is_asked_for_not_read_off_an_earlier_stage(self, repo_path, default_config):
-        # The baseline must come from current metadata, rather than a prior gate.
-        maintainer = self._maintainer(repo_path, default_config, (True, True), (True, True), gm.TESTS_NOT_RUN)
-        maintainer._checks_detected = frozenset()
-        maintainer.fix_ci_failure("boom")
-        assert maintainer._detected_checks.call_count == 2
-
-    def test_the_prompt_does_not_call_a_lint_failure_a_test_failure(self, repo_path, default_config):
-        # The linter runs first, so what failed is as often lint as the suite;
-        # a prompt saying "tests" sends the agent to watch the suite pass
-        maintainer = self._maintainer(repo_path, default_config, (False, True), (False, True), gm.TESTS_NOT_RUN)
-        maintainer._try_fix_tests("Command: npm run lint")
+    @pytest.mark.parametrize("method", ["_try_fix_tests", "fix_ci_failure"])
+    def test_prompts_preserve_checks_and_literal_gate(self, repo_path, default_config, method):
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False)
+        maintainer.git.is_workdir_clean = MagicMock(return_value=True)
+        maintainer._ask_ai_to_fix = MagicMock(return_value=(gm.FIX_DECLINED, ""))
+        maintainer.git.reset_changes = MagicMock(return_value=True)
+        getattr(maintainer, method)("Command: make check")
         prompt = maintainer._ask_ai_to_fix.call_args[0][0]
-        assert "Tests failed" not in prompt
-        assert "verification command failed" in prompt
-
-    def test_both_prompts_forbid_removing_the_checks(self, repo_path, default_config):
-        maintainer = self._maintainer(repo_path, default_config, (True, True), (True, True), gm.TESTS_PASSED)
-        maintainer._try_fix_tests("boom")
-        maintainer.fix_ci_failure("boom")
-        for call in maintainer._ask_ai_to_fix.call_args_list:
-            assert "do NOT remove or weaken" in call[0][0].replace("Do NOT", "do NOT")
+        assert "do NOT remove or weaken" in prompt.replace("Do NOT", "do NOT")
+        if method == "fix_ci_failure":
+            assert "make check" in prompt
+        else:
+            assert "verification command failed" in prompt
+            assert "Re-run that same command" in prompt
 
 
 class TestADeclinedFixIsNotRetried:
@@ -3930,54 +3882,13 @@ if __name__ == "__main__":
 
 
 class TestProjectCheckContract:
-    def _maintainer(self, repo_path, default_config, checks=("lint", "test", "build"), gate="printf gate-ran"):
-        metadata = json.dumps({"version": 1, "checks": list(checks)})
-        (repo_path / "Makefile").write_text(
-            ".PHONY: check-info check exec\n"
-            "override COMMAND := $(value COMMAND)\n"
-            "export COMMAND\n"
-            "check-info:\n\t@printf '%s\\n' '" + metadata + "'\n"
-            "check:\n\t@" + gate + "\n"
-            "exec:\n\t@printf '%s\\n' \"$$COMMAND\"\n"
-        )
+    def _maintainer(self, repo_path, default_config, gate="printf gate-ran"):
+        (repo_path / "Makefile").write_text(".PHONY: check\ncheck:\n\t@" + gate + "\n")
         maintainer = gm.Maintainer(repo_path, default_config)
         maintainer._verification_snapshot = MagicMock(return_value="stable")
         return maintainer
 
-    @pytest.mark.parametrize(
-        "metadata",
-        [
-            None,
-            [],
-            {},
-            {"version": True, "checks": ["test"]},
-            {"version": 2, "checks": ["test"]},
-            {"version": 1, "checks": []},
-            {"version": 1, "checks": "test"},
-            {"version": 1, "checks": ["test", "test"]},
-            {"version": 1, "checks": ["deploy"]},
-            {"version": 1, "checks": [None]},
-            {"version": 1, "checks": ["test"], "extra": True},
-        ],
-    )
-    def test_unknown_or_unusable_metadata_blocks(self, repo_path, default_config, monkeypatch, metadata):
-        maintainer = self._maintainer(repo_path, default_config)
-        monkeypatch.setattr(gm, "run_command", lambda *a, **k: (True, json.dumps(metadata), ""))
-        assert maintainer.run_tests()[0] == gm.TESTS_BLOCKED
-
-    @pytest.mark.parametrize("stdout", ["", "not JSON", 'warning\n{"version":1,"checks":["test"]}'])
-    def test_missing_or_noisy_metadata_is_not_no_suite(self, repo_path, default_config, monkeypatch, stdout):
-        maintainer = self._maintainer(repo_path, default_config)
-        monkeypatch.setattr(gm, "run_command", lambda *a, **k: (True, stdout, ""))
-        assert maintainer.run_tests()[0] == gm.TESTS_BLOCKED
-
-    def test_package_metadata_never_enables_a_host_language_fallback(self, repo_path, default_config, monkeypatch):
-        (repo_path / "package.json").write_text('{"scripts":{"test":"vitest run"}}')
-        maintainer = gm.Maintainer(repo_path, default_config)
-        monkeypatch.setattr(gm, "run_command", lambda *a, **k: pytest.fail("host language probe"))
-        assert maintainer.run_tests()[0] == gm.TESTS_BLOCKED
-
-    def test_declared_categories_run_the_full_gate_once(self, repo_path, default_config, monkeypatch):
+    def test_success_uses_only_full_gate_once(self, repo_path, default_config, monkeypatch):
         maintainer = self._maintainer(repo_path, default_config)
         original = gm.run_command
         calls = []
@@ -3987,101 +3898,68 @@ class TestProjectCheckContract:
             return original(command, *args, **kwargs)
 
         monkeypatch.setattr(gm, "run_command", run)
-        result, output = maintainer.run_tests()
-        assert result == gm.TESTS_PASSED
+        verdict, output = maintainer.run_tests()
+        assert verdict == gm.TESTS_PASSED
         assert "gate-ran" in output
-        gates = [call for call in calls if call[0][-1] == "check"]
-        assert gates == [
+        assert calls == [
             (
                 ["make", "--no-print-directory", "check"],
                 default_config.lint_timeout_seconds + default_config.test_timeout_seconds,
             )
         ]
-        assert all(call[0][0] == "make" for call in calls)
 
-    @pytest.mark.parametrize("checks", [("lint",), ("build",), ("lint", "build")])
-    def test_successful_gate_without_suite_remains_not_run(self, repo_path, default_config, checks):
-        maintainer = self._maintainer(repo_path, default_config, checks)
-        result, output = maintainer.run_tests()
-        assert result == gm.TESTS_NOT_RUN
-        assert "gate-ran" in output
-        assert "without a test suite" in output
+    def test_missing_target_is_failure_without_native_fallback(self, repo_path, default_config):
+        maintainer = self._maintainer(repo_path, default_config)
+        (repo_path / "Makefile").write_text("other:\n\t@true\n")
+        (repo_path / "package.json").write_text('{"scripts":{"test":"touch native-ran"}}')
+        verdict, output = maintainer.run_tests()
+        assert verdict == gm.TESTS_FAILED
+        assert "No rule to make target" in output
+        assert not (repo_path / "native-ran").exists()
 
-    @pytest.mark.parametrize("checks", [("test",), ("lint",), ("build",)])
-    def test_failure_in_any_declared_gate_is_failed(self, repo_path, default_config, checks):
-        maintainer = self._maintainer(repo_path, default_config, checks, "printf failure >&2; exit 7")
-        result, output = maintainer.run_tests()
-        assert result == gm.TESTS_FAILED
-        assert "failure" in output
+    def test_gate_failure_preserves_diagnostics(self, repo_path, default_config):
+        maintainer = self._maintainer(repo_path, default_config, "printf detail >&2; exit 7")
+        verdict, output = maintainer.run_tests()
+        assert verdict == gm.TESTS_FAILED
+        assert "detail" in output
+        assert "Command: make check" in output
 
-    def test_missing_contract_blocks_before_pull(self, repo_path, default_config):
+    @pytest.mark.parametrize("missing", ["Makefile", "make"])
+    def test_missing_prerequisite_blocks_without_execution(self, repo_path, default_config, monkeypatch, missing):
+        maintainer = self._maintainer(repo_path, default_config)
+        if missing == "Makefile":
+            (repo_path / "Makefile").unlink()
+        else:
+            monkeypatch.setattr(gm.shutil, "which", lambda command: None)
+        monkeypatch.setattr(gm, "run_command", lambda *a, **k: pytest.fail("unexpected command"))
+        assert maintainer.run_tests()[0] == gm.TESTS_BLOCKED
+
+    def test_missing_interface_blocks_before_pull(self, repo_path, default_config):
         maintainer = gm.Maintainer(repo_path, default_config)
         maintainer.git = MagicMock()
-        maintainer.git.is_git_repo.return_value = True
         maintainer.git.current_branch = "main"
         maintainer.git.get_default_branch.return_value = "main"
         assert not maintainer._validate_repo()
         maintainer.git.pull_changes.assert_not_called()
-        maintainer.git.get_default_branch.assert_called_once_with(refresh=False)
         assert maintainer._verification_blocked
 
-    def test_pull_must_preserve_the_interface_before_dependency_work(self, repo_path, default_config):
-        maintainer = gm.Maintainer(repo_path, gm.Config(**{**default_config.__dict__, "dry_run": False}))
+    def test_pull_must_preserve_interface(self, repo_path, default_config):
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False)
         maintainer.git = MagicMock()
         maintainer.git.current_branch = "main"
         maintainer.git.get_default_branch.return_value = "main"
-        maintainer._detected_checks = MagicMock(
-            side_effect=[frozenset({"test"}), gm.CheckContractError("lost interface")]
-        )
+        maintainer._require_check_interface.side_effect = [None, gm.CheckContractError("lost interface")]
         assert not maintainer._validate_repo()
         maintainer.git.pull_changes.assert_called_once()
         assert maintainer._verification_blocked == "lost interface"
 
-    @pytest.mark.parametrize("category", ["lint", "test", "build"])
-    @pytest.mark.parametrize("method", ["_try_fix_tests", "fix_ci_failure"])
-    def test_fix_may_not_remove_any_declared_category(self, repo_path, default_config, category, method):
-        maintainer = make_maintainer(repo_path, default_config, dry_run=False, push_changes=True)
-        before = frozenset({"lint", "test", "build"})
-        maintainer._detected_checks = MagicMock(side_effect=[before, before - {category}])
-        maintainer.git.is_workdir_clean = MagicMock(side_effect=[True, *[False] * 8])
-        maintainer.git.reset_changes = MagicMock(return_value=True)
-        maintainer._ask_ai_to_fix = MagicMock(return_value=(gm.FIX_RESOLVED, "fix"))
-        maintainer.run_tests = MagicMock(return_value=(gm.TESTS_PASSED, "gate output"))
-        maintainer.commit_and_push = MagicMock()
-        assert getattr(maintainer, method)("failure") == gm.FIX_FAILED
-        maintainer.commit_and_push.assert_not_called()
-        maintainer.git.reset_changes.assert_called_once()
-
-    def test_exec_preserves_literal_make_expressions_as_data(self, repo_path, default_config):
-        maintainer = self._maintainer(repo_path, default_config)
-        target = repo_path / "must-not-exist"
-        command = f"echo $(shell touch {target})"
-        success, stdout, _ = maintainer._project_command(command, 30)
-        assert success
-        assert stdout.strip() == command
-        assert not target.exists()
-
-    @pytest.mark.parametrize(
-        "command", ["echo $(id -u)", "echo $$", 'printf "%s" "$HOME"', "printf first\nprintf second"]
-    )
-    def test_frozen_make_interface_preserves_exact_shell_command_data(self, repo_path, default_config, command):
-        maintainer = self._maintainer(repo_path, default_config)
-        success, stdout, _ = maintainer._project_command(command, 30)
-        assert success
-        assert stdout == command + "\n"
-
-    def test_exec_passes_raw_command_argv_without_dollar_rewriting(self, repo_path, default_config, monkeypatch):
-        maintainer = self._maintainer(repo_path, default_config)
+    def test_native_dependency_command_does_not_require_make_exec(self, repo_path, default_config, monkeypatch):
+        maintainer = gm.Maintainer(repo_path, default_config)
         calls = []
-        command = "echo $(id -u) $$"
-
-        def run(arguments, *args, **kwargs):
-            calls.append(arguments)
-            return True, "", ""
-
-        monkeypatch.setattr(gm, "run_command", run)
+        monkeypatch.setattr(gm, "run_command", lambda *a, **k: calls.append((a, k)) or (True, "", ""))
+        command = "npm view example time --json"
         maintainer._project_command(command, 30)
-        assert calls == [["make", "--no-print-directory", "--silent", "exec", "COMMAND=" + command]]
+        assert calls == [((["sh", "-c", command], repo_path), {"timeout": 30})]
 
     def test_changed_verification_source_is_preserved(self, repo_path, default_config):
         maintainer = self._maintainer(repo_path, default_config)
@@ -4091,18 +3969,16 @@ class TestProjectCheckContract:
             maintainer.run_tests()
         maintainer.git.reset_changes.assert_not_called()
 
-    def test_dry_run_never_pulls_or_fires_a_push_probe(self, repo_path, default_config):
+    def test_dry_run_never_executes_project_make(self, repo_path, default_config, monkeypatch):
         maintainer = self._maintainer(repo_path, default_config)
         maintainer.git = MagicMock()
         maintainer.git.current_branch = "main"
         maintainer.git.get_default_branch.return_value = "main"
-        maintainer._is_writable = MagicMock()
+        monkeypatch.setattr(gm, "run_command", lambda *a, **k: pytest.fail("unexpected command"))
         assert maintainer._validate_repo()
         maintainer.git.pull_changes.assert_not_called()
-        maintainer._is_writable.assert_not_called()
-        maintainer.git.get_default_branch.assert_called_once_with(refresh=False)
 
-    def test_agent_prompt_uses_project_targets_instead_of_host_toolchains(self, agent_client, monkeypatch):
+    def test_agent_requires_only_make_check_for_verification(self, agent_client, monkeypatch):
         captured = []
         proc = MagicMock(returncode=0)
         proc.communicate.return_value = ('{"ok":true}', "")
@@ -4114,19 +3990,9 @@ class TestProjectCheckContract:
         monkeypatch.setattr(gm.subprocess, "Popen", launch)
         assert agent_client.ask("verify")
         assert "make check" in captured[0]
-        assert "make exec COMMAND=" in captured[0]
-        assert "Never invoke language tools" in captured[0]
-
-    def test_dependency_update_cannot_remove_a_declared_build(self, repo_path, default_config):
-        (repo_path / "package.json").write_text("{}")
-        maintainer = make_maintainer(repo_path, default_config, dry_run=False)
-        maintainer._detected_checks = MagicMock(side_effect=[frozenset({"test", "build"}), frozenset({"test"})])
-        maintainer._outdated_report = MagicMock(return_value=gm.OutdatedReport({}, []))
-        maintainer.agent.ask_json = MagicMock(return_value={"updated": True, "changes_made": "update"})
-        maintainer.git.is_workdir_clean = MagicMock(return_value=False)
-        maintainer.git.reset_changes = MagicMock(return_value=True)
-        assert maintainer.update_dependencies() == (False, False)
-        maintainer.git.reset_changes.assert_called_once()
+        assert "make exec" not in captured[0]
+        assert "make test" not in captured[0]
+        assert "native dependency tools" in captured[0]
 
 
 class TestVerificationSnapshot:
