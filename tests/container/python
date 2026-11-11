@@ -1,0 +1,26 @@
+#!/bin/sh
+set -eu
+export VIRTUAL_ENV=/scratch/venv PATH="/scratch/venv/bin:$PATH"
+case "$1" in
+    prepare)
+        python -m venv /scratch/venv >&2
+        /scratch/venv/bin/python -m pip install --disable-pip-version-check -r requirements-dev.txt >&2
+        exec tar --create --file - --directory / scratch/venv
+        ;;
+    check)
+        for task in lint test build; do sh "$0" "$task"; done
+        ;;
+    lint)
+        for script in tests/container/run tests/container/stock tests/container/check-stock; do bash -n "$script"; done
+        for script in tests/container/check tests/container/python tests/container/markdown scripts/test-in-container; do sh -n "$script"; done
+        ruff check .
+        ruff format --check .
+        ;;
+    test)
+        exec python -m pytest -v -p no:cacheprovider --basetemp=/scratch/pytest
+        ;;
+    build)
+        exec python -m py_compile ai-maintainer test_ai_maintainer.py
+        ;;
+    *) exit 2 ;;
+esac

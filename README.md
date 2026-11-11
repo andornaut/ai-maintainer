@@ -209,7 +209,7 @@ Rewinding would mean force pushing away commits that are already on the remote, 
 make check
 ```
 
-The project-owned launcher runs compilation, the full pytest suite, Ruff lint and formatting in an isolated container.
+The project-owned Make gate runs compilation, the full pytest suite, Ruff lint and formatting in the declared Python stock image. Markdown and ShellCheck use separate pinned images. Each phase receives a sanitized source snapshot and disposable scratch storage.
 
 ## License
 
