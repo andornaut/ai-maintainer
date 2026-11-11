@@ -67,30 +67,26 @@ jobs:
           persist-credentials: false
 
       - name: Validate build
+        shell: bash
         run: |
-          set -eu
-          scratch=$(mktemp -d)
-          SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
-          export SOURCE_DATE_EPOCH
-          image="python:$(cat .python-version)"
-          docker run --rm -i --platform linux/amd64 --read-only \
-            --user "$(id -u):$(id -g)" --cap-drop ALL \
-            --security-opt no-new-privileges --cpus 4 --memory 4g --pids-limit 512 \
-            --mount "type=bind,src=$PWD,dst=/project,readonly" \
-            --mount "type=bind,src=$scratch,dst=/scratch" \
-            -e SOURCE_DATE_EPOCH \
-            -e HOME=/scratch/home -e TMPDIR=/scratch/tmp \
-            -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPYCACHEPREFIX=/scratch/pycache \
-            "$image" sh -se <<'CONTAINER'
-          mkdir -p /scratch/home /scratch/tmp /scratch/work
-          test "$(uname -m)" = x86_64
-          mkdir -p /scratch/work/tests/container
-          cp /project/ai-maintainer /project/test_ai_maintainer.py /project/requirements-dev.txt /scratch/work/
-          cp /project/tests/container/run /project/tests/container/test_exports.py /scratch/work/tests/container/
-          cd /scratch/work
-          python --version
-          python -m py_compile ai-maintainer test_ai_maintainer.py
-          CONTAINER
+          set -euo pipefail
+          : "${GITHUB_SHA:?CI requires its expected source commit}"
+          ci_revision=$(git --no-optional-locks -c core.fsmonitor=false -c core.hooksPath=/dev/null rev-parse HEAD)
+          ci_status=$(git --no-optional-locks -c core.fsmonitor=false -c core.hooksPath=/dev/null status --porcelain=v1 --untracked-files=all)
+          if [[ ${ci_revision} != "${GITHUB_SHA}" || -n ${ci_status} ]]; then
+            printf '%s\n' 'CI requires the clean expected source commit.' >&2
+            exit 125
+          fi
+          source tests/container/stock
+          stock_begin "$PWD"
+          if [[ ${revision} != "${GITHUB_SHA}" || ${source_dirty} != false ]]; then
+            printf '%s\n' 'CI source changed before snapshot capture.' >&2
+            exit 125
+          fi
+          stock_image native_image "python:$(cat .python-version)"
+          stock_run "${native_image}" '' -- sh -ec 'python -m py_compile ai-maintainer test_ai_maintainer.py
+          '
+          stock_finish
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v7.0.2
