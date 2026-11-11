@@ -108,7 +108,6 @@ def make_maintainer(repo_path, config, **overrides):
         config = gm.Config(**{**config.__dict__, **overrides})
     maintainer = gm.Maintainer(repo_path, config)
     maintainer._require_check_interface = MagicMock()
-    maintainer._verification_snapshot = MagicMock(return_value="stable")
     return maintainer
 
 
@@ -3884,9 +3883,7 @@ if __name__ == "__main__":
 class TestProjectCheckContract:
     def _maintainer(self, repo_path, default_config, gate="printf gate-ran"):
         (repo_path / "Makefile").write_text(".PHONY: check\ncheck:\n\t@" + gate + "\n")
-        maintainer = gm.Maintainer(repo_path, default_config)
-        maintainer._verification_snapshot = MagicMock(return_value="stable")
-        return maintainer
+        return gm.Maintainer(repo_path, default_config)
 
     def test_success_uses_only_full_gate_once(self, repo_path, default_config, monkeypatch):
         maintainer = self._maintainer(repo_path, default_config)
@@ -3961,14 +3958,6 @@ class TestProjectCheckContract:
         maintainer._project_command(command, 30)
         assert calls == [((["sh", "-c", command], repo_path), {"timeout": 30})]
 
-    def test_changed_verification_source_is_preserved(self, repo_path, default_config):
-        maintainer = self._maintainer(repo_path, default_config)
-        maintainer._verification_snapshot.side_effect = ["before", "after"]
-        maintainer.git.reset_changes = MagicMock()
-        with pytest.raises(gm.WorkingTreeError, match="preserve"):
-            maintainer.run_tests()
-        maintainer.git.reset_changes.assert_not_called()
-
     def test_dry_run_never_executes_project_make(self, repo_path, default_config, monkeypatch):
         maintainer = self._maintainer(repo_path, default_config)
         maintainer.git = MagicMock()
@@ -3993,175 +3982,3 @@ class TestProjectCheckContract:
         assert "make exec" not in captured[0]
         assert "make test" not in captured[0]
         assert "native dependency tools" in captured[0]
-
-
-class TestVerificationSnapshot:
-    def _maintainer(self, repo_path, default_config, monkeypatch, statuses, heads=None, indexes=None):
-        statuses = iter(statuses)
-        heads = iter(heads or ["head", "head"])
-        indexes = iter(indexes or ["index", "index"])
-
-        def query(command, *args, **kwargs):
-            if "status" in command:
-                return True, next(statuses), ""
-            if "rev-parse" in command:
-                return True, next(heads), ""
-            return True, next(indexes), ""
-
-        monkeypatch.setattr(gm, "run_command", query)
-        return gm.Maintainer(repo_path, default_config)
-
-    def test_same_status_with_changed_file_contents_discards_result(self, repo_path, default_config, monkeypatch):
-        path = repo_path / "source.py"
-        path.write_text("before")
-        maintainer = self._maintainer(repo_path, default_config, monkeypatch, [" M source.py\0"] * 2)
-        before = maintainer._verification_snapshot()
-        path.write_text("after")
-        assert maintainer._verification_snapshot() != before
-
-    def test_moving_bytes_between_dirty_files_is_detected(self, repo_path, default_config, monkeypatch):
-        first, second = repo_path / "first.py", repo_path / "second.py"
-        first.write_text("abc")
-        second.write_text("def")
-        status = " M first.py\0 M second.py\0"
-        maintainer = self._maintainer(repo_path, default_config, monkeypatch, [status] * 2)
-        before = maintainer._verification_snapshot()
-        first.write_text("ab")
-        second.write_text("cdef")
-        assert maintainer._verification_snapshot() != before
-
-    def test_clean_to_clean_commit_move_is_detected(self, repo_path, default_config, monkeypatch):
-        maintainer = self._maintainer(repo_path, default_config, monkeypatch, ["", ""], heads=["old", "new"])
-        assert maintainer._verification_snapshot() != maintainer._verification_snapshot()
-
-    def test_index_move_is_detected(self, repo_path, default_config, monkeypatch):
-        maintainer = self._maintainer(repo_path, default_config, monkeypatch, ["", ""], indexes=["old", "new"])
-        assert maintainer._verification_snapshot() != maintainer._verification_snapshot()
-
-    def test_clean_to_dirty_is_detected(self, repo_path, default_config, monkeypatch):
-        maintainer = self._maintainer(repo_path, default_config, monkeypatch, ["", "?? new.py\0"])
-        before = maintainer._verification_snapshot()
-        (repo_path / "new.py").write_text("new")
-        assert maintainer._verification_snapshot() != before
-
-    def test_external_parent_symlink_is_refused_before_read(self, repo_path, default_config, monkeypatch, tmp_path):
-        outside = tmp_path.parent / "outside-source"
-        outside.mkdir()
-        (outside / "source.py").write_text("must not be read")
-        (repo_path / "directory").symlink_to(outside, target_is_directory=True)
-        maintainer = self._maintainer(repo_path, default_config, monkeypatch, [" M directory/source.py\0"])
-        monkeypatch.setattr(Path, "read_bytes", lambda self: pytest.fail("external contents read"))
-        with pytest.raises(gm.WorkingTreeError, match="outside"):
-            maintainer._verification_snapshot()
-
-    def test_credentials_are_refused_before_read(self, repo_path, default_config, monkeypatch):
-        (repo_path / ".env").write_text("placeholder")
-        maintainer = self._maintainer(repo_path, default_config, monkeypatch, ["?? .env\0"])
-        monkeypatch.setattr(Path, "read_bytes", lambda self: pytest.fail("credential contents read"))
-        with pytest.raises(gm.WorkingTreeError, match="credential-shaped"):
-            maintainer._verification_snapshot()
-
-    def test_unreadable_git_state_preserves_source(self, repo_path, default_config, monkeypatch):
-        maintainer = gm.Maintainer(repo_path, default_config)
-        monkeypatch.setattr(gm, "run_command", lambda *a, **k: (False, "", "unavailable"))
-        with pytest.raises(gm.WorkingTreeError, match="preserve"):
-            maintainer._verification_snapshot()
-
-
-class TestWritableContainerGuard:
-    def _marker(self, repo_path):
-        return repo_path / ".git" / "container-exec-active"
-
-    def test_marker_lookup_is_exact_metadata_only_git_query(self, repo_path, monkeypatch):
-        calls = []
-        marker = self._marker(repo_path)
-
-        def query(command, *args):
-            calls.append(command)
-            return True, str(marker) + "\n", ""
-
-        monkeypatch.setattr(gm, "_run_command_raw", query)
-        gm._assert_container_exec_idle(repo_path, 10)
-        assert calls == [
-            [
-                "git",
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                "core.fsmonitor=false",
-                "rev-parse",
-                "--path-format=absolute",
-                "--git-path",
-                "container-exec-active",
-            ]
-        ]
-
-    @pytest.mark.parametrize("operation", ["reset_changes", "stash_drop", "stage_all"])
-    def test_active_marker_blocks_git_mutation_before_execution(self, repo_path, monkeypatch, operation):
-        marker = self._marker(repo_path)
-        marker.mkdir()
-        original = gm._run_command_raw
-        calls = []
-
-        def run(command, *args, **kwargs):
-            calls.append(command)
-            return original(command, *args, **kwargs)
-
-        monkeypatch.setattr(gm, "_run_command_raw", run)
-        git = gm.GitClient(repo_path, MagicMock())
-        with pytest.raises(gm.WorkingTreeError, match="cleanup is unconfirmed"):
-            getattr(git, operation)()
-        assert all("--git-path" in command for command in calls)
-        assert marker.exists()
-
-    @pytest.mark.parametrize("stderr", ["command failed", "Command timed out after 1s"])
-    def test_unconfirmed_marker_after_command_failure_preserves_state(self, repo_path, monkeypatch, stderr):
-        marker = self._marker(repo_path)
-
-        def run(command, *args):
-            if "--git-path" in command:
-                return True, str(marker), ""
-            marker.mkdir()
-            return False, "", stderr
-
-        monkeypatch.setattr(gm, "_run_command_raw", run)
-        with pytest.raises(gm.WorkingTreeError, match="preserve source and stash"):
-            gm.run_command(["make", "exec", "COMMAND=operation"], repo_path, 1)
-        assert marker.exists()
-
-    @pytest.mark.parametrize("response", ["response", None])
-    def test_agent_result_or_timeout_cannot_return_before_guard(self, repo_path, default_config, monkeypatch, response):
-        marker = self._marker(repo_path)
-        client = gm.AgentClient(repo_path, repo_path.name, default_config, MagicMock())
-
-        def ask(*args):
-            marker.mkdir()
-            return response
-
-        monkeypatch.setattr(client, "_ask", ask)
-        with pytest.raises(gm.WorkingTreeError, match="cleanup is unconfirmed"):
-            client.ask("update")
-        assert marker.exists()
-
-    def test_marker_contents_are_never_read_or_cleared(self, repo_path, monkeypatch):
-        marker = self._marker(repo_path)
-        marker.mkdir()
-        (marker / "state").write_text("launcher-owned metadata")
-        monkeypatch.setattr(Path, "read_text", lambda *a, **k: pytest.fail("marker contents read"))
-        monkeypatch.setattr(Path, "read_bytes", lambda *a, **k: pytest.fail("marker contents read"))
-        with pytest.raises(gm.WorkingTreeError, match="cleanup is unconfirmed"):
-            gm._assert_container_exec_idle(repo_path, 10)
-        assert (marker / "state").exists()
-
-    def test_unknown_marker_location_is_not_treated_as_idle(self, repo_path, monkeypatch):
-        monkeypatch.setattr(gm, "_run_command_raw", lambda *a, **k: (False, "", "Git unavailable"))
-        with pytest.raises(gm.WorkingTreeError, match="Cannot determine"):
-            gm.run_command(["git", "reset", "--hard"], repo_path, 10)
-
-    def test_unconfirmed_exec_prevents_commit_and_preserves_stash(self, repo_path, default_config):
-        self._marker(repo_path).mkdir()
-        maintainer = make_maintainer(repo_path, default_config, dry_run=False)
-        with pytest.raises(gm.WorkingTreeError, match="cleanup is unconfirmed"):
-            maintainer.commit_and_push("fix: update")
-        with pytest.raises(gm.WorkingTreeError, match="cleanup is unconfirmed"):
-            maintainer.git.stash_drop()

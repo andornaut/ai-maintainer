@@ -1,26 +1,24 @@
 #!/bin/sh
 set -eu
-export VIRTUAL_ENV=/scratch/venv PATH="/scratch/venv/bin:$PATH"
-case "$1" in
-    prepare)
-        python -m venv /scratch/venv >&2
-        /scratch/venv/bin/python -m pip install --disable-pip-version-check -r requirements-dev.txt >&2
-        exec tar --create --file - --directory / scratch/venv
-        ;;
-    check)
-        for task in lint test build; do sh "$0" "$task"; done
-        ;;
-    lint)
-        for script in tests/container/run tests/container/stock tests/container/check-stock; do bash -n "$script"; done
-        for script in tests/container/check tests/container/python tests/container/markdown scripts/test-in-container; do sh -n "$script"; done
-        ruff check .
-        ruff format --check .
-        ;;
-    test)
-        exec python -m pytest -v -p no:cacheprovider --basetemp=/scratch/pytest
-        ;;
-    build)
-        exec python -m py_compile ai-maintainer test_ai_maintainer.py
-        ;;
-    *) exit 2 ;;
-esac
+action=${1:?Expected a declared check action}
+case "$action" in check|lint|test|build) ;; *) exit 2 ;; esac
+export PYTHONPYCACHEPREFIX=/scratch/pycache
+if [ "$action" = check ] || [ "$action" = lint ]; then
+    for script in tests/container/stock tests/container/check-stock scripts/test-in-container; do bash -n "$script"; done
+    for script in tests/container/python tests/container/markdown; do sh -n "$script"; done
+fi
+if [ "$action" != build ]; then
+    python -m venv /scratch/venv >&2
+    export VIRTUAL_ENV=/scratch/venv PATH="/scratch/venv/bin:$PATH"
+    python -m pip install --disable-pip-version-check -r requirements-dev.txt >&2
+fi
+if [ "$action" = check ] || [ "$action" = lint ]; then
+    ruff check .
+    ruff format --check .
+fi
+if [ "$action" = check ] || [ "$action" = test ]; then
+    python -m pytest -v -p no:cacheprovider --basetemp=/scratch/pytest
+fi
+if [ "$action" = check ] || [ "$action" = build ]; then
+    python -m py_compile ai-maintainer test_ai_maintainer.py
+fi

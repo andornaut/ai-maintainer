@@ -67,7 +67,7 @@ Each maintained repository exposes `make check`, which runs its complete verific
 
 Before pulling and before dependency work, the consumer requires a root `Makefile` and an available Make executable. It does not probe targets, read verification metadata, detect languages or infer an alternative command. A missing `check` target is reported when `make check` runs.
 
-The project's thin Make orchestration is trusted. Its launcher owns runtime versions, dependency setup, container isolation and cleanup. Writable execution creates the per-worktree Git metadata marker `container-exec-active` before launching its container and removes it only after confirmed teardown. The consumer checks that marker around managed commands and agent calls. Unconfirmed or unreadable state preserves source changes and stashes, and prevents subsequent resets or commits; the consumer never manages Docker.
+The project's Make targets own runtime versions, dependency setup, container isolation and cleanup. The consumer invokes them without managing Docker.
 
 Dependency queries, installs and updates use native project tools on the host. Git retains its existing host authentication and fires the project's actual hooks. The AI agent is instructed to verify with `make check` and preserve lint, test and build configuration. This instruction does not sandbox the agent's host process. Dry runs do not pull, run push-probe hooks, update dependencies or invoke the verification gate.
 
@@ -110,7 +110,6 @@ Step 5 invokes `make check` once after dependency changes or merges. The project
 - A nonzero gate, including a missing `check` target, is a verification failure with its command output. No native command or AI inference substitutes for the gate.
 - A missing Makefile or unavailable Make executable blocks verification and committing. Disabling verification with `--no-run-tests` reports changes as unverified.
 - Dependency updates and both fix paths reject a missing verification entrypoint. The agent is instructed not to remove or weaken checks; the consumer does not infer check categories.
-- Before and after the gate, the maintainer fingerprints HEAD, the index, working-tree status and changed-file contents. A changed or unreadable snapshot discards the result and preserves source changes and any pending stash. Credential-shaped paths and changed paths resolving outside the checkout are refused.
 - Commands run in bounded process groups. On timeout, the project launcher gets a termination signal and time to clean up before forced termination. Container lifecycle remains the project's responsibility.
 - `--repo-timeout` bounds each repository's total wall clock, CI waits included.
 
@@ -209,7 +208,7 @@ Rewinding would mean force pushing away commits that are already on the remote, 
 make check
 ```
 
-The project-owned Make gate runs compilation, the full pytest suite, Ruff lint and formatting in the declared Python stock image. Markdown and ShellCheck use separate pinned images. Each phase receives a sanitized source snapshot and disposable scratch storage.
+The project-owned Make gate runs compilation, the full pytest suite, Ruff lint and formatting in the declared Python stock image. Markdown and ShellCheck use separate pinned images. Each phase uses project source and disposable scratch storage.
 
 ## License
 

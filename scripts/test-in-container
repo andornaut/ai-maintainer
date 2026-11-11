@@ -1,8 +1,23 @@
-#!/bin/sh
-set -eu
-
-checkout=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
-if [ "$#" -eq 0 ]; then
+#!/usr/bin/env bash
+set -euo pipefail
+checkout=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
+if (( $# == 0 )); then
     exec make --no-print-directory --directory "${checkout}" check
 fi
-exec "${checkout}/tests/container/run" command "$@"
+# shellcheck source=tests/container/stock
+source "${checkout}/tests/container/stock"
+stock_begin "${checkout}"
+STOCK_OUTPUT_DIR=
+stock_copy_source
+timeout --signal=TERM --kill-after=10 "${CHECK_TIMEOUT_SECONDS:-900}" docker build \
+    --resource cpu-period=100000 --resource cpu-quota=400000 \
+    --resource "memory=${CHECK_MEMORY:-4g}" --ulimit nofile=256:256 \
+    --build-arg "PYTHON_VERSION=$(cat "${checkout}/.python-version")" \
+    --iidfile "${scratch}/compatibility-image.id" \
+    --file "${stock_source}/tests/container/Dockerfile" "${stock_source}" >&2
+image=$(cat "${scratch}/compatibility-image.id")
+STOCK_NETWORK=bridge stock_run_image "${image}" -- /bin/sh -ec '
+    cp -a --no-preserve=ownership /opt/project/. /work/
+    exec "$@"
+' command "$@"
+stock_finish

@@ -17,7 +17,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import functools
-import hashlib
 import json
 import logging
 import os
@@ -217,7 +216,6 @@ NO_FAILED_JOB_LOG_NOTE = (
 # Cap on the number of staged paths named in the pre-commit log line
 MAX_LOGGED_STAGED_FILES = 20
 
-CONTAINER_EXEC_ACTIVE_MARKER = "container-exec-active"
 
 # Dependency files to check for in repositories
 DEPENDENCY_FILES = (
@@ -330,7 +328,7 @@ def _stop_process_group(proc: subprocess.Popen) -> CommandResult:
     return False, "", ""
 
 
-def _run_command_raw(
+def run_command(
     cmd: list[str],
     cwd: Path,
     timeout: int | None = None,
@@ -362,50 +360,6 @@ def _run_command_raw(
         raise
     except (subprocess.SubprocessError, OSError) as error:
         return False, "", str(error)
-
-
-def _assert_container_exec_idle(cwd: Path, timeout: int) -> None:
-    """Require project-owned writable execution to confirm its own teardown."""
-    if not (cwd / ".git").exists():
-        return
-    success, output, stderr = _run_command_raw(
-        [
-            "git",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.fsmonitor=false",
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-path",
-            CONTAINER_EXEC_ACTIVE_MARKER,
-        ],
-        cwd,
-        timeout,
-    )
-    if not success or not output.strip() or not Path(output.strip()).is_absolute():
-        raise WorkingTreeError(f"Cannot determine writable container state; preserve changes: {stderr.strip()}")
-    marker = Path(output.strip())
-    try:
-        marker.lstat()
-    except FileNotFoundError:
-        return
-    except OSError as error:
-        raise WorkingTreeError("Cannot read writable container state; preserve source and stash") from error
-    raise WorkingTreeError(f"Writable container cleanup is unconfirmed; preserve source and stash: {marker}")
-
-
-def run_command(
-    cmd: list[str],
-    cwd: Path,
-    timeout: int | None = None,
-) -> CommandResult:
-    timeout = DEFAULT_COMMAND_TIMEOUT_SECONDS if timeout is None else timeout
-    _assert_container_exec_idle(cwd, timeout)
-    try:
-        return _run_command_raw(cmd, cwd, timeout)
-    finally:
-        _assert_container_exec_idle(cwd, timeout)
 
 
 def run_shell_command(
@@ -531,13 +485,6 @@ class AgentClient:
         return _stop_process_group(proc)
 
     def ask(self, prompt: str, context: dict[str, Any] | None = None) -> str | None:
-        _assert_container_exec_idle(self.repo_path, self.config.command_timeout_seconds)
-        try:
-            return self._ask(prompt, context)
-        finally:
-            _assert_container_exec_idle(self.repo_path, self.config.command_timeout_seconds)
-
-    def _ask(self, prompt: str, context: dict[str, Any] | None = None) -> str | None:
         """Ask the AI agent for a decision.
 
         Returns the agent's raw response, or None if the agent could not be
@@ -2471,59 +2418,15 @@ class Maintainer:
         except CheckContractError as error:
             self.logger.warning(f"[{self.repo_name}] Verification blocked: {error}")
             return TESTS_BLOCKED, str(error)
-        before = self._verification_snapshot()
         success, stdout, stderr = run_command(
             ["make", "--no-print-directory", "check"],
             self.repo_path,
             timeout=self.config.lint_timeout_seconds + self.config.test_timeout_seconds,
         )
-        if self._verification_snapshot() != before:
-            raise WorkingTreeError("Working tree changed during verification; discard the result and preserve changes")
         output = f"Command: make check\n\nSTDOUT:\n{stdout}\n\nSTDERR:\n{stderr}"
         if not success:
             return TESTS_FAILED, output
         return TESTS_PASSED, output
-
-    def _verification_snapshot(self) -> str:
-        """Fingerprint source state without reading credentials or external targets."""
-        git = ["git", "--no-optional-locks", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"]
-        outputs = []
-        for command in (
-            ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-            ["rev-parse", "--verify", "HEAD"],
-            ["ls-files", "--stage", "-z"],
-        ):
-            success, output, stderr = run_command([*git, *command], self.repo_path, self.config.command_timeout_seconds)
-            if not success:
-                raise WorkingTreeError(f"Cannot fingerprint verification source; preserve changes: {stderr.strip()}")
-            outputs.append(output)
-        digest = hashlib.sha256("\0".join(outputs).encode())
-        entries = iter(outputs[0].split("\0"))
-        for entry in entries:
-            if not entry:
-                continue
-            name = entry[3:]
-            if "R" in entry[:2] or "C" in entry[:2]:
-                next(entries, None)
-            path = self.repo_path / name
-            try:
-                if not path.resolve().is_relative_to(self.repo_path.resolve()):
-                    raise WorkingTreeError(f"Changed path resolves outside the checkout; preserve changes: {name}")
-                if (
-                    any(part in (".ssh", ".private") for part in path.parts)
-                    or path.name.startswith(".env")
-                    or path.suffix in (".pem", ".key", ".p12", ".pfx")
-                ):
-                    raise WorkingTreeError(
-                        f"Cannot fingerprint credential-shaped changed path; preserve changes: {name}"
-                    )
-                if path.is_symlink():
-                    digest.update(hashlib.sha256(str(path.readlink()).encode()).digest())
-                elif path.is_file():
-                    digest.update(hashlib.sha256(path.read_bytes()).digest())
-            except (OSError, RuntimeError) as error:
-                raise WorkingTreeError(f"Cannot fingerprint changed path; preserve changes: {name}") from error
-        return digest.hexdigest()
 
     def _outdated_candidates(self, dep_file: str, report: str) -> list[tuple[str, str, str]] | None:
         """Each (name, installed, newest) an ecosystem's report names.
