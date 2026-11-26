@@ -362,31 +362,12 @@ def run_command(
         return False, "", str(error)
 
 
-def run_shell_command(
-    cmd: str,
-    cwd: Path,
-    timeout: int | None = None,
-) -> CommandResult:
-    """Run a shell command string via bash and return (success, stdout, stderr)."""
-    return run_command(["bash", "-c", cmd], cwd, timeout=timeout)
-
-
 def run_git(
     args: list[str],
     cwd: Path,
-    env_runner: str | None = None,
     timeout: int | None = None,
 ) -> CommandResult:
-    """Run a git command, optionally activating the project env runner first.
-
-    When env_runner is set (e.g. nvm/fnm for .nvmrc, pipenv/poetry/venv for
-    Python, the Go/Rust toolchain PATH), the command runs through a shell so
-    git hooks (pre-commit, pre-push) resolve the project's toolchain instead
-    of whatever is on the ambient PATH.
-    """
-    if env_runner:
-        quoted = " ".join(shlex.quote(arg) for arg in args)
-        return run_shell_command(f"{env_runner} git {quoted}", cwd, timeout=timeout)
+    """Run Git directly, preserving native hooks and the command timeout."""
     return run_command(["git", *args], cwd, timeout=timeout)
 
 
@@ -643,14 +624,11 @@ class GitClient:
         self,
         repo_path: Path,
         logger: logging.Logger,
-        env_runner: str | None = None,
         command_timeout: int = DEFAULT_COMMAND_TIMEOUT_SECONDS,
         hook_timeout: int = DEFAULT_TEST_TIMEOUT_SECONDS,
     ):
         self.repo_path = repo_path
         self.logger = logger
-        # Activate this before git ops that may fire hooks (pre-commit/pre-push)
-        self.env_runner = env_runner
         self.command_timeout = command_timeout
         # Budget for commit/push/pull, which fire hooks. Separate from
         # command_timeout because a pre-commit or pre-push hook commonly runs
@@ -813,9 +791,7 @@ class GitClient:
     def pull_changes(self) -> bool:
         """Pull latest changes from remote."""
         self.logger.debug(f"[{self.repo_name}] Pulling changes...")
-        # Run through the project env runner so post-merge hooks resolve the
-        # project's toolchain instead of the ambient PATH.
-        success, _, stderr = run_git(["pull"], self.repo_path, self.env_runner, self.hook_timeout)
+        success, _, stderr = run_git(["pull"], self.repo_path, timeout=self.hook_timeout)
         if not success:
             self.logger.warning(f"[{self.repo_name}] Command failed: git pull\n{stderr}")
         return success
@@ -825,7 +801,7 @@ class GitClient:
 
         This detects archived/read-only repositories before making changes.
         """
-        success, _, stderr = run_git(["push", "--dry-run"], self.repo_path, self.env_runner, self.hook_timeout)
+        success, _, stderr = run_git(["push", "--dry-run"], self.repo_path, timeout=self.hook_timeout)
         if not success:
             expected = any(reason in stderr.lower() for reason in UNWRITABLE_REASONS)
             report = self.logger.debug if expected else self.logger.warning
@@ -1544,7 +1520,6 @@ class Maintainer:
         self.git = GitClient(
             repo_path,
             self.logger,
-            None,
             config.command_timeout_seconds,
             config.test_timeout_seconds,
         )
@@ -1657,13 +1632,10 @@ class Maintainer:
                 # anything the agent left behind that it never reported, so
                 # name the files going into the commit.
                 self._log_staged_files(staged)
-                # Run through the project env runner so pre-commit hooks
-                # resolve the project's toolchain instead of the ambient PATH.
                 success, _, stderr = run_git(
                     ["commit", "-m", message],
                     self.repo_path,
-                    self.git.env_runner,
-                    self.git.hook_timeout,
+                    timeout=self.git.hook_timeout,
                 )
                 if not success:
                     self.logger.warning(f"[{self.repo_name}] Command failed: git commit\n{stderr}")
@@ -1687,9 +1659,7 @@ class Maintainer:
             return True, False
 
         self.logger.debug(f"[{self.repo_name}] Pushing to remote...")
-        # Run through the project env runner too, so pre-push hooks resolve
-        # the project's toolchain instead of the ambient PATH.
-        success, _, stderr = run_git(["push"], self.repo_path, self.git.env_runner, self.git.hook_timeout)
+        success, _, stderr = run_git(["push"], self.repo_path, timeout=self.git.hook_timeout)
         if not success:
             self.logger.warning(f"[{self.repo_name}] Command failed: git push\n{stderr}")
             if committed and pre_commit_sha:

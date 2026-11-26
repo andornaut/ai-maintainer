@@ -178,12 +178,6 @@ class TestRunCommand:
         success, _stdout, _stderr = gm.run_command(["nonexistent_command_12345"], Path("/tmp"))
         assert success is False
 
-    def test_a_shell_command_gets_the_shell(self):
-        success, stdout, _stderr = gm.run_shell_command("echo hello && echo world", Path("/tmp"))
-        assert success is True
-        assert "hello" in stdout
-        assert "world" in stdout
-
     def test_a_timeout_is_not_a_success(self):
         before = gm.time.monotonic()
         success, _, stderr = gm.run_command(
@@ -508,127 +502,68 @@ class TestMaintainerValidation:
         maintainer.github.is_commit_verified.assert_not_called()
 
 
-class TestCommitAndPushEnvRunner:
-    """commit_and_push runs git through the project env runner so hooks
-    (pre-commit/pre-push) resolve the same toolchain used for testing."""
+class TestCommitAndPushDirectGit:
+    """Commit and push preserve native Git hook execution."""
 
-    def _maintainer(self, repo_path, default_config, env_runner):
+    def _maintainer(self, repo_path, default_config):
         maintainer = make_maintainer(repo_path, default_config, dry_run=False, push_changes=True)
-        # Force the env runner as if .nvmrc + nvm were present
-        maintainer.git.env_runner = env_runner
         maintainer.git.get_head_sha = MagicMock(return_value="abc1234")
         maintainer.git.is_workdir_clean = MagicMock(return_value=False)
         maintainer.git.has_unpushed_commits = MagicMock(return_value=True)
         maintainer.github.repo_url = None
         return maintainer
 
-    def test_commit_and_push_use_env_runner_prefix(self, repo_path, default_config, monkeypatch):
-        prefix = "source ~/.nvm/nvm.sh && nvm use &&"
-        maintainer = self._maintainer(repo_path, default_config, prefix)
+    def test_commit_and_push_use_direct_git(self, repo_path, default_config, monkeypatch):
+        maintainer = self._maintainer(repo_path, default_config)
 
-        shell_calls = []
-
-        def fake_run_command(cmd, cwd, *a, **k):
-            if cmd[:3] == ["git", "diff", "--cached"]:
-                return True, "package.json\n", ""
-            # git commit / git push must NOT go through here when prefixed
-            assert cmd[:2] not in (["git", "commit"], ["git", "push"])
-            return True, "", ""
-
-        def fake_run_shell_command(cmd, cwd, *a, **k):
-            shell_calls.append(cmd)
-            return True, "", ""
-
-        monkeypatch.setattr(gm, "run_command", fake_run_command)
-        monkeypatch.setattr(gm, "run_shell_command", fake_run_shell_command)
-
-        success, had_changes = maintainer.commit_and_push("fix: bump deps")
-
-        assert success is True
-        assert had_changes is True
-        assert any(c.startswith(f"{prefix} git commit -m ") and "fix: bump deps" in c for c in shell_calls)
-        assert f"{prefix} git push" in shell_calls
-
-    def test_commit_and_push_without_env_runner(self, repo_path, default_config, monkeypatch):
-        maintainer = self._maintainer(repo_path, default_config, None)
-
-        commit_calls = []
+        hook_calls = []
 
         def fake_run_command(cmd, cwd, *a, **k):
             if cmd[:3] == ["git", "diff", "--cached"]:
                 return True, "package.json\n", ""
-            if cmd[:2] == ["git", "commit"]:
-                commit_calls.append(cmd)
+            if cmd[:2] in (["git", "commit"], ["git", "push"]):
+                hook_calls.append(cmd)
             return True, "", ""
 
-        def fake_run_shell_command(cmd, cwd, *a, **k):
-            raise AssertionError("env_runner is None; should not use a shell")
-
         monkeypatch.setattr(gm, "run_command", fake_run_command)
-        monkeypatch.setattr(gm, "run_shell_command", fake_run_shell_command)
 
         success, _had_changes = maintainer.commit_and_push("fix: bump deps")
 
         assert success is True
-        assert commit_calls == [["git", "commit", "-m", "fix: bump deps"]]
+        assert hook_calls == [["git", "commit", "-m", "fix: bump deps"], ["git", "push"]]
 
 
 class TestRunGit:
     """Tests for the run_git helper."""
 
-    def test_no_env_runner_uses_run_command(self, monkeypatch):
+    def test_direct_git_uses_run_command(self, monkeypatch):
         calls = []
 
         def fake_run_command(cmd, cwd, **k):
             calls.append(cmd)
             return True, "", ""
 
-        def fail_shell(*a, **k):
-            raise AssertionError("env_runner is None; should not use a shell")
-
         monkeypatch.setattr(gm, "run_command", fake_run_command)
-        monkeypatch.setattr(gm, "run_shell_command", fail_shell)
 
         ok, _, _ = gm.run_git(["push"], Path("/tmp"))
         assert ok is True
         assert calls == [["git", "push"]]
 
-    def test_env_runner_uses_shell_and_quotes(self, monkeypatch):
-        shell = []
+    @pytest.mark.parametrize(
+        ("method", "arguments"),
+        [("is_writable", ["git", "push", "--dry-run"]), ("pull_changes", ["git", "pull"])],
+    )
+    def test_hook_commands_use_direct_git(self, tmp_path, monkeypatch, method, arguments):
+        client = gm.GitClient(tmp_path, MagicMock(), hook_timeout=123)
+        calls = []
 
-        def fake_run_shell_command(cmd, cwd, **k):
-            shell.append(cmd)
+        def run(command, cwd, *, timeout=None):
+            calls.append((command, cwd, timeout))
             return True, "", ""
 
-        monkeypatch.setattr(gm, "run_shell_command", fake_run_shell_command)
-
-        ok, _, _ = gm.run_git(["commit", "-m", "a b"], Path("/tmp"), "nvm use &&")
-        assert ok is True
-        assert shell == ["nvm use && git commit -m 'a b'"]
-
-    def test_gitclient_is_writable_uses_env_runner(self, tmp_path, monkeypatch):
-        client = gm.GitClient(tmp_path, MagicMock(), "nvm use &&")
-        shell = []
-
-        def fake_run_shell_command(cmd, cwd, **k):
-            shell.append(cmd)
-            return True, "", ""
-
-        monkeypatch.setattr(gm, "run_shell_command", fake_run_shell_command)
-        assert client.is_writable() is True
-        assert shell == ["nvm use && git push --dry-run"]
-
-    def test_gitclient_pull_uses_env_runner(self, tmp_path, monkeypatch):
-        client = gm.GitClient(tmp_path, MagicMock(), "nvm use &&")
-        shell = []
-
-        def fake_run_shell_command(cmd, cwd, **k):
-            shell.append(cmd)
-            return True, "", ""
-
-        monkeypatch.setattr(gm, "run_shell_command", fake_run_shell_command)
-        assert client.pull_changes() is True
-        assert shell == ["nvm use && git pull"]
+        monkeypatch.setattr(gm, "run_command", run)
+        assert getattr(client, method)() is True
+        assert calls == [(arguments, tmp_path, 123)]
 
 
 class TestGitHubClientIsCommitVerified:
@@ -1765,7 +1700,6 @@ class TestPypiReleases:
         # Dated against the clock rather than by the feed's fixed date, which
         # the 30 day limit would otherwise pass once the suite is old enough
         maintainer._release_date = MagicMock(return_value=datetime.now(UTC) - timedelta(days=3))
-        monkeypatch.setattr(gm, "run_shell_command", lambda cmd, cwd, timeout=None: (True, "", ""))
         report = maintainer._outdated_report(["requirements-dev.txt"])
         assert report.answered == ["requirements-dev.txt"]
         # 0.16.4 is three days old against a 30 day limit, so nothing is offered
@@ -1775,7 +1709,6 @@ class TestPypiReleases:
         maintainer, _ = self._maintainer(repo_path, default_config, monkeypatch)
         (repo_path / "requirements.txt").write_text("ruff==0.16.3\n")
         maintainer._release_date = MagicMock(return_value=OLD_RELEASE)
-        monkeypatch.setattr(gm, "run_shell_command", lambda cmd, cwd, timeout=None: (True, "", ""))
         report = maintainer._outdated_report(["requirements.txt"])
         assert report.updates == {
             "PyPI releases newer than the requirements.txt pins": "ruff: 0.16.3 -> 0.16.4 (released 2020-01-01)"
@@ -1928,7 +1861,6 @@ class TestMinimumAgeInThePrompt:
     def _prompt(self, repo_path, default_config, monkeypatch, dep_files, updates, answered=(), minimum_age=30):
         for dep_file in dep_files:
             (repo_path / dep_file).write_text("{}")
-        monkeypatch.setattr(gm, "run_shell_command", lambda cmd, cwd, timeout=None: (True, "", ""))
         maintainer = make_maintainer(repo_path, default_config, dry_run=False, dependency_min_age_days=minimum_age)
         maintainer._outdated_report = MagicMock(return_value=gm.OutdatedReport(updates, list(answered)))
         maintainer.agent.ask_json = MagicMock(return_value={"updated": False, "reasoning": "none"})
@@ -2819,7 +2751,7 @@ class TestCommitAndPushWithoutPush:
         maintainer.git.get_staged_files = MagicMock(return_value=["Gemfile.lock"])
         ran = []
 
-        def fake_run_git(args, cwd, env_runner=None, timeout=None):
+        def fake_run_git(args, cwd, timeout=None):
             ran.append(args)
             return True, "", ""
 
@@ -2833,7 +2765,6 @@ class TestPushingWhatWasAlreadyHere:
 
     def _maintainer(self, repo_path, default_config, monkeypatch, workdir_clean, ran):
         maintainer = make_maintainer(repo_path, default_config, dry_run=False, push_changes=True)
-        maintainer.git.env_runner = None
         maintainer.git.is_workdir_clean = MagicMock(return_value=workdir_clean)
         maintainer.git.has_unpushed_commits = MagicMock(return_value=True)
         maintainer.git.stage_all = MagicMock(return_value=(True, "", ""))
@@ -2841,7 +2772,7 @@ class TestPushingWhatWasAlreadyHere:
         maintainer.git.get_head_sha = MagicMock(return_value="abc1234")
         maintainer.github.repo_url = None
 
-        def fake_run_git(args, cwd, env_runner=None, timeout=None):
+        def fake_run_git(args, cwd, timeout=None):
             ran.append(args)
             return True, "", ""
 
@@ -3564,7 +3495,7 @@ class TestHookFiringGitOpsGetTheTestBudget:
         maintainer.git.get_head_sha = MagicMock(return_value="head123")
         timeouts = []
 
-        def fake_run_git(args, cwd, env_runner=None, timeout=None):
+        def fake_run_git(args, cwd, timeout=None):
             timeouts.append(timeout)
             return True, "", ""
 
@@ -3582,7 +3513,7 @@ class TestHookFiringGitOpsGetTheTestBudget:
         )
         timeouts = []
 
-        def fake_run_git(args, cwd, env_runner=None, timeout=None):
+        def fake_run_git(args, cwd, timeout=None):
             timeouts.append(timeout)
             return True, "", ""
 
