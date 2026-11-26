@@ -2770,6 +2770,89 @@ class TestFixPreservesVerification:
             assert "Re-run that same command" in prompt
 
 
+class TestRepairVerificationFeedback:
+    def _maintainer(self, repo_path, default_config):
+        maintainer = make_maintainer(repo_path, default_config, dry_run=False, push_changes=True)
+        maintainer.git.reset_changes = MagicMock(return_value=True)
+        maintainer.agent.ask_json = MagicMock(return_value={"fixed": True, "changes_made": "Updated the fix"})
+        return maintainer
+
+    def test_local_retry_keeps_rejected_patch_diagnostics_separate_from_baseline(
+        self, repo_path, default_config, caplog
+    ):
+        maintainer = self._maintainer(repo_path, default_config)
+        maintainer.git.is_workdir_clean = MagicMock(return_value=True)
+        maintainer.run_tests = MagicMock(
+            side_effect=[
+                (gm.TESTS_FAILED, "Rejected patch formatter diagnostic"),
+                (gm.TESTS_FAILED, "Restored dependency baseline failure"),
+                (gm.TESTS_PASSED, "Passed"),
+            ]
+        )
+        assert maintainer.fix_test_with_retries("Initial baseline failure") is True
+        first, second = [call.args[1] for call in maintainer.agent.ask_json.call_args_list]
+        assert first == {"test_output": "Initial baseline failure"}
+        assert second == {
+            "test_output": "Restored dependency baseline failure",
+            "previous_patch_verification_output": "Rejected patch formatter diagnostic",
+        }
+        assert maintainer.run_tests.call_count == 3
+        assert maintainer._last_patch_verification_output is None
+        assert "Rejected patch formatter diagnostic" not in caplog.text
+
+    def test_ci_retry_receives_local_failure_and_clears_it_after_a_successful_patch(
+        self, repo_path, default_config, caplog
+    ):
+        maintainer = self._maintainer(repo_path, default_config)
+        maintainer.git.is_workdir_clean = MagicMock(side_effect=[True, True, True, False, True, False])
+        maintainer.git.get_head_sha = MagicMock(side_effect=["original", "original", "pushed-fix"])
+        maintainer.github.get_ci_failure_logs = MagicMock(
+            side_effect=[("Original hosted failure", 7), ("Original hosted failure", 7), ("New hosted failure", 8)]
+        )
+        maintainer.run_tests = MagicMock(
+            side_effect=[
+                (gm.TESTS_FAILED, "Rejected CI patch formatter diagnostic"),
+                (gm.TESTS_PASSED, "Passed"),
+                (gm.TESTS_PASSED, "Passed"),
+            ]
+        )
+        maintainer.commit_and_push = MagicMock(return_value=(True, True))
+        maintainer._wait_for_ci = MagicMock(side_effect=["failure", "success"])
+        assert maintainer.fix_ci_with_retries() is True
+        first, second, third = [call.args[1] for call in maintainer.agent.ask_json.call_args_list]
+        assert first == {"ci_logs": "Original hosted failure"}
+        assert second == {
+            "ci_logs": "Original hosted failure",
+            "previous_patch_verification_output": "Rejected CI patch formatter diagnostic",
+        }
+        assert third == {"ci_logs": "New hosted failure"}
+        assert [call.args for call in maintainer.github.get_ci_failure_logs.call_args_list] == [
+            ("original",),
+            ("original",),
+            ("pushed-fix",),
+        ]
+        prompt = maintainer.agent.ask_json.call_args_list[0].args[0]
+        assert "reported CI check failed" in prompt
+        assert "filesystem-isolated container tooling" in prompt
+        assert "Run make check" in prompt
+        assert "Rejected CI patch formatter diagnostic" not in caplog.text
+
+    @pytest.mark.parametrize("method", ["_try_fix_tests", "fix_ci_failure"])
+    def test_rejected_patch_feedback_is_bounded(self, repo_path, default_config, method):
+        maintainer = self._maintainer(repo_path, default_config)
+        maintainer.git.is_workdir_clean = MagicMock(return_value=True)
+        maintainer.run_tests = MagicMock(return_value=(gm.TESTS_FAILED, "HEAD" + "x" * 30000 + "TAIL"))
+        repair = getattr(maintainer, method)
+        assert repair("Original failure") == gm.FIX_FAILED
+        maintainer.agent.ask_json.return_value = {"fixed": False, "reasoning": "Needs operator input"}
+        assert repair("Original failure") == gm.FIX_DECLINED
+        feedback = maintainer.agent.ask_json.call_args.args[1]["previous_patch_verification_output"]
+        assert feedback.startswith("HEAD")
+        assert feedback.endswith("TAIL")
+        assert "characters truncated" in feedback
+        assert len(feedback) < gm.CI_LOG_MAX_LENGTH + 100
+
+
 class TestADeclinedFixIsNotRetried:
     """A decline is an answer. The tree and the failure are unchanged, so the
     remaining attempts put the identical question and spend the agent timeout
