@@ -882,6 +882,10 @@ class GitHubClient:
 
     def _run(self, args: list[str]) -> CommandResult:
         """Run a gh command with the configured command timeout."""
+        if args[:2] in (["gh", "pr"], ["gh", "run"]):
+            if not self.owner_repo:
+                return False, "", "Origin is not a github.com repository"
+            args = [*args, "--repo", f"github.com/{self.owner_repo}"]
         return run_command(args, self.repo_path, timeout=self.command_timeout)
 
     @functools.cached_property
@@ -1046,7 +1050,7 @@ class GitHubClient:
             # to fetch. Describe it instead: the fault is in the workflow file
             # itself, which the agent can read and repair. Without this the
             # fix path gives up and the repository fails on every later run.
-            names = [c["name"] for c in self._startup_failure_checks(head_sha)]
+            names = [c["name"] for c in self._startup_failure_checks(head_sha) or []]
             if names:
                 return (
                     "GitHub could not load these workflow definitions, so no "
@@ -1095,10 +1099,12 @@ class GitHubClient:
             if check.get("conclusion") in FAILING_CHECK_CONCLUSIONS and (name := check.get("name"))
         ]
 
-    def get_dependabot_prs(self) -> list[dict[str, Any]]:
-        """Get open dependabot PRs targeting the current branch."""
+    def get_dependabot_prs(self) -> list[dict[str, Any]] | None:
+        """Open dependabot PRs targeting the current branch, or None on lookup failure."""
+        if not self.owner_repo:
+            return []
         base_branch = self._git.current_branch or "main"
-        success, stdout, _ = self._run(
+        success, stdout, stderr = self._run(
             [
                 "gh",
                 "pr",
@@ -1112,8 +1118,13 @@ class GitHubClient:
             ]
         )
         if not success:
-            return []
-        return safe_json_parse(stdout, default=[])
+            self.logger.warning(f"[{self.repo_path.name}] Could not list dependabot PRs: {stderr or stdout}")
+            return None
+        prs = safe_json_parse(stdout)
+        if not isinstance(prs, list) or any(not isinstance(pr, dict) for pr in prs):
+            self.logger.warning(f"[{self.repo_path.name}] Could not parse dependabot PR listing")
+            return None
+        return prs
 
     def get_check_runs(self, head_sha: str) -> list[dict[str, Any]] | None:
         """Every check attached to a commit, or None if GitHub cannot answer.
@@ -1164,9 +1175,12 @@ class GitHubClient:
         # fallback: the repository's other workflows still report normally, so
         # keying off an empty list would hide the broken one behind them - and
         # the AI fix path edits workflow files, so it can cause exactly that.
-        return checks + self._startup_failure_checks(head_sha)
+        startup_checks = self._startup_failure_checks(head_sha)
+        if startup_checks is None:
+            return checks if self._combine_check_runs(checks) == "failure" else None
+        return checks + startup_checks
 
-    def _startup_failure_checks(self, head_sha: str) -> list[dict[str, Any]]:
+    def _startup_failure_checks(self, head_sha: str) -> list[dict[str, Any]] | None:
         """Stand-in checks for runs that failed before creating any job.
 
         Costs a run listing on every call, including each poll of a wait.
@@ -1176,6 +1190,8 @@ class GitHubClient:
         checks now" would hide the case this exists to catch.
         """
         runs = self._get_runs(10, "conclusion,headSha,workflowName")
+        if runs is None:
+            return None
         return [
             {
                 "name": run.get("workflowName") or "workflow",
@@ -1221,6 +1237,8 @@ class GitHubClient:
         # The run list is only used to name the newest checked commit; its
         # verdict still comes from that commit's checks.
         runs = self._get_runs(1, "headSha")
+        if runs is None:
+            return CI_UNKNOWN
         newest_sha = runs[0].get("headSha") if runs else None
         if not newest_sha or newest_sha == head_sha:
             return None
@@ -1241,7 +1259,7 @@ class GitHubClient:
 
     def get_latest_run_id(self) -> int | None:
         """Get the database ID of the latest CI run."""
-        runs = self._get_runs(1, "databaseId")
+        runs = self._get_runs(1, "databaseId") or []
         if runs and "databaseId" in runs[0]:
             return runs[0]["databaseId"]
         return None
@@ -1262,7 +1280,7 @@ class GitHubClient:
         _combine_check_runs report a failure, and its log exists and is worth
         reading, so it must be selectable.
         """
-        runs = self._get_runs(10, "databaseId,status,conclusion,headSha")
+        runs = self._get_runs(10, "databaseId,status,conclusion,headSha") or []
         failed = [
             r for r in runs if r.get("status") == "completed" and r.get("conclusion") in FAILING_CHECK_CONCLUSIONS
         ]
@@ -1468,7 +1486,7 @@ class GitHubClient:
             return "in_progress"
         return next((c for c in conclusions if c not in PASSING_CHECK_CONCLUSIONS), "success")
 
-    def _get_runs(self, limit: int = 1, fields: str = "status,conclusion") -> list[dict]:
+    def _get_runs(self, limit: int = 1, fields: str = "status,conclusion") -> list[dict] | None:
         """Recent CI runs for the current branch, excluding ignored workflows.
 
         Not filtered by trigger event. Verdicts come from the commit's checks,
@@ -1476,6 +1494,8 @@ class GitHubClient:
         fetching logs for is just as likely to come from a workflow chained
         off another one as from the push itself.
         """
+        if not self.owner_repo:
+            return []
         branch = self._git.current_branch or "main"
         # Always include workflowName so we can filter out ignored workflows.
         # Sorted so the command is identical from run to run.
@@ -1483,7 +1503,7 @@ class GitHubClient:
         # Over-fetch so that ignored workflows filtered out below cannot leave
         # the result empty (or short) when relevant runs exist beyond the limit
         fetch_limit = limit + len(IGNORED_WORKFLOW_PREFIXES) * 5
-        success, stdout, _ = self._run(
+        success, stdout, stderr = self._run(
             [
                 "gh",
                 "run",
@@ -1497,8 +1517,12 @@ class GitHubClient:
             ]
         )
         if not success:
-            return []
-        runs = safe_json_parse(stdout, default=[])
+            self.logger.warning(f"[{self.repo_path.name}] Could not list CI runs: {stderr or stdout}")
+            return None
+        runs = safe_json_parse(stdout)
+        if not isinstance(runs, list) or any(not isinstance(run, dict) for run in runs):
+            self.logger.warning(f"[{self.repo_path.name}] Could not parse CI run listing")
+            return None
         filtered = [
             r
             for r in runs
@@ -2356,6 +2380,8 @@ class Maintainer:
             return []
 
         prs = self.github.get_dependabot_prs()
+        if prs is None:
+            return []
         if not prs:
             self.logger.debug(f"[{self.repo_name}] No dependabot PRs found")
             return []

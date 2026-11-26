@@ -848,6 +848,96 @@ def github_client(path, git=None):
     return gm.GitHubClient(path, git, MagicMock())
 
 
+class TestGitHubRepositorySelection:
+    @pytest.mark.parametrize(
+        ("method", "arguments"),
+        [
+            ("get_dependabot_prs", ()),
+            ("get_pr_head", (42,)),
+            ("get_pr_body_and_coauthors", (42,)),
+            ("merge_pr", (42, "head")),
+            ("comment_pr", (42, "Please rebase")),
+            ("get_recent_pr_comment_bodies", (42,)),
+            ("get_ci_failure_logs", ("head",)),
+        ],
+    )
+    def test_pr_and_run_operations_target_origin(self, tmp_path, monkeypatch, method, arguments):
+        client = github_client(tmp_path)
+        client._git.get_remote_url.return_value = "git@github.com:fork/project.git"
+        client._git.current_branch = "main"
+        calls = []
+
+        def fake_command(command, cwd, **kwargs):
+            calls.append(command)
+            assert command[command.index("--repo") + 1] == "github.com/fork/project"
+            if command[:3] == ["gh", "pr", "view"]:
+                return True, json.dumps({"body": "Update", "headRefOid": "head", "comments": []}), ""
+            if command[:3] == ["gh", "run", "list"]:
+                runs = [{"databaseId": 9, "headSha": "head", "status": "completed", "conclusion": "failure"}]
+                return True, json.dumps(runs), ""
+            if command[:3] == ["gh", "run", "view"]:
+                return True, "Failure log", ""
+            return True, "[]", ""
+
+        monkeypatch.setenv("GH_HOST", "github.example.com")
+        monkeypatch.setattr(gm, "run_command", fake_command)
+        getattr(client, method)(*arguments)
+        assert calls
+
+    def test_non_github_origin_never_falls_back_to_another_remote(self, tmp_path, monkeypatch):
+        client = github_client(tmp_path)
+        client._git.get_remote_url.return_value = "git@gitlab.com:owner/project.git"
+        command = MagicMock()
+        monkeypatch.setattr(gm, "run_command", command)
+        assert client.get_dependabot_prs() == []
+        assert client._get_runs() == []
+        assert client.merge_pr(42, "head")[0] is False
+        command.assert_not_called()
+
+
+class TestGitHubLookupFailures:
+    @pytest.mark.parametrize("method", ["_get_runs", "get_dependabot_prs"])
+    @pytest.mark.parametrize(
+        "response",
+        [(False, "", "API unavailable"), (True, "not JSON", ""), (True, "{}", ""), (True, "[null]", "")],
+    )
+    def test_failed_or_unreadable_discovery_warns(self, tmp_path, method, response):
+        client = github_client(tmp_path)
+        client._run = MagicMock(return_value=response)
+        assert getattr(client, method)() is None
+        client.logger.warning.assert_called_once()
+
+    @pytest.mark.parametrize("method", ["_get_runs", "get_dependabot_prs"])
+    def test_an_empty_listing_is_not_a_failed_lookup(self, tmp_path, method):
+        client = github_client(tmp_path)
+        client._run = MagicMock(return_value=(True, "[]", ""))
+        assert getattr(client, method)() == []
+        client.logger.warning.assert_not_called()
+
+    def test_failed_baseline_discovery_does_not_disable_ci_monitoring(self, tmp_path):
+        client = github_client(tmp_path)
+        client.get_check_runs = MagicMock(return_value=[])
+        client._get_runs = MagicMock(return_value=None)
+        assert client.get_ci_conclusion("head") == gm.CI_UNKNOWN
+
+    def test_failed_pr_discovery_does_not_report_no_prs(self, repo_path, default_config, caplog):
+        maintainer = make_maintainer(repo_path, default_config)
+        maintainer.github.owner_repo = "owner/repo"
+        maintainer.github._run = MagicMock(return_value=(False, "", "API unavailable"))
+        with caplog.at_level(logging.DEBUG):
+            assert maintainer.merge_dependabot_prs() == []
+        assert "Could not list dependabot PRs" in caplog.text
+        assert "No dependabot PRs found" not in caplog.text
+
+    @pytest.mark.parametrize("conclusion", ["success", "failure"])
+    def test_failed_startup_discovery_cannot_establish_a_pass(self, tmp_path, conclusion):
+        client = github_client(tmp_path)
+        check = completed(conclusion)
+        client._run = MagicMock(return_value=(True, json.dumps(check), ""))
+        client._get_runs = MagicMock(return_value=None)
+        assert client.get_check_runs("head") == ([check] if conclusion == "failure" else None)
+
+
 def completed(conclusion, name="build"):
     return {
         "name": name,
