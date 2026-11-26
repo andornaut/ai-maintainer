@@ -3121,23 +3121,9 @@ def check_github_auth() -> CommandResult:
 
 
 def check_prerequisites(agent_command: str) -> list[str]:
-    """Check for required tools before running."""
-    missing = []
-    required_tools = ["git", "gh", "make"]
-
-    # Extract the actual command from agent_command (might be "ollama run llama3")
-    try:
-        agent_parts = shlex.split(agent_command)
-        if agent_parts:
-            agent_binary = agent_parts[0]
-            required_tools.append(agent_binary)
-    except ValueError:
-        # Malformed agent_command, add default
-        required_tools.append("claude")
-
-    missing.extend(tool for tool in required_tools if not shutil.which(tool))
-
-    return missing
+    """Check for required tools after validating the agent command."""
+    required_tools = ["git", "gh", "make", shlex.split(agent_command)[0]]
+    return [tool for tool in required_tools if not shutil.which(tool)]
 
 
 def positive_int(value: str) -> int:
@@ -3176,7 +3162,7 @@ Examples:
   %(prog)s --limit 5
 
   # Use different AI agent
-  %(prog)s --agent-command "ollama run llama3"
+  %(prog)s --agent-command "ollama run llama3" --agent-flags ""
 
   # Disable specific features
   %(prog)s --no-merge-dependabot --no-update-dependencies
@@ -3313,7 +3299,15 @@ Examples:
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output (debug level)")
     parser.add_argument("--quiet", "-q", action="store_true", help="Quiet mode (warnings, errors and the summary only)")
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    for option in ("agent_command", "agent_flags"):
+        try:
+            parts = shlex.split(getattr(args, option))
+        except ValueError as exc:
+            parser.error(f"--{option.replace('_', '-')}: {exc}")
+        if option == "agent_command" and (not parts or not parts[0]):
+            parser.error("--agent-command: must contain a non-empty executable")
+    return args
 
 
 def main():

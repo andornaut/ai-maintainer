@@ -38,8 +38,13 @@ ai-maintainer --dry-run --verbose              # preview, recommended first run
 ai-maintainer                                # repositories directly inside the current directory
 ai-maintainer --base-dir ~/src --limit 5       # elsewhere, stop after 5 changed
 ai-maintainer -e forked-repo -e broken-repo    # skip named repos
-ai-maintainer --agent-command "ollama run llama3"
+ai-maintainer --agent-command "ollama run llama3" --agent-flags ""
 ```
+
+Custom agents receive the complete prompt as their final command-line argument
+and must return a JSON object on stdout with the fields requested by the prompt.
+Use `--agent-flags ""` to clear the Claude-specific default flags, or supply flags
+supported by the custom agent.
 
 ## How it works
 

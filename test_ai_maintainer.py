@@ -2942,6 +2942,68 @@ class TestRunTestsOutcome:
         assert not [r for r in caplog.records if r.levelname == "WARNING"]
 
 
+class TestAgentCommandLineValidation:
+    @pytest.mark.parametrize(
+        ("option", "value"),
+        [
+            ("--agent-command", ""),
+            ("--agent-command", " \t"),
+            ("--agent-command", "''"),
+            ("--agent-command", '"" --model example'),
+            ("--agent-command", "ollama 'model"),
+            ("--agent-command", "ollama \\"),
+            ("--agent-flags", "'unterminated"),
+            ("--agent-flags", '"unterminated'),
+            ("--agent-flags", "--model \\"),
+        ],
+    )
+    def test_invalid_agent_arguments_exit_before_startup(self, monkeypatch, capsys, option, value):
+        guards = {
+            "check_prerequisites": MagicMock(),
+            "check_github_auth": MagicMock(),
+            "find_repos": MagicMock(),
+            "Maintainer": MagicMock(),
+        }
+        for name, guard in guards.items():
+            monkeypatch.setattr(gm, name, guard)
+        monkeypatch.setattr(sys, "argv", ["ai-maintainer", f"{option}={value}"])
+
+        with pytest.raises(SystemExit) as exc:
+            gm.main()
+
+        assert exc.value.code == 2
+        error = capsys.readouterr().err
+        assert "usage:" in error
+        assert option in error
+        assert "Traceback" not in error
+        for guard in guards.values():
+            guard.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("command", "flags"),
+        [
+            ("ollama run llama3", ""),
+            ("claude", " \t"),
+            ('"/opt/Agent CLI" --model "example model"', '--output json --label "two words"'),
+        ],
+    )
+    def test_valid_agent_arguments_keep_their_original_strings(self, monkeypatch, command, flags):
+        monkeypatch.setattr(sys, "argv", ["ai-maintainer", f"--agent-command={command}", f"--agent-flags={flags}"])
+
+        args = gm.parse_args()
+
+        assert args.agent_command == command
+        assert args.agent_flags == flags
+
+    def test_default_agent_arguments_are_unchanged(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", ["ai-maintainer"])
+
+        args = gm.parse_args()
+
+        assert args.agent_command == "claude"
+        assert args.agent_flags == "--dangerously-skip-permissions"
+
+
 class TestGitHubAuthIsMandatory:
     """gh answers CI status, write access and dependabot verification, so an
     unauthenticated run would report success for work it never did."""
